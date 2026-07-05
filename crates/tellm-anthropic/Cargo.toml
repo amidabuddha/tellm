@@ -1,0 +1,17 @@
+[package]
+name = "tellm-anthropic"
+description = "Anthropic Messages API client for tellm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tellm-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

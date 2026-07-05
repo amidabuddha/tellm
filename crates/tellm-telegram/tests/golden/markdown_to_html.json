@@ -1,0 +1,142 @@
+[
+  {
+    "name": "empty",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "name": "plain_text",
+    "input": "Just a plain sentence.",
+    "expected": "Just a plain sentence."
+  },
+  {
+    "name": "html_escaping",
+    "input": "Tags like <b> & \"quotes\" and 'single' get escaped",
+    "expected": "Tags like &lt;b&gt; &amp; &quot;quotes&quot; and &#x27;single&#x27; get escaped"
+  },
+  {
+    "name": "bold_asterisks",
+    "input": "This is **bold** text",
+    "expected": "This is <b>bold</b> text"
+  },
+  {
+    "name": "bold_underscores",
+    "input": "This is __also bold__ text",
+    "expected": "This is <b>also bold</b> text"
+  },
+  {
+    "name": "bold_not_across_newline",
+    "input": "**not\nbold** stays literal asterisks",
+    "expected": "**not\nbold** stays literal asterisks"
+  },
+  {
+    "name": "inline_code",
+    "input": "Run `cargo test` to verify",
+    "expected": "Run <code>cargo test</code> to verify"
+  },
+  {
+    "name": "inline_code_escapes_inside",
+    "input": "Use `a < b && c > d` carefully",
+    "expected": "Use <code>a &lt; b &amp;&amp; c &gt; d</code> carefully"
+  },
+  {
+    "name": "heading_h1",
+    "input": "# Big Title",
+    "expected": "<b>Big Title</b>"
+  },
+  {
+    "name": "heading_h3_leading_spaces",
+    "input": "   ### Indented heading   ",
+    "expected": "<b>Indented heading</b>"
+  },
+  {
+    "name": "heading_too_indented_is_text",
+    "input": "    # four spaces is not a heading",
+    "expected": "    # four spaces is not a heading"
+  },
+  {
+    "name": "link_simple",
+    "input": "See [the docs](https://example.com/docs) for more",
+    "expected": "See <a href=\"https://example.com/docs\">the docs</a> for more"
+  },
+  {
+    "name": "link_with_query_amp",
+    "input": "Go to [search](https://example.com/a?b=1&c=2) now",
+    "expected": "Go to <a href=\"https://example.com/a?b=1&amp;c=2\">search</a> now"
+  },
+  {
+    "name": "fenced_no_language",
+    "input": "before\n```\ncode here\n```\nafter",
+    "expected": "before\n<pre><code>code here</code></pre>\nafter"
+  },
+  {
+    "name": "fenced_with_language",
+    "input": "```python\nprint('hi')\n```",
+    "expected": "<pre><code>print(&#x27;hi&#x27;)</code></pre>"
+  },
+  {
+    "name": "fenced_preserves_literals",
+    "input": "```rust\nlet x = a < b && c > d; // **not bold** `not code`\n```",
+    "expected": "<pre><code>let x = a &lt; b &amp;&amp; c &gt; d; // **not bold** `not code`</code></pre>"
+  },
+  {
+    "name": "fenced_multiple_blocks",
+    "input": "```\nfirst\n```\nmiddle **bold**\n```\nsecond\n```",
+    "expected": "<pre><code>first</code></pre>\nmiddle <b>bold</b>\n<pre><code>second</code></pre>"
+  },
+  {
+    "name": "fenced_unclosed_stays_raw",
+    "input": "```python\nprint('never closed')",
+    "expected": "```python\nprint(&#x27;never closed&#x27;)"
+  },
+  {
+    "name": "fenced_strips_outer_newlines",
+    "input": "```\n\n\npadded\n\n\n```",
+    "expected": "<pre><code>padded</code></pre>"
+  },
+  {
+    "name": "quad_backtick_fence",
+    "input": "````\ncode\n```",
+    "expected": "`<pre><code>code</code></pre>"
+  },
+  {
+    "name": "bracket_in_link_label",
+    "input": "[see [1]](https://x.org) end",
+    "expected": "[see [1]](https://x.org) end"
+  },
+  {
+    "name": "multiline_bold_second_open",
+    "input": "**a\nb** and **c**",
+    "expected": "**a\nb<b> and </b>c**"
+  },
+  {
+    "name": "seven_hashes_not_a_heading",
+    "input": "####### seven",
+    "expected": "####### seven"
+  },
+  {
+    "name": "heading_only_whitespace_after_hashes",
+    "input": "##   ",
+    "expected": "<b></b>"
+  },
+  {
+    "name": "empty_bold_stays_literal",
+    "input": "****",
+    "expected": "****"
+  },
+  {
+    "name": "triple_underscore_bold",
+    "input": "___x___",
+    "expected": "<b>_x</b>_"
+  },
+  {
+    "name": "backtick_in_fence_language_no_fence",
+    "input": "```a`b\ncode\n```",
+    "expected": "``<code>a</code>b\ncode\n```"
+  },
+  {
+    "name": "kitchen_sink",
+    "input": "# Report\n\nThe value of `x` is **42** — see [ref](https://x.org/p?a=1&b=2).\n\n```sh\necho \"a > b\" && ls\n```\n\n__Done__ & dusted <end>",
+    "expected": "<b>Report</b>\n\nThe value of <code>x</code> is <b>42</b> — see <a href=\"https://x.org/p?a=1&amp;b=2\">ref</a>.\n\n<pre><code>echo &quot;a &gt; b&quot; &amp;&amp; ls</code></pre>\n\n<b>Done</b> &amp; dusted &lt;end&gt;"
+  }
+]

@@ -1,0 +1,36 @@
+[package]
+name = "tellm-config"
+description = "Configuration: human-editable TOML for non-secrets, OS keychain (0600 file fallback) for secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tellm-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+keyring-core = { workspace = true, optional = true }
+getrandom.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+zbus-secret-service-keyring-store = { workspace = true, optional = true }
+
+[features]
+default = ["keychain"]
+keychain = [
+    "dep:keyring-core",
+    "dep:apple-native-keyring-store",
+    "dep:windows-native-keyring-store",
+    "dep:zbus-secret-service-keyring-store",
+]

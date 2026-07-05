@@ -1,0 +1,163 @@
+[
+  {
+    "name": "empty",
+    "input": "",
+    "chunk_size": 10,
+    "expected": [
+      ""
+    ]
+  },
+  {
+    "name": "shorter_than_chunk",
+    "input": "hello",
+    "chunk_size": 10,
+    "expected": [
+      "hello"
+    ]
+  },
+  {
+    "name": "exactly_chunk_size",
+    "input": "0123456789",
+    "chunk_size": 10,
+    "expected": [
+      "0123456789"
+    ]
+  },
+  {
+    "name": "one_over_no_newline",
+    "input": "0123456789A",
+    "chunk_size": 10,
+    "expected": [
+      "0123456789",
+      "A"
+    ]
+  },
+  {
+    "name": "hard_cut_no_newlines",
+    "input": "AAAAAAAAAAAAAAAAAAAAAAAAA",
+    "chunk_size": 10,
+    "expected": [
+      "AAAAAAAAAA",
+      "AAAAAAAAAA",
+      "AAAAA"
+    ]
+  },
+  {
+    "name": "prefers_newline_break",
+    "input": "aaaa\nbbbb\ncccc\ndddd\neeee",
+    "chunk_size": 10,
+    "expected": [
+      "aaaa\nbbbb\n",
+      "cccc\ndddd\n",
+      "eeee"
+    ]
+  },
+  {
+    "name": "newline_at_window_start_not_used",
+    "input": "\nBBBBBBBBBBBBBBB",
+    "chunk_size": 10,
+    "expected": [
+      "\nBBBBBBBBB",
+      "BBBBBB"
+    ]
+  },
+  {
+    "name": "newline_only_string",
+    "input": "\n\n\n\n\n\n\n\n\n\n\n\n",
+    "chunk_size": 5,
+    "expected": [
+      "\n\n\n\n\n",
+      "\n\n\n\n\n",
+      "\n\n"
+    ]
+  },
+  {
+    "name": "trailing_newline",
+    "input": "line one\nline two\nline three\n",
+    "chunk_size": 12,
+    "expected": [
+      "line one\n",
+      "line two\n",
+      "line three\n"
+    ]
+  },
+  {
+    "name": "windows_crlf",
+    "input": "one\r\ntwo\r\nthree\r\nfour\r\nfive",
+    "chunk_size": 10,
+    "expected": [
+      "one\r\ntwo\r\n",
+      "three\r\n",
+      "four\r\nfive"
+    ]
+  },
+  {
+    "name": "cyrillic_code_points",
+    "input": "привет мир это тест на кириллице привет мир это тест на кириллице привет мир это тест на кириллице ",
+    "chunk_size": 20,
+    "expected": [
+      "привет мир это тест ",
+      "на кириллице привет ",
+      "мир это тест на кири",
+      "ллице привет мир это",
+      " тест на кириллице "
+    ]
+  },
+  {
+    "name": "emoji_astral_plane",
+    "input": "🚀🚀🚀 launch 🚀🚀🚀\n🚀🚀🚀 launch 🚀🚀🚀\n🚀🚀🚀 launch 🚀🚀🚀\n🚀🚀🚀 launch 🚀🚀🚀\n",
+    "chunk_size": 12,
+    "expected": [
+      "🚀🚀🚀 launch 🚀",
+      "🚀🚀\n",
+      "🚀🚀🚀 launch 🚀",
+      "🚀🚀\n",
+      "🚀🚀🚀 launch 🚀",
+      "🚀🚀\n",
+      "🚀🚀🚀 launch 🚀",
+      "🚀🚀\n"
+    ]
+  },
+  {
+    "name": "realistic_markdown",
+    "input": "# Title\n\nSome intro paragraph that is fairly long and rambles on.\n\n- bullet one\n- bullet two\n- bullet three\n\n```python\nprint('hello world')\n```\n\nClosing thoughts here.",
+    "chunk_size": 60,
+    "expected": [
+      "# Title\n\n",
+      "Some intro paragraph that is fairly long and rambles on.\n\n",
+      "- bullet one\n- bullet two\n- bullet three\n\n```python\n",
+      "print('hello world')\n```\n\nClosing thoughts here."
+    ]
+  },
+  {
+    "name": "long_single_line_then_newline",
+    "input": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\nYYYYY",
+    "chunk_size": 20,
+    "expected": [
+      "XXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXX\nYYYYY"
+    ]
+  },
+  {
+    "name": "multibyte_boundary_stress",
+    "input": "äääääääääääääääääääää",
+    "chunk_size": 10,
+    "expected": [
+      "ääääääääää",
+      "ääääääääää",
+      "ä"
+    ]
+  },
+  {
+    "name": "chunk_size_one",
+    "input": "ab\ncd",
+    "chunk_size": 1,
+    "expected": [
+      "a",
+      "b",
+      "\n",
+      "c",
+      "d"
+    ]
+  }
+]
