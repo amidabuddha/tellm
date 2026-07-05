@@ -126,6 +126,9 @@ The four wiring shapes are:
 
 `telegram_chat_ids` is only for locked room pins. Normal `/model KEY`
 selection is stored in `rooms.toml`, so these arrays usually stay empty.
+`thinking` in `config.toml` is the model default. A room only writes
+`thinking` to `rooms.toml` after `/reasoning LEVEL`; `/reasoning default`
+clears that room override and returns to the selected model's default.
 
 ## Setting Up Model Rooms
 

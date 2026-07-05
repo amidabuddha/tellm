@@ -11,6 +11,7 @@ pub struct CommandContext<'a> {
     pub default_model: &'a str,
     pub model_keys: &'a BTreeSet<String>,
     pub pinned_model_key: Option<&'a str>,
+    pub model_thinking: ThinkingLevel,
     pub shutdown_access: access::ShutdownAccess,
     pub capabilities: RoomCapabilities,
 }
@@ -84,10 +85,11 @@ pub enum CommandAction {
         role: Option<String>,
     },
     ShowReasoning {
-        current: ThinkingLevel,
+        override_level: Option<ThinkingLevel>,
+        model_default: ThinkingLevel,
     },
     SetReasoning {
-        thinking: ThinkingLevel,
+        thinking: Option<ThinkingLevel>,
     },
     ShowWebSearch {
         enabled: bool,
@@ -196,7 +198,9 @@ pub fn route(text: &str, context: &CommandContext<'_>) -> Route {
         KnownCommand::Mode => route_mode(parsed.args, context.room),
         KnownCommand::Model => route_model(parsed.args, context),
         KnownCommand::Role => route_role(parsed.args, context.room),
-        KnownCommand::Reasoning => route_reasoning(parsed.args, context.room),
+        KnownCommand::Reasoning => {
+            route_reasoning(parsed.args, context.room, context.model_thinking)
+        }
         KnownCommand::WebSearch => {
             route_web_search(parsed.args, context.room, &context.capabilities)
         }
@@ -316,14 +320,19 @@ fn route_role(args: &str, room: &rooms::RoomState) -> CommandAction {
     }
 }
 
-fn route_reasoning(args: &str, room: &rooms::RoomState) -> CommandAction {
+fn route_reasoning(
+    args: &str,
+    room: &rooms::RoomState,
+    model_default: ThinkingLevel,
+) -> CommandAction {
     let Some(value) = first_arg(args) else {
         return CommandAction::ShowReasoning {
-            current: room.settings.thinking,
+            override_level: room.settings.thinking,
+            model_default,
         };
     };
 
-    match parse_thinking(value) {
+    match parse_thinking_setting(value) {
         Some(thinking) => CommandAction::SetReasoning { thinking },
         None => CommandAction::Reject {
             command: KnownCommand::Reasoning,
@@ -607,13 +616,14 @@ fn parse_known_command(name: &str) -> Option<KnownCommand> {
     }
 }
 
-fn parse_thinking(value: &str) -> Option<ThinkingLevel> {
+fn parse_thinking_setting(value: &str) -> Option<Option<ThinkingLevel>> {
     match value.to_ascii_lowercase().as_str() {
-        "off" => Some(ThinkingLevel::Off),
-        "low" => Some(ThinkingLevel::Low),
-        "medium" => Some(ThinkingLevel::Medium),
-        "high" => Some(ThinkingLevel::High),
-        "max" => Some(ThinkingLevel::Max),
+        "default" | "model" | "reset" => Some(None),
+        "off" => Some(Some(ThinkingLevel::Off)),
+        "low" => Some(Some(ThinkingLevel::Low)),
+        "medium" => Some(Some(ThinkingLevel::Medium)),
+        "high" => Some(Some(ThinkingLevel::High)),
+        "max" => Some(Some(ThinkingLevel::Max)),
         _ => None,
     }
 }
@@ -900,28 +910,33 @@ mod tests {
     #[test]
     fn reasoning_command_shows_sets_and_rejects_unknown_levels() {
         let settings = rooms::RoomSettings {
-            thinking: ThinkingLevel::High,
+            thinking: Some(ThinkingLevel::High),
             ..rooms::RoomSettings::default()
         };
 
         assert_eq!(
             route_command_with_default_settings("/reasoning", settings.clone()),
             Route::Command(CommandAction::ShowReasoning {
-                current: ThinkingLevel::High,
+                override_level: Some(ThinkingLevel::High),
+                model_default: ThinkingLevel::Medium,
             })
         );
         assert_eq!(
             route_command_with_default_settings("/reasoning max", settings.clone()),
             Route::Command(CommandAction::SetReasoning {
-                thinking: ThinkingLevel::Max,
+                thinking: Some(ThinkingLevel::Max),
             })
         );
         assert_eq!(
             route_command_with_default_settings("/reasoning default", settings),
+            Route::Command(CommandAction::SetReasoning { thinking: None })
+        );
+        assert_eq!(
+            route_command_with_default_settings("/reasoning nope", rooms::RoomSettings::default()),
             Route::Command(CommandAction::Reject {
                 command: KnownCommand::Reasoning,
                 reason: CommandReject::UnknownReasoning {
-                    value: "default".to_string(),
+                    value: "nope".to_string(),
                 },
             })
         );
@@ -1215,6 +1230,7 @@ mod tests {
             default_model: "claude",
             model_keys: &model_keys,
             pinned_model_key,
+            model_thinking: ThinkingLevel::Medium,
             shutdown_access,
             capabilities: RoomCapabilities::permissive(),
         };
@@ -1234,6 +1250,7 @@ mod tests {
             default_model: "claude",
             model_keys: &model_keys,
             pinned_model_key: None,
+            model_thinking: ThinkingLevel::Medium,
             shutdown_access: access::ShutdownAccess::NotAdmin,
             capabilities,
         };

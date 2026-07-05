@@ -475,16 +475,23 @@ async fn route_command(
     sender_user_id: Option<i64>,
     handles: &RuntimeHandles,
 ) -> Result<Route, String> {
-    let (room, default_model, model_keys, pinned_model_key, capabilities) = {
+    let (room, default_model, model_keys, pinned_model_key, model_thinking, capabilities) = {
         let config = handles.config.lock().await;
         let mut rooms = handles.rooms.lock().await;
         let room = rooms.get_or_default(chat_id).clone();
+        let model_key = selected_model_key(&config, &room, chat_id);
+        let model_thinking = config
+            .models
+            .get(&model_key)
+            .map(|model| model.thinking)
+            .unwrap_or_default();
         let capabilities = room_capabilities(&config, &room, chat_id);
         (
             room,
             config.default_model.clone(),
             config.models.keys().cloned().collect::<BTreeSet<_>>(),
             pinned_model_key(&config, chat_id).map(str::to_string),
+            model_thinking,
             capabilities,
         )
     };
@@ -502,6 +509,7 @@ async fn route_command(
         default_model: &default_model,
         model_keys: &model_keys,
         pinned_model_key: pinned_model_key.as_deref(),
+        model_thinking,
         shutdown_access,
         capabilities,
     };
@@ -556,6 +564,7 @@ async fn handle_command(
         CommandAction::SetModel { model_key } => {
             mutate_room(handles, chat_id, |room| {
                 room.settings.model_key = Some(model_key.clone());
+                room.settings.thinking = None;
                 room.wire_format = None;
                 room.reset_history();
             })
@@ -574,6 +583,7 @@ async fn handle_command(
                 tellm_config::save(&config).map_err(|error| error.to_string())?;
             }
             mutate_room(handles, chat_id, |room| {
+                room.settings.thinking = None;
                 room.wire_format = None;
                 room.reset_history();
             })
@@ -672,15 +682,23 @@ async fn handle_command(
             };
             send_command_reply(handles, chat_id, &reply).await
         }
-        CommandAction::ShowReasoning { current } => {
-            send_command_reply(handles, chat_id, &format!("Reasoning: {current:?}.")).await
+        CommandAction::ShowReasoning {
+            override_level,
+            model_default,
+        } => {
+            send_command_reply(
+                handles,
+                chat_id,
+                &format_reasoning_status(override_level, model_default),
+            )
+            .await
         }
         CommandAction::SetReasoning { thinking } => {
             mutate_room(handles, chat_id, |room| {
                 room.settings.thinking = thinking;
             })
             .await?;
-            send_command_reply(handles, chat_id, &format!("Reasoning set to {thinking:?}.")).await
+            send_command_reply(handles, chat_id, &reasoning_set_reply(thinking)).await
         }
         CommandAction::ShowWebSearch { enabled } => {
             let state = if enabled { "on" } else { "off" };
@@ -834,7 +852,7 @@ fn chat_request_from_room(
             ChatMode::Message => Vec::new(),
         },
         input,
-        thinking: room.settings.thinking,
+        thinking: room.settings.thinking.unwrap_or(model_config.thinking),
         web_search: room.settings.web_search,
         image_generation: room.settings.image_generation,
         max_tokens: None,
@@ -1403,6 +1421,11 @@ async fn pair_code_from_message(
         default_model: &config.default_model,
         model_keys: &model_keys,
         pinned_model_key: None,
+        model_thinking: config
+            .models
+            .get(&config.default_model)
+            .map(|model| model.thinking)
+            .unwrap_or_default(),
         shutdown_access: crate::access::ShutdownAccess::NotAdmin,
         capabilities: commands::RoomCapabilities::permissive(),
     };
@@ -2179,6 +2202,25 @@ fn mode_name(mode: ChatMode) -> &'static str {
     }
 }
 
+fn format_reasoning_status(
+    override_level: Option<tellm_core::ThinkingLevel>,
+    model_default: tellm_core::ThinkingLevel,
+) -> String {
+    match override_level {
+        Some(level) => {
+            format!("Reasoning: {level:?} (room override; model default is {model_default:?}).")
+        }
+        None => format!("Reasoning: {model_default:?} (model default)."),
+    }
+}
+
+fn reasoning_set_reply(thinking: Option<tellm_core::ThinkingLevel>) -> String {
+    match thinking {
+        Some(thinking) => format!("Reasoning set to {thinking:?} for this room."),
+        None => "Reasoning reset to this model's configured default.".to_string(),
+    }
+}
+
 fn format_model_status(
     selected: Option<String>,
     effective: String,
@@ -2202,7 +2244,7 @@ fn format_model_status(
 
 fn model_set_reply(model_key: &str) -> String {
     format!(
-        "Model set to {model_key}. Chat history reset. This is this room's selection; owners can lock it into config.toml with /model pin {model_key}."
+        "Model set to {model_key}. Chat history reset. This room now uses the model's configured reasoning default; /reasoning can override it. Owners can lock it into config.toml with /model pin {model_key}."
     )
 }
 
@@ -2238,7 +2280,9 @@ fn format_reject(reason: CommandReject) -> String {
             )
         }
         CommandReject::UnknownReasoning { value } => {
-            format!("Unknown reasoning level \"{value}\". Use off, low, medium, high, or max.")
+            format!(
+                "Unknown reasoning level \"{value}\". Use default, off, low, medium, high, or max."
+            )
         }
         CommandReject::UnknownBoolean { value } => {
             format!("Unknown on/off value \"{value}\". Use on, off, or status.")
@@ -2310,7 +2354,7 @@ const HELP_TEXT: &str = "\
 - /model pin KEY | /model unpin - lock or release this room's model (owner)
 - /model add [KEY] - list the provider catalog or add a preset (owner)
 - /role TEXT|clear - show, set, or clear the system role
-- /reasoning off|low|medium|high|max - show or set reasoning level
+- /reasoning default|off|low|medium|high|max - show or set reasoning level
 - /websearch on|off|status - toggle, set, or show web search
 - /imagegen on|off|status - toggle, set, or show image generation
 - /allow CHAT_ID - allow a chat (owner)
@@ -2515,7 +2559,8 @@ mod tests {
     fn model_set_reply_distinguishes_selection_from_pin() {
         let reply = model_set_reply("openai");
 
-        assert!(reply.contains("room's selection"), "{reply}");
+        assert!(reply.contains("configured reasoning default"), "{reply}");
+        assert!(reply.contains("/reasoning can override"), "{reply}");
         assert!(reply.contains("/model pin openai"), "{reply}");
         assert!(reply.contains("config.toml"), "{reply}");
     }
@@ -2766,6 +2811,33 @@ mod tests {
         assert!(request.image_generation);
         assert!(request.web_search);
         assert_eq!(request.model, "gpt-5.5");
+        assert_eq!(request.thinking, tellm_core::ThinkingLevel::High);
+    }
+
+    #[test]
+    fn chat_request_uses_room_thinking_override_when_present() {
+        let room = RoomState::new(crate::rooms::RoomSettings {
+            thinking: Some(tellm_core::ThinkingLevel::Low),
+            ..crate::rooms::RoomSettings::default()
+        });
+        let model = ModelConfig {
+            wire_format: WireFormat::Responses,
+            model_name: "gpt-5.5".to_string(),
+            base_url: None,
+            api_key_secret: Some("openai_api_key".to_string()),
+            telegram_chat_ids: Vec::new(),
+            thinking: tellm_core::ThinkingLevel::High,
+        };
+
+        let request = chat_request_from_room(
+            &room,
+            &model,
+            vec![ContentPart::Text {
+                text: "think less".to_string(),
+            }],
+        );
+
+        assert_eq!(request.thinking, tellm_core::ThinkingLevel::Low);
     }
 
     #[test]

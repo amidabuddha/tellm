@@ -26,8 +26,8 @@ pub struct RoomSettings {
     pub mode: ChatMode,
     #[serde(default)]
     pub role: Option<String>,
-    #[serde(default)]
-    pub thinking: ThinkingLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
     #[serde(default)]
     pub web_search: bool,
     #[serde(default)]
@@ -40,7 +40,7 @@ impl Default for RoomSettings {
             model_key: None,
             mode: ChatMode::Chat,
             role: None,
-            thinking: ThinkingLevel::default(),
+            thinking: None,
             web_search: false,
             image_generation: false,
         }
@@ -240,7 +240,7 @@ mod tests {
                     model_key: Some("claude".to_string()),
                     mode: ChatMode::Chat,
                     role: Some("Be precise.".to_string()),
-                    thinking: ThinkingLevel::High,
+                    thinking: Some(ThinkingLevel::High),
                     web_search: true,
                     image_generation: true,
                 },
@@ -251,7 +251,7 @@ mod tests {
                     model_key: Some("ollama".to_string()),
                     mode: ChatMode::Message,
                     role: None,
-                    thinking: ThinkingLevel::Off,
+                    thinking: Some(ThinkingLevel::Off),
                     web_search: false,
                     image_generation: false,
                 },

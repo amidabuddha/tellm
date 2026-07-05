@@ -93,9 +93,9 @@ Validity caveats (2026-07-05):
   Gemini thinks dynamically. User-facing text must say "default", not "off".
 - OpenAI `xhigh` is officially model-dependent; an unsupported value errors
   explicitly and the user can lower the room's level.
-- Gemini `medium` is invalid on gemini-3-pro-preview (low/high only) — and
-  medium is tellm's default thinking level, so that model needs a per-room
-  level change. gemini-3.1-pro and 3.5-flash accept medium.
+- Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
+  model should be configured with `thinking = "low"` or `thinking = "high"`;
+  gemini-3.1-pro and 3.5-flash accept medium.
 - Anthropic default max_tokens is 16000: thinking tokens count toward
   max_tokens, and 4096 risked mid-thought truncation at high/max effort.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
@@ -169,10 +169,11 @@ Notes:
   backpressure for free and is the tokio-native equivalent of the parent's
   chained-futures design.
 - In-memory conversations; **room settings persist** across restarts
-  (model pin, mode, role, thinking level, web-search toggle, image-generation
-  toggle) in
-  `config_dir()/rooms.toml` — runtime state deliberately separate from the
-  user-owned config.toml. Conversations don't persist.
+  (model pin, mode, role, optional thinking override, web-search toggle,
+  image-generation toggle) in `config_dir()/rooms.toml` — runtime state
+  deliberately separate from the user-owned config.toml. If a room has no
+  `thinking` entry, it uses the selected model's `config.toml` thinking value;
+  `/reasoning default` clears the room override. Conversations don't persist.
 - Modes: `chat` (multi-turn) and `message` (stateless per message). Message
   mode requests never send prior history, but the runtime keeps the latest
   exchange in memory so switching back with `/mode chat` can continue from the
@@ -200,7 +201,7 @@ through as normal model input rather than producing "command not found" noise.
 Argument semantics: `/id` replies with the current Telegram chat id,
 `/mode [chat|message]`, `/model [key]`, `/role [text]`
 with `clear|off|none|reset` clearing the role, `/reasoning
-[off|low|medium|high|max]`, `/websearch [on|off|status]` (no argument
+[default|off|low|medium|high|max]`, `/websearch [on|off|status]` (no argument
 toggles), `/imagegen [on|off|status]` (no argument toggles),
 `/ollama unload` to unload local Ollama models invoked by this tellm process,
 and `/allow CHAT_ID` / `/deny CHAT_ID` from any owner, and `/pair CODE`.
