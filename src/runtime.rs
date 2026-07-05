@@ -1435,7 +1435,11 @@ fn room_capabilities(
             }
         }
         WireFormat::Compat => (false, false, "chat-completions endpoint"),
-        WireFormat::Gemini => (true, true, "Gemini Interactions"),
+        WireFormat::Gemini => (
+            true,
+            tellm_gemini::is_image_generation_model(&model.model_name),
+            "Gemini Interactions",
+        ),
     };
 
     commands::RoomCapabilities {
@@ -2762,6 +2766,31 @@ mod tests {
         assert!(request.image_generation);
         assert!(request.web_search);
         assert_eq!(request.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn gemini_image_generation_capability_requires_image_model() {
+        let room = RoomState::new(crate::rooms::RoomSettings {
+            model_key: Some("gemini".to_string()),
+            ..crate::rooms::RoomSettings::default()
+        });
+        let mut config = Config {
+            default_model: "gemini".to_string(),
+            models: BTreeMap::new(),
+            telegram: tellm_config::TelegramConfig::default(),
+        };
+
+        let mut gemini = test_model(WireFormat::Gemini, &[]);
+        gemini.model_name = "gemini-3.5-flash".to_string();
+        config.models.insert("gemini".to_string(), gemini);
+        let capabilities = room_capabilities(&config, &room, 42);
+        assert!(capabilities.web_search);
+        assert!(!capabilities.image_generation);
+
+        config.models.get_mut("gemini").unwrap().model_name = "gemini-3.1-flash-image".to_string();
+        let capabilities = room_capabilities(&config, &room, 42);
+        assert!(capabilities.web_search);
+        assert!(capabilities.image_generation);
     }
 
     #[test]

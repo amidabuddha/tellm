@@ -845,6 +845,34 @@ mod tests {
     }
 
     #[test]
+    fn model_add_does_not_select_configured_model() {
+        assert_eq!(
+            route_command_with(
+                "/model add claude2",
+                rooms::RoomSettings::default(),
+                None,
+                access::ShutdownAccess::Allowed,
+                &["claude2"],
+            ),
+            Route::Command(CommandAction::AddModel {
+                preset_key: "claude2".to_string(),
+            })
+        );
+        assert_eq!(
+            route_command_with(
+                "/model claude2",
+                rooms::RoomSettings::default(),
+                None,
+                access::ShutdownAccess::Allowed,
+                &["claude2"],
+            ),
+            Route::Command(CommandAction::SetModel {
+                model_key: "claude2".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn role_command_shows_sets_and_clears_full_text_roles() {
         let settings = rooms::RoomSettings {
             role: Some("terse".to_string()),

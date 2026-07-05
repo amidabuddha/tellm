@@ -1,8 +1,8 @@
 //! Google Gemini Interactions API client (`POST /v1beta/interactions`).
 //!
-//! Mapping notes (checked 2026-07-04 against ai.google.dev Interactions API,
-//! API key, thinking, and Google Search docs — re-check live provider docs
-//! before changing these mappings):
+//! Mapping notes (checked 2026-07-05 against ai.google.dev Interactions API,
+//! API key, thinking, Google Search, and image generation docs — re-check
+//! live provider docs before changing these mappings):
 //! - State: `store: false`; stateless history is carried as raw Interactions
 //!   `Step` objects in `ChatRequest::history` and replayed via `input`.
 //! - Turn items: return the new `user_input` step plus EVERY response step
@@ -15,6 +15,8 @@
 //!   ["web_search"]}]`.
 //! - Images/documents: native `image` and `document` content blocks with
 //!   inline base64 `data`.
+//! - Image generation: only Gemini image model ids (`*-image*`) are eligible;
+//!   request `response_format: {"type": "image"}`.
 
 use std::time::Duration;
 
@@ -54,6 +56,10 @@ impl Gemini {
             api_key: api_key.into(),
         }
     }
+}
+
+pub fn is_image_generation_model(model_name: &str) -> bool {
+    model_name.to_ascii_lowercase().contains("-image")
 }
 
 impl Provider for Gemini {
@@ -149,7 +155,13 @@ fn request_body(request: &ChatRequest, user_step: Value) -> Result<Value, Provid
     }
 
     if request.image_generation {
-        body["response_modalities"] = json!(["text", "image"]);
+        if !is_image_generation_model(&request.model) {
+            return Err(ProviderError::Unsupported(format!(
+                "Gemini image generation requires an image-capable model such as gemini-3.1-flash-image, not {}",
+                request.model
+            )));
+        }
+        body["response_format"] = json!({ "type": "image" });
     }
 
     Ok(body)

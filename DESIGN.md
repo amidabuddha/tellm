@@ -26,8 +26,8 @@ which remains the reference implementation and the author's fallback during the 
         ┌────────────┬───┴────────┬──────────────┐
   tellm-anthropic tellm-openai tellm-compat  tellm-gemini
    Messages API   Responses API chat completions Interactions API
-   (Anthropic)    (OpenAI, xAI) (Ollama, DeepSeek, (Gemini; stub —
-                                 OpenRouter, ...)   see Open questions)
+   (Anthropic)    (OpenAI, xAI) (Ollama, DeepSeek, (Gemini)
+                                 OpenRouter, ...)
 ```
 
 **No middleware.** Each wire-format crate talks to the provider's latest
@@ -99,12 +99,12 @@ Validity caveats (2026-07-05):
 - Anthropic default max_tokens is 16000: thinking tokens count toward
   max_tokens, and 4096 risked mid-thought truncation at high/max effort.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
-  `/websearch on` refuse in rooms whose wire format can never honor them
-  (image generation: Anthropic/compat/xAI; web search: compat), naming the
-  model and endpoint. Support that varies per model *inside* a capable
-  format (which OpenAI models can use the image tool; which Gemini models
-  emit images) is not statically knowable and stays a request-time error,
-  with the error reply suggesting the off command.
+  `/websearch on` refuse in rooms whose wire format or model id can never
+  honor them (image generation: Anthropic/compat/xAI/non-image Gemini models;
+  web search: compat), naming the model and endpoint. Support that still varies
+  per model *inside* a capable format (for example, which OpenAI models can use
+  the image tool) stays a request-time error, with the error reply suggesting
+  the off command.
 
 Notes:
 - **API surface details are pinned at implementation time against live
@@ -142,12 +142,13 @@ Notes:
   and documents are reported as unsupported before any provider call.
 - Gemini Interactions uses `POST /v1beta/interactions`, `x-goog-api-key`,
   `store:false`, `stream:false`, `system_instruction`, and stateless `input`
-  as an array of Interactions `Step` objects (checked 2026-07-04 against
+  as an array of Interactions `Step` objects (checked 2026-07-05 against
   ai.google.dev). Raw response `steps` are replayed through `turn_items`
   verbatim, including `thought` and Google Search call/result signatures.
   Web search is `tools: [{type:"google_search",
-  search_types:["web_search"]}]`; generated image content becomes
-  `GeneratedImage`.
+  search_types:["web_search"]}]`; image generation is allowed only for Gemini
+  image model ids (`*-image*`) and sends `response_format: {"type":"image"}`;
+  generated image content becomes `GeneratedImage`.
 - **File upload requires no extraction.** PDFs/images pass through natively:
   Anthropic `document`/`image` blocks, OpenAI `input_file`/`input_image`,
   Gemini `document`/`image` content blocks.

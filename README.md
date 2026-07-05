@@ -47,7 +47,7 @@ then prints a pairing code. Message your bot `/pair 123456` on Telegram. Done
 | Anthropic Messages | Claude (with prompt caching + adaptive thinking) |
 | OpenAI Responses | OpenAI, xAI (web search, image generation) |
 | Chat completions | Ollama, DeepSeek, OpenRouter, any compatible endpoint |
-| Google Interactions | Gemini |
+| Google Interactions | Gemini (including image models) |
 
 ## `config.toml` Example
 
@@ -90,6 +90,9 @@ model_name = "gemini-3.5-flash"
 api_key_secret = "gemini_api_key"
 telegram_chat_ids = []
 thinking = "high"
+
+# Gemini image generation requires a Gemini image model id, for example:
+# model_name = "gemini-3.1-flash-image"
 
 # Any OpenAI chat-completions-compatible paid endpoint, such as Mistral,
 # DeepSeek, OpenRouter, or a proxy. base_url is required for compat models.

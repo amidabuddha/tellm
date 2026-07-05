@@ -209,7 +209,7 @@ async fn off_reasoning_and_no_options_omit_optional_fields() {
     assert_missing(&body, "system_instruction");
     assert_missing(&body, "generation_config");
     assert_missing(&body, "tools");
-    assert_missing(&body, "response_modalities");
+    assert_missing(&body, "response_format");
 }
 
 #[tokio::test]
@@ -231,6 +231,7 @@ async fn image_generation_extracts_image_content() {
     )]);
     let mut req = request();
     req.image_generation = true;
+    req.model = "gemini-3.1-flash-image".to_string();
 
     let response = client(&mock).chat(&req).await.unwrap();
 
@@ -239,8 +240,25 @@ async fn image_generation_extracts_image_content() {
     assert_eq!(response.images[0].media_type, "image/png");
     assert_eq!(response.images[0].base64, "BASE64PNG");
     assert_eq!(
-        mock.requests()[0].json_body()["response_modalities"],
-        json!(["text", "image"])
+        mock.requests()[0].json_body()["response_format"],
+        json!({ "type": "image" })
+    );
+}
+
+#[tokio::test]
+async fn image_generation_requires_image_model_before_network() {
+    let mut req = request();
+    req.image_generation = true;
+    let error = Gemini::new("test-key", Some("http://127.0.0.1:9".to_string()))
+        .chat(&req)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("requires an image-capable model"),
+        "{error}"
     );
 }
 
