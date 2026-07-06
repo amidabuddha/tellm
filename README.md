@@ -149,14 +149,22 @@ already present in `config.toml`, `/model add KEY` uses that model's
 `api_key_secret` and opens the same terminal prompt.
 
 For local Ollama models using `base_url = "http://localhost:11434/v1"` (or
-`127.0.0.1` / `[::1]` on port `11434`), tellm checks the local port before a
-request. If Ollama is not running, it starts `ollama serve` and waits briefly
-before dispatching the message. If tellm started that Ollama process, it stops
-it again during normal tellm shutdown, first asking Ollama to unload the local
-models tellm invoked so model runner processes do not stay resident in memory.
-Ollama processes that were already running are left alone. Owners can also send
+`http://127.0.0.1:11434/v1` / `http://[::1]:11434/v1`), tellm checks the local
+port before a request. If Ollama is not running, it starts `ollama serve` and
+waits briefly before dispatching the message. If tellm started that Ollama
+process, it stops it again during tellm shutdown, including terminal
+`exit`/`quit`, Telegram `/shutdown`, SIGINT, and SIGTERM. Before stopping the
+child, tellm asks Ollama to unload the local models that actually completed a
+request in this tellm session so model runner processes do not stay resident in
+memory. Already-evicted models are forgotten instead of retried forever. Ollama
+processes that were already running are left alone. Owners can also send
 `/ollama unload` to unload local Ollama models used by the current tellm
 session without stopping tellm or `ollama serve`.
+
+That lifecycle management is intentionally narrow: it is inferred only for the
+default local HTTP endpoint above. Non-default ports, `https://` proxies,
+`0.0.0.0`/LAN hosts, and remote compat servers are treated as ordinary compat
+endpoints and are neither auto-started nor unloaded.
 
 At startup, tellm also reads every unique `api_key_secret` referenced by
 configured models. This surfaces OS keychain permission prompts before the

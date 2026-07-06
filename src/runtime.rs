@@ -124,7 +124,14 @@ struct OllamaLoadedModel {
 struct OllamaUnloadSummary {
     attempted: usize,
     unloaded: Vec<String>,
+    not_loaded: Vec<String>,
     failed: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OllamaUnloadOutcome {
+    Unloaded,
+    NotLoaded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,9 +199,15 @@ impl Runtime {
         };
         let mut dispatchers = BTreeMap::new();
         let mut offset = 0_i64;
+        let shutdown_signal = shutdown_signal();
+        tokio::pin!(shutdown_signal);
 
         loop {
             tokio::select! {
+                signal = &mut shutdown_signal => {
+                    eprintln!("Shutdown requested from {signal}.");
+                    break;
+                }
                 command = self.terminal_rx.recv() => {
                     match command {
                         Some(TerminalCommand::Reset) => {
@@ -884,12 +897,14 @@ async fn dispatch_provider(
                 .clone()
                 .ok_or_else(|| "compat model is missing base_url".to_string())?;
             ensure_local_ollama_ready(&base_url).await?;
-            remember_local_ollama_model(&base_url, &request.model).await;
+            let requested_model = request.model.clone();
             let api_key = compat_api_key(model)?;
-            Compat::new(api_key, base_url)
+            let response = Compat::new(api_key, base_url.clone())
                 .chat(request)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            remember_local_ollama_model(&base_url, &requested_model).await;
+            Ok(response)
         }
         WireFormat::Gemini => {
             let api_key = required_api_key(model)?;
@@ -1013,6 +1028,9 @@ async fn unload_started_ollama_models() {
     for model in summary.unloaded {
         eprintln!("unloaded Ollama model {model}");
     }
+    for model in summary.not_loaded {
+        eprintln!("Ollama model {model} was already not loaded");
+    }
     for (model, error) in summary.failed {
         eprintln!("failed to unload Ollama model {model}: {error}");
     }
@@ -1030,9 +1048,13 @@ async fn unload_tracked_ollama_models() -> OllamaUnloadSummary {
 
     for model in models {
         match unload_ollama_model(model.base_url.clone(), model.model.clone()).await {
-            Ok(()) => {
+            Ok(OllamaUnloadOutcome::Unloaded) => {
                 ollama_loaded_models().lock().await.remove(&model);
                 summary.unloaded.push(model.model);
+            }
+            Ok(OllamaUnloadOutcome::NotLoaded) => {
+                ollama_loaded_models().lock().await.remove(&model);
+                summary.not_loaded.push(model.model);
             }
             Err(error) => summary.failed.push((model.model, error)),
         }
@@ -1041,7 +1063,10 @@ async fn unload_tracked_ollama_models() -> OllamaUnloadSummary {
     summary
 }
 
-async fn unload_ollama_model(base_url: String, model: String) -> Result<(), String> {
+async fn unload_ollama_model(
+    base_url: String,
+    model: String,
+) -> Result<OllamaUnloadOutcome, String> {
     let addr = local_ollama_addr(&base_url)
         .ok_or_else(|| format!("not a local Ollama endpoint: {base_url}"))?;
     spawn_blocking(move || unload_ollama_model_blocking(&addr, &model))
@@ -1049,7 +1074,7 @@ async fn unload_ollama_model(base_url: String, model: String) -> Result<(), Stri
         .map_err(|error| format!("Ollama unload task failed: {error}"))?
 }
 
-fn unload_ollama_model_blocking(addr: &str, model: &str) -> Result<(), String> {
+fn unload_ollama_model_blocking(addr: &str, model: &str) -> Result<OllamaUnloadOutcome, String> {
     let mut stream = connect_ollama_tcp(addr)?;
     stream
         .set_read_timeout(Some(OLLAMA_UNLOAD_TIMEOUT))
@@ -1067,14 +1092,7 @@ fn unload_ollama_model_blocking(addr: &str, model: &str) -> Result<(), String> {
     stream
         .read_to_string(&mut response)
         .map_err(|error| format!("could not read Ollama unload response: {error}"))?;
-    if http_response_is_success(&response) {
-        return Ok(());
-    }
-
-    Err(format!(
-        "Ollama unload returned {}",
-        response.lines().next().unwrap_or("an empty HTTP response")
-    ))
+    ollama_unload_response_outcome(&response)
 }
 
 fn connect_ollama_tcp(addr: &str) -> Result<TcpStream, String> {
@@ -1112,10 +1130,36 @@ fn ollama_unload_request(addr: &str, model: &str) -> String {
 }
 
 fn http_response_is_success(response: &str) -> bool {
-    matches!(
-        response.lines().next().and_then(|line| line.split(' ').nth(1)),
-        Some(code) if code.starts_with('2')
-    )
+    matches!(http_response_status_code(response), Some(code) if (200..300).contains(&code))
+}
+
+fn http_response_status_code(response: &str) -> Option<u16> {
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+}
+
+fn ollama_unload_response_outcome(response: &str) -> Result<OllamaUnloadOutcome, String> {
+    if http_response_is_success(response) {
+        return Ok(OllamaUnloadOutcome::Unloaded);
+    }
+
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    if http_response_status_code(response) == Some(404)
+        || body.to_ascii_lowercase().contains("not found")
+    {
+        return Ok(OllamaUnloadOutcome::NotLoaded);
+    }
+
+    Err(format!(
+        "Ollama unload returned {}",
+        response.lines().next().unwrap_or("an empty HTTP response")
+    ))
 }
 
 fn ollama_unload_reply(summary: &OllamaUnloadSummary) -> String {
@@ -1129,6 +1173,13 @@ fn ollama_unload_reply(summary: &OllamaUnloadSummary) -> String {
             "Unloaded local Ollama model{}: {}.",
             plural(summary.unloaded.len()),
             summary.unloaded.join(", ")
+        ));
+    }
+    if !summary.not_loaded.is_empty() {
+        parts.push(format!(
+            "Already not loaded local Ollama model{}: {}.",
+            plural(summary.not_loaded.len()),
+            summary.not_loaded.join(", ")
         ));
     }
     if !summary.failed.is_empty() {
@@ -1145,6 +1196,24 @@ fn ollama_unload_reply(summary: &OllamaUnloadSummary) -> String {
     }
 
     parts.join(" ")
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = sigint.recv() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "Ctrl-C"
 }
 
 fn plural(count: usize) -> &'static str {
@@ -2452,17 +2521,23 @@ mod tests {
             ollama_unload_reply(&OllamaUnloadSummary {
                 attempted: 2,
                 unloaded: vec!["llama3.3:70b".to_string(), "qwen3:32b".to_string()],
+                not_loaded: Vec::new(),
                 failed: Vec::new(),
             }),
             "Unloaded local Ollama models: llama3.3:70b, qwen3:32b."
         );
         let partial = ollama_unload_reply(&OllamaUnloadSummary {
-            attempted: 2,
+            attempted: 3,
             unloaded: vec!["llama3.3:70b".to_string()],
+            not_loaded: vec!["gemma4:31b-mlx".to_string()],
             failed: vec![("qwen3:32b".to_string(), "connection refused".to_string())],
         });
         assert!(
             partial.contains("Unloaded local Ollama model: llama3.3:70b."),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("Already not loaded local Ollama model: gemma4:31b-mlx."),
             "{partial}"
         );
         assert!(
@@ -2477,6 +2552,28 @@ mod tests {
         assert!(http_response_is_success("HTTP/1.1 204 No Content\r\n\r\n"));
         assert!(!http_response_is_success("HTTP/1.1 404 Not Found\r\n\r\n"));
         assert!(!http_response_is_success(""));
+    }
+
+    #[test]
+    fn ollama_unload_response_treats_missing_model_as_terminal() {
+        assert_eq!(
+            ollama_unload_response_outcome("HTTP/1.1 200 OK\r\n\r\n{}"),
+            Ok(OllamaUnloadOutcome::Unloaded)
+        );
+        assert_eq!(
+            ollama_unload_response_outcome("HTTP/1.1 404 Not Found\r\n\r\n{}"),
+            Ok(OllamaUnloadOutcome::NotLoaded)
+        );
+        assert_eq!(
+            ollama_unload_response_outcome(
+                "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"model \\\"bad\\\" not found\"}"
+            ),
+            Ok(OllamaUnloadOutcome::NotLoaded)
+        );
+
+        let error = ollama_unload_response_outcome("HTTP/1.1 500 Server Error\r\n\r\n{}")
+            .expect_err("500 remains a real unload failure");
+        assert!(error.contains("HTTP/1.1 500 Server Error"), "{error}");
     }
 
     #[test]

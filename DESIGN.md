@@ -283,16 +283,21 @@ restart and local room-setting changes.
   `api_key_secret`; `/model add KEY` must not open a key prompt for those
   configured models.
 - Local Ollama convenience: for compat models whose `base_url` points at the
-  default local Ollama endpoint (`http://localhost:11434`, `127.0.0.1:11434`,
-  or `[::1]:11434`), the runtime checks the TCP port before dispatch. If it is
-  down, tellm starts `ollama serve` once and waits briefly for readiness. A
-  tellm-started Ollama child is stopped during normal tellm shutdown, after
-  tellm asks Ollama to unload every local model it invoked via `keep_alive: 0`
-  (checked 2026-07-05 against docs.ollama.com/api/generate). An Ollama server
-  that was already running is left alone. Other compat endpoints, including
-  local proxies on different ports, are never auto-started or unloaded.
-  Owners can also send `/ollama unload` to unload local Ollama models invoked
-  by the current tellm process without stopping tellm or `ollama serve`.
+  default local HTTP Ollama endpoint (`http://localhost:11434`,
+  `http://127.0.0.1:11434`, or `http://[::1]:11434`, with or without `/v1`),
+  the runtime checks the TCP port before dispatch. If it is down, tellm starts
+  `ollama serve` once and waits briefly for readiness. A tellm-started Ollama
+  child is stopped during tellm shutdown, including terminal `exit`/`quit`,
+  Telegram `/shutdown`, SIGINT, and SIGTERM, after tellm asks Ollama to unload
+  every local model that completed a request in the current tellm process via
+  `keep_alive: 0` (checked 2026-07-05 against docs.ollama.com/api/generate).
+  A 404 / not-found unload response means the model is already gone and is
+  removed from tellm's in-memory tracking. An Ollama server that was already
+  running is left alone. Other compat endpoints, including `https://` proxies,
+  LAN binds, remote hosts, and local proxies on different ports, are never
+  auto-started or unloaded. Owners can also send `/ollama unload` to unload
+  local Ollama models invoked by the current tellm process without stopping
+  tellm or `ollama serve`.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists, compat models have a base_url, each chat is pinned to at most one
   model. All problems reported at once; the bot refuses to start on an
