@@ -153,11 +153,14 @@ For local Ollama models using `base_url = "http://localhost:11434/v1"` (or
 port before a request. If Ollama is not running, it starts `ollama serve` and
 waits briefly before dispatching the message. If tellm started that Ollama
 process, it stops it again during tellm shutdown, including terminal
-`exit`/`quit`, Telegram `/shutdown`, SIGINT, and SIGTERM. Before stopping the
-child, tellm asks Ollama to unload the local models that actually completed a
-request in this tellm session so model runner processes do not stay resident in
-memory. Already-evicted models are forgotten instead of retried forever. Ollama
-processes that were already running are left alone. Owners can also send
+`exit`/`quit`, Telegram `/shutdown`, SIGINT, SIGTERM, and ordinary panic
+unwinds. Before stopping the child, tellm asks Ollama to unload the local models
+that actually completed a request in this tellm session so model runner
+processes do not stay resident in memory, then sends SIGTERM before falling
+back to SIGKILL. Already-evicted models are forgotten instead of retried
+forever. SIGKILL and power loss cannot run cleanup. Ollama processes that were
+already running, including possible leftovers from a prior hard kill, are left
+alone. Owners can also send
 `/ollama unload` to unload local Ollama models used by the current tellm
 session without stopping tellm or `ollama serve`.
 

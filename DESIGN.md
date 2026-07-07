@@ -148,7 +148,9 @@ Notes:
   Web search is `tools: [{type:"google_search",
   search_types:["web_search"]}]`; image generation is allowed only for Gemini
   image model ids (`*-image*`) and sends `response_format: {"type":"image"}`;
-  generated image content becomes `GeneratedImage`.
+  generated image content becomes `GeneratedImage`. The image-model gate is a
+  fail-closed naming heuristic, not a capability-discovery API; update it if
+  Google's public model ids stop using `-image`.
 - **File upload requires no extraction.** PDFs/images pass through natively:
   Anthropic `document`/`image` blocks, OpenAI `input_file`/`input_image`,
   Gemini `document`/`image` content blocks.
@@ -288,16 +290,19 @@ restart and local room-setting changes.
   the runtime checks the TCP port before dispatch. If it is down, tellm starts
   `ollama serve` once and waits briefly for readiness. A tellm-started Ollama
   child is stopped during tellm shutdown, including terminal `exit`/`quit`,
-  Telegram `/shutdown`, SIGINT, and SIGTERM, after tellm asks Ollama to unload
-  every local model that completed a request in the current tellm process via
-  `keep_alive: 0` (checked 2026-07-05 against docs.ollama.com/api/generate).
-  A 404 / not-found unload response means the model is already gone and is
-  removed from tellm's in-memory tracking. An Ollama server that was already
-  running is left alone. Other compat endpoints, including `https://` proxies,
-  LAN binds, remote hosts, and local proxies on different ports, are never
-  auto-started or unloaded. Owners can also send `/ollama unload` to unload
-  local Ollama models invoked by the current tellm process without stopping
-  tellm or `ollama serve`.
+  Telegram `/shutdown`, SIGINT, SIGTERM, and ordinary panic unwinds, after
+  tellm asks Ollama to unload every local model that completed a request in the
+  current tellm process via `keep_alive: 0` (checked 2026-07-05 against
+  docs.ollama.com/api/generate). The child shutdown path sends SIGTERM, waits
+  briefly, then falls back to SIGKILL. A 404 / not-found unload response means
+  the model is already gone and is removed from tellm's in-memory tracking.
+  SIGKILL and power loss cannot run cleanup. An Ollama server that was already
+  running, including a possible orphan from an earlier hard kill, is left alone
+  rather than adopted and killed. Other compat endpoints, including `https://`
+  proxies, LAN binds, remote hosts, and local proxies on different ports, are
+  never auto-started or unloaded. Owners can also send `/ollama unload` to
+  unload local Ollama models invoked by the current tellm process without
+  stopping tellm or `ollama serve`.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists, compat models have a base_url, each chat is pinned to at most one
   model. All problems reported at once; the bot refuses to start on an

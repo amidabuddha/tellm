@@ -3,7 +3,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -30,10 +30,12 @@ const OLLAMA_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const OLLAMA_START_WAIT: Duration = Duration::from_secs(15);
 const OLLAMA_READY_POLL: Duration = Duration::from_millis(250);
 const OLLAMA_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const OLLAMA_TERMINATE_WAIT: Duration = Duration::from_secs(2);
+const OLLAMA_TERMINATE_POLL: Duration = Duration::from_millis(100);
 const TERMINAL_SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 static OLLAMA_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static OLLAMA_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
-static OLLAMA_LOADED_MODELS: OnceLock<Mutex<BTreeSet<OllamaLoadedModel>>> = OnceLock::new();
+static OLLAMA_CHILD: OnceLock<StdMutex<Option<ManagedOllamaChild>>> = OnceLock::new();
+static OLLAMA_LOADED_MODELS: OnceLock<StdMutex<BTreeSet<OllamaLoadedModel>>> = OnceLock::new();
 
 pub struct Runtime {
     telegram: Telegram,
@@ -120,6 +122,48 @@ struct OllamaLoadedModel {
     model: String,
 }
 
+struct ManagedOllamaChild {
+    child: Option<Child>,
+}
+
+impl ManagedOllamaChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    fn stop(mut self) -> Result<String, String> {
+        let child = self
+            .child
+            .take()
+            .ok_or_else(|| "Ollama child was already stopped".to_string())?;
+        stop_ollama_child(child)
+    }
+}
+
+impl Drop for ManagedOllamaChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        match stop_ollama_child(child) {
+            Ok(message) => eprintln!("{message}"),
+            Err(error) => eprintln!("failed to stop spawned Ollama process during drop: {error}"),
+        }
+    }
+}
+
+struct RuntimeOllamaCleanup;
+
+impl Drop for RuntimeOllamaCleanup {
+    fn drop(&mut self) {
+        stop_started_ollama_blocking();
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct OllamaUnloadSummary {
     attempted: usize,
@@ -174,6 +218,7 @@ impl Runtime {
     }
 
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ollama_cleanup = RuntimeOllamaCleanup;
         let bot = self.telegram.get_me().await?;
         let bot_username = bot.username;
         if let Some(username) = &bot_username {
@@ -903,7 +948,7 @@ async fn dispatch_provider(
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())?;
-            remember_local_ollama_model(&base_url, &requested_model).await;
+            remember_local_ollama_model(&base_url, &requested_model);
             Ok(response)
         }
         WireFormat::Gemini => {
@@ -953,12 +998,12 @@ fn ollama_start_lock() -> &'static Mutex<()> {
     OLLAMA_START_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn ollama_child() -> &'static Mutex<Option<Child>> {
-    OLLAMA_CHILD.get_or_init(|| Mutex::new(None))
+fn ollama_child() -> &'static StdMutex<Option<ManagedOllamaChild>> {
+    OLLAMA_CHILD.get_or_init(|| StdMutex::new(None))
 }
 
-fn ollama_loaded_models() -> &'static Mutex<BTreeSet<OllamaLoadedModel>> {
-    OLLAMA_LOADED_MODELS.get_or_init(|| Mutex::new(BTreeSet::new()))
+fn ollama_loaded_models() -> &'static StdMutex<BTreeSet<OllamaLoadedModel>> {
+    OLLAMA_LOADED_MODELS.get_or_init(|| StdMutex::new(BTreeSet::new()))
 }
 
 async fn tcp_connects(addr: String) -> Result<bool, String> {
@@ -991,32 +1036,53 @@ async fn start_ollama_serve() -> Result<(), String> {
     .map_err(|error| {
         format!("local Ollama is not running and `ollama serve` could not be started: {error}")
     })?;
-    let pid = child.id();
-    *ollama_child().lock().await = Some(child);
+    let child = ManagedOllamaChild::new(child);
+    let pid = child.id().expect("newly spawned child has a pid");
+    *ollama_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
     eprintln!("started `ollama serve` with pid {pid}");
     Ok(())
 }
 
 async fn stop_started_ollama() {
-    let Some(child) = ollama_child().lock().await.take() else {
+    let Some(child) = take_started_ollama_child() else {
         return;
     };
     unload_started_ollama_models().await;
-    match spawn_blocking(move || stop_ollama_child(child)).await {
+    match spawn_blocking(move || child.stop()).await {
         Ok(Ok(message)) => eprintln!("{message}"),
         Ok(Err(error)) => eprintln!("failed to stop spawned Ollama process: {error}"),
         Err(error) => eprintln!("failed to join Ollama shutdown task: {error}"),
     }
 }
 
-async fn remember_local_ollama_model(base_url: &str, model: &str) {
+fn stop_started_ollama_blocking() {
+    let Some(child) = take_started_ollama_child() else {
+        return;
+    };
+    unload_started_ollama_models_blocking();
+    match child.stop() {
+        Ok(message) => eprintln!("{message}"),
+        Err(error) => eprintln!("failed to stop spawned Ollama process: {error}"),
+    }
+}
+
+fn take_started_ollama_child() -> Option<ManagedOllamaChild> {
+    ollama_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+fn remember_local_ollama_model(base_url: &str, model: &str) {
     if local_ollama_addr(base_url).is_none() {
         return;
     }
 
     ollama_loaded_models()
         .lock()
-        .await
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(OllamaLoadedModel {
             base_url: base_url.to_string(),
             model: model.to_string(),
@@ -1025,6 +1091,15 @@ async fn remember_local_ollama_model(base_url: &str, model: &str) {
 
 async fn unload_started_ollama_models() {
     let summary = unload_tracked_ollama_models().await;
+    log_ollama_unload_summary(summary);
+}
+
+fn unload_started_ollama_models_blocking() {
+    let summary = unload_tracked_ollama_models_blocking();
+    log_ollama_unload_summary(summary);
+}
+
+fn log_ollama_unload_summary(summary: OllamaUnloadSummary) {
     for model in summary.unloaded {
         eprintln!("unloaded Ollama model {model}");
     }
@@ -1037,8 +1112,23 @@ async fn unload_started_ollama_models() {
 }
 
 async fn unload_tracked_ollama_models() -> OllamaUnloadSummary {
+    spawn_blocking(unload_tracked_ollama_models_blocking)
+        .await
+        .unwrap_or_else(|error| OllamaUnloadSummary {
+            attempted: 1,
+            failed: vec![(
+                "tracked Ollama models".to_string(),
+                format!("Ollama unload task failed: {error}"),
+            )],
+            ..OllamaUnloadSummary::default()
+        })
+}
+
+fn unload_tracked_ollama_models_blocking() -> OllamaUnloadSummary {
     let models = {
-        let models = ollama_loaded_models().lock().await;
+        let models = ollama_loaded_models()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         models.iter().cloned().collect::<Vec<_>>()
     };
     let mut summary = OllamaUnloadSummary {
@@ -1047,13 +1137,19 @@ async fn unload_tracked_ollama_models() -> OllamaUnloadSummary {
     };
 
     for model in models {
-        match unload_ollama_model(model.base_url.clone(), model.model.clone()).await {
+        match unload_ollama_model(&model) {
             Ok(OllamaUnloadOutcome::Unloaded) => {
-                ollama_loaded_models().lock().await.remove(&model);
+                ollama_loaded_models()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&model);
                 summary.unloaded.push(model.model);
             }
             Ok(OllamaUnloadOutcome::NotLoaded) => {
-                ollama_loaded_models().lock().await.remove(&model);
+                ollama_loaded_models()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&model);
                 summary.not_loaded.push(model.model);
             }
             Err(error) => summary.failed.push((model.model, error)),
@@ -1063,15 +1159,10 @@ async fn unload_tracked_ollama_models() -> OllamaUnloadSummary {
     summary
 }
 
-async fn unload_ollama_model(
-    base_url: String,
-    model: String,
-) -> Result<OllamaUnloadOutcome, String> {
-    let addr = local_ollama_addr(&base_url)
-        .ok_or_else(|| format!("not a local Ollama endpoint: {base_url}"))?;
-    spawn_blocking(move || unload_ollama_model_blocking(&addr, &model))
-        .await
-        .map_err(|error| format!("Ollama unload task failed: {error}"))?
+fn unload_ollama_model(model: &OllamaLoadedModel) -> Result<OllamaUnloadOutcome, String> {
+    let addr = local_ollama_addr(&model.base_url)
+        .ok_or_else(|| format!("not a local Ollama endpoint: {}", model.base_url))?;
+    unload_ollama_model_blocking(&addr, &model.model)
 }
 
 fn unload_ollama_model_blocking(addr: &str, model: &str) -> Result<OllamaUnloadOutcome, String> {
@@ -1231,15 +1322,73 @@ fn stop_ollama_child(mut child: Child) -> Result<String, String> {
         ));
     }
 
+    let fallback_reason = match terminate_ollama_child(&mut child) {
+        Ok(method) => {
+            if let Some(status) = wait_for_ollama_exit(&mut child)? {
+                return Ok(format!(
+                    "stopped tellm-started `ollama serve` pid {pid} after {method} with {status}"
+                ));
+            }
+            format!("{method} timeout")
+        }
+        Err(error) => format!("failed graceful stop: {error}"),
+    };
+
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| format!("could not inspect pid {pid}: {error}"))?
+    {
+        return Ok(format!(
+            "stopped tellm-started `ollama serve` pid {pid} after {fallback_reason} with {status}"
+        ));
+    }
+
     child
         .kill()
-        .map_err(|error| format!("could not kill pid {pid}: {error}"))?;
+        .map_err(|error| format!("could not kill pid {pid} after {fallback_reason}: {error}"))?;
     let status = child
         .wait()
         .map_err(|error| format!("could not wait for pid {pid}: {error}"))?;
     Ok(format!(
-        "stopped tellm-started `ollama serve` pid {pid} with {status}"
+        "stopped tellm-started `ollama serve` pid {pid} with SIGKILL after {fallback_reason}: {status}"
     ))
+}
+
+#[cfg(unix)]
+fn terminate_ollama_child(child: &mut Child) -> Result<&'static str, String> {
+    let pid = child.id();
+    let raw_pid = i32::try_from(pid).map_err(|_| format!("pid {pid} does not fit in pid_t"))?;
+    let result = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
+    if result == 0 {
+        Ok("SIGTERM")
+    } else {
+        Err(format!(
+            "could not send SIGTERM to pid {pid}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_ollama_child(_child: &mut Child) -> Result<&'static str, String> {
+    Err("graceful process termination is unsupported on this platform".to_string())
+}
+
+fn wait_for_ollama_exit(child: &mut Child) -> Result<Option<std::process::ExitStatus>, String> {
+    let pid = child.id();
+    let deadline = StdInstant::now() + OLLAMA_TERMINATE_WAIT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("could not inspect pid {pid}: {error}"))?
+        {
+            return Ok(Some(status));
+        }
+        if StdInstant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(OLLAMA_TERMINATE_POLL);
+    }
 }
 
 fn local_ollama_addr(base_url: &str) -> Option<String> {
@@ -2574,6 +2723,54 @@ mod tests {
         let error = ollama_unload_response_outcome("HTTP/1.1 500 Server Error\r\n\r\n{}")
             .expect_err("500 remains a real unload failure");
         assert!(error.contains("HTTP/1.1 500 Server Error"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_ollama_child_uses_sigterm_before_sigkill() {
+        let child = ProcessCommand::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep test process");
+
+        let message = stop_ollama_child(child).expect("stop child");
+        assert!(message.contains("SIGTERM"), "{message}");
+        assert!(!message.contains("SIGKILL"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_ollama_cleanup_drop_stops_tracked_child() {
+        drop(take_started_ollama_child());
+        let child = ProcessCommand::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep test process");
+        let pid = child.id();
+        *ollama_child()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ManagedOllamaChild::new(child));
+
+        {
+            let _guard = RuntimeOllamaCleanup;
+        }
+
+        assert!(take_started_ollama_child().is_none());
+        assert!(!process_exists(pid), "pid {pid} should have exited");
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        let raw_pid = i32::try_from(pid).expect("test pid fits in pid_t");
+        let result = unsafe { libc::kill(raw_pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     #[test]
