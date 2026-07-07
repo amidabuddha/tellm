@@ -6,8 +6,9 @@ One small binary. No Docker, no Python, no config scavenger hunt. Chat with
 Claude, GPT, Grok, Gemini, or your local Ollama models from any Telegram
 client — usage billed directly by your API providers, not by a subscription.
 
-> **Status: pre-alpha.** The design is in
-> [DESIGN.md](DESIGN.md); the battle-tested reference implementation lives in
+> **Status: alpha.** Runs as the author's daily driver across every supported
+> provider, but it hasn't been road-tested by anyone else yet — expect rough
+> edges and the occasional breaking change. It grew out of
 > [console-chat-gpt](https://github.com/amidabuddha/console-chat-gpt).
 
 ## Why
@@ -22,10 +23,22 @@ client — usage billed directly by your API providers, not by a subscription.
   minutes, rate-limited per chat. Secrets live in your OS keychain, not in a
   dotfile.
 - **Not an agent.** No shell access, no skills registry, no browser control,
-  no MCP. The entire attack surface is HTTPS calls to Telegram and your model
-  providers. If you want an agent, run OpenClaw — in a VM. If you want to
-  *talk to models* from your pocket without handing anything the keys to your
-  machine, that's tellm.
+  no MCP. The whole attack surface is HTTPS calls to Telegram and your model
+  providers — nothing on your machine to inject into or steal, beyond keys
+  that live in your OS keychain.
+
+## Why not OpenClaw?
+
+OpenClaw and similar agent frameworks put an LLM in your messenger *and* give
+it hands: shell, filesystem, a skills registry, browser control. That power
+comes with a matching attack surface: exposed control planes, prompt-injection
+paths to data exfiltration, and malicious entries in extension registries.
+
+tellm is the deliberate opposite. It has no hands. It relays messages between
+Telegram and your model providers and does nothing else: no shell to hijack,
+no skill to poison, no control UI to leak a token. If you want an autonomous
+agent, run one — in a VM. If you just want to *talk to models* from your phone
+without handing anything the keys to your machine, that's tellm.
 
 ## Install From Source
 
@@ -48,6 +61,28 @@ then prints a pairing code. Message your bot `/pair 123456` on Telegram. Done
 | OpenAI Responses | OpenAI, xAI (web search, image generation) |
 | Chat completions | Ollama, DeepSeek, OpenRouter, any compatible endpoint |
 | Google Interactions | Gemini (including image models) |
+
+## Commands
+
+Send these to the bot in any allowed chat. Owner-only commands are marked.
+
+| Command | Does |
+|---|---|
+| `/help` | List commands |
+| `/new` | Reset this chat's conversation |
+| `/id` | Show this chat's Telegram id |
+| `/mode chat\|message` | Multi-turn context, or one question per message |
+| `/model [KEY]` | Show or switch this room's model |
+| `/model add [KEY]` | List the provider catalog, or add a preset (owner) |
+| `/model pin KEY` · `/model unpin` | Lock or release this room's model (owner) |
+| `/role TEXT\|clear` | Set or clear the system prompt |
+| `/reasoning default\|off\|low\|medium\|high\|max` | Thinking effort |
+| `/websearch on\|off\|status` | Provider-native web search |
+| `/imagegen on\|off\|status` | Image generation (capable models only) |
+| `/pair CODE` | Claim an unpaired chat with the code from the terminal |
+| `/allow CHAT_ID` · `/deny CHAT_ID` | Approve or revoke a chat (owner) |
+| `/ollama unload` | Unload this session's local Ollama models (owner) |
+| `/shutdown` | Stop tellm (owner) |
 
 ## `config.toml` Example
 
