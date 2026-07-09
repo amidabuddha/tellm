@@ -20,6 +20,10 @@ pub const TELEGRAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 pub const TELEGRAM_LONG_POLL_GRACE: Duration = Duration::from_secs(30);
 
 /// Chunk limit for plain/HTML `sendMessage` (Telegram caps at 4096).
+/// Caveat: `chunk_text` counts chars while Telegram's cap counts UTF-16 code
+/// units, so astral-plane-heavy text (emoji) can still exceed the cap and
+/// fail delivery. Inherited from the Python reference — the golden vectors
+/// pin char-counting semantics, so any fix belongs there first.
 pub const TEXT_CHUNK_SIZE: usize = 3900;
 /// Chunk limit for `sendRichMessage`.
 pub const RICH_CHUNK_SIZE: usize = 32000;

@@ -15,9 +15,11 @@ These rules apply to every contributor — human, Claude, Codex, or otherwise.
 
 ## Work packaging
 
-- Tickets live in **TICKETS.md**. One ticket per commit series; keep commits
-  scoped to one behavioral change with an imperative subject line and a body
-  that explains why.
+- The maintainer's backlog (TICKETS.md) is deliberately local and untracked —
+  a fresh clone does not have it. Contributors propose and pick up work
+  through GitHub issues instead. One ticket/issue per commit series; keep
+  commits scoped to one behavioral change with an imperative subject line and
+  a body that explains why.
 - Golden tests precede ports: `chunk_text` and `markdown_to_html` must be
   implemented against `crates/tellm-telegram/tests/golden/*.json` (remove the
   `#[ignore]` attributes; do not edit the vectors to make tests pass —

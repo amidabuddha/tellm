@@ -198,6 +198,10 @@ Notes:
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
   chunking at 32000/3900 chars. Fallback triggers ported from the Python
   implementation's error-marker list.
+- Shutdown (terminal `exit`/`quit`, Telegram `/shutdown`, SIGINT/SIGTERM)
+  stops polling and cuts any in-flight provider turns — deliberately, since
+  draining could block exit for the length of a multi-minute turn. Only the
+  tellm-started Ollama child gets graceful cleanup (see § Configuration).
 
 ### Telegram commands (v1)
 
