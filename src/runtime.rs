@@ -851,11 +851,15 @@ async fn handle_model_message(
                 let mut rooms = handles.rooms.lock().await;
                 *rooms.get_or_default(chat_id) = before_state;
             }
+            // This reply IS the error handling — returning Err here would
+            // make the chat worker send a second "tellm error" message for
+            // the same failure.
+            eprintln!("chat {chat_id} model call failed: {error}");
             let _ = handles
                 .telegram
                 .send_message(chat_id, &provider_error_reply(&error))
                 .await;
-            Err(error)
+            Ok(())
         }
     }
 }
