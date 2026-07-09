@@ -95,7 +95,6 @@ default_model = "claude"
 [telegram]
 allowed_chat_ids = []
 owner_user_ids = []
-max_concurrent_updates = 8
 
 [models.claude]
 wire_format = "anthropic"

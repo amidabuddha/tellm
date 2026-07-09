@@ -80,8 +80,6 @@ pub struct TelegramConfig {
     /// needed.
     #[serde(default)]
     pub owner_user_ids: Vec<i64>,
-    #[serde(default)]
-    pub max_concurrent_updates: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

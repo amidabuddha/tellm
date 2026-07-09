@@ -2799,7 +2799,6 @@ mod tests {
             telegram: tellm_config::TelegramConfig {
                 allowed_chat_ids: vec![1, 42],
                 owner_user_ids: Vec::new(),
-                max_concurrent_updates: None,
             },
         };
 
@@ -2831,7 +2830,6 @@ mod tests {
             telegram: tellm_config::TelegramConfig {
                 allowed_chat_ids: vec![7],
                 owner_user_ids: vec![7],
-                max_concurrent_updates: None,
             },
         };
 
