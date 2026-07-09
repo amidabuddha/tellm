@@ -70,3 +70,8 @@ serde_json.workspace = true
 toml.workspace = true
 getrandom.workspace = true
 libc.workspace = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
