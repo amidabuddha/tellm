@@ -1,9 +1,9 @@
 //! OpenAI Responses API client (`POST /v1/responses`) - used for OpenAI,
 //! Meta Model API, and xAI (Grok) via `base_url` switch.
 //!
-//! Mapping notes (checked 2026-07-04 against platform.openai.com and
-//! docs.x.ai, and 2026-07-09 against dev.meta.ai - re-check live provider
-//! docs before changing these mappings):
+//! Mapping notes (checked 2026-07-04 against platform.openai.com, refreshed
+//! 2026-07-09 against docs.x.ai for Grok 4.5, and checked 2026-07-09 against
+//! dev.meta.ai - re-check live provider docs before changing these mappings):
 //! - Reasoning: `reasoning: {"effort": ...}`; omit for ThinkingLevel::Off.
 //!   Include `reasoning.encrypted_content` when reasoning is requested so
 //!   stateless history can replay reasoning items later.
@@ -202,7 +202,7 @@ fn tools(request: &ChatRequest, is_xai: bool) -> Vec<Value> {
     let mut tools = Vec::new();
     if request.web_search {
         if is_xai {
-            // Checked 2026-07-04 against docs.x.ai Web Search and X Search
+            // Checked 2026-07-09 against docs.x.ai Web Search and X Search
             // docs: both tools are available through the Responses surface.
             tools.push(json!({ "type": "web_search" }));
             tools.push(json!({ "type": "x_search" }));
@@ -253,8 +253,9 @@ fn content_parts_to_responses(parts: &[ContentPart]) -> Vec<Value> {
 
 /// Checked 2026-07-05: OpenAI effort values are none/minimal/low/medium/
 /// high/xhigh (model-dependent subsets; xhigh only on models that list it).
-/// xAI grok-4.3 accepts none/low/medium/high — no xhigh — so Max clamps to
-/// "high" on xAI requests.
+/// xAI grok-4.5 accepts low/medium/high, defaults to high, and cannot disable
+/// reasoning — no xhigh — so Off omits the field and Max clamps to "high" on
+/// xAI requests. Checked 2026-07-09 against docs.x.ai reasoning docs.
 fn responses_effort(thinking: ThinkingLevel, is_xai: bool) -> Option<&'static str> {
     match thinking {
         ThinkingLevel::Off => None,

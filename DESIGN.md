@@ -79,17 +79,18 @@ state, so:
 - Switching a room's wire format resets the opaque history (announced to the
   user).
 
-Thinking-level translation (verified against live provider docs 2026-07-05):
+Thinking-level translation (verified against live provider docs 2026-07-05;
+xAI Grok 4.5 refreshed 2026-07-09):
 
 | Level | Anthropic Messages | OpenAI Responses | xAI Responses | Chat completions | Gemini |
 |---|---|---|---|---|---|
 | off | omit `thinking` | omit `reasoning` | omit | omit `reasoning_effort` | omit `thinking_level` |
 | low/medium/high | adaptive + `output_config.effort` | `reasoning: {effort}` | same | `reasoning_effort` | `thinking_level` |
-| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "xhigh"` (model-dependent) | clamps to `"high"` (grok-4.3 has no xhigh) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
+| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "xhigh"` (model-dependent) | clamps to `"high"` (grok-4.5 has no xhigh) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
 
 Validity caveats (2026-07-05):
 - **"off" means provider default everywhere, not "no thinking"**: Sonnet 5 /
-  Fable 5 think anyway, gpt-5.5 defaults to medium, grok-4.3 defaults to low,
+  Fable 5 think anyway, gpt-5.5 defaults to medium, grok-4.5 defaults to high,
   Gemini thinks dynamically. User-facing text must say "default", not "off".
 - OpenAI `xhigh` is officially model-dependent; an unsupported value errors
   explicitly and the user can lower the room's level.
@@ -130,10 +131,11 @@ Notes:
   reasoning can be replayed on later stateless turns. OpenAI system prompts use
   top-level `instructions`; xAI currently rejects `instructions`, so xAI
   system prompts are sent as compatible input message items instead (checked
-  2026-07-04).
+  2026-07-04; still shown as input messages in 2026-07-09 Grok 4.5 docs).
 - OpenAI Responses web search uses the `web_search` tool. xAI Responses uses
   `web_search` plus `x_search` for tellm's search toggle (checked
-  2026-07-04). Meta Model API Responses uses the same `web_search` tool,
+  2026-07-09 against docs.x.ai for Grok 4.5). Meta Model API Responses uses
+  the same `web_search` tool,
   supports image understanding through `input_image` and `input_file`, and
   does not document image generation on this surface (checked 2026-07-09
   against dev.meta.ai). OpenAI image generation uses `image_generation`, and
@@ -320,7 +322,7 @@ restart and local room-setting changes.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
   from the built-in list (checked 2026-07-04: Claude Fable 5, GPT-5.5,
-  Grok 4.3, Muse Spark 1.1, Gemini 3.5 Flash), stores Telegram/provider
+  Grok 4.5, Muse Spark 1.1, Gemini 3.5 Flash), stores Telegram/provider
   secrets via the secret facade, writes nonsecret config, and explains the
   `/pair CODE` claim step.
   Target: install-to-chatting under two minutes, zero file editing.

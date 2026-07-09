@@ -184,7 +184,7 @@ async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
         }),
     )]);
     let mut req = request();
-    req.model = "grok-4.3".to_string();
+    req.model = "grok-4.5".to_string();
     req.history = Vec::new();
     req.input = vec![ContentPart::Text {
         text: "Search X.".to_string(),
@@ -200,7 +200,7 @@ async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
     let body = mock.requests()[0].json_body();
     assert_missing(&body, "instructions");
     assert_missing(&body, "max_output_tokens");
-    // grok-4.3 has no xhigh effort: Max must clamp to high on xAI requests.
+    // grok-4.5 has no xhigh effort: Max must clamp to high on xAI requests.
     assert_eq!(body["reasoning"], json!({ "effort": "high" }));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(
@@ -351,7 +351,7 @@ async fn api_error_uses_responses_error_message() {
 #[tokio::test]
 async fn xai_image_generation_is_reported_unsupported_before_network() {
     let mut req = request();
-    req.model = "grok-4.3".to_string();
+    req.model = "grok-4.5".to_string();
     req.image_generation = true;
 
     let error = Responses::new("test-key", Some("http://127.0.0.1:9".to_string()))

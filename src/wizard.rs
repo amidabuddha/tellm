@@ -40,6 +40,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 // Checked 2026-07-04 against platform.claude.com model docs,
 // developers.openai.com API model docs, and docs.x.ai model docs.
 // Checked 2026-07-09 against dev.meta.ai Model API docs for Muse Spark.
+// Checked 2026-07-09 against docs.x.ai model docs for Grok 4.5.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -59,9 +60,9 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         key: "xai",
-        label: "xAI Grok 4.3",
+        label: "xAI Grok 4.5",
         wire_format: WireFormat::Responses,
-        model_name: "grok-4.3",
+        model_name: "grok-4.5",
         base_url: Some(tellm_openai::XAI_BASE_URL),
         api_key_secret: secrets::XAI_API_KEY,
     },
@@ -247,7 +248,7 @@ mod tests {
 
         assert_eq!(config.default_model, "xai");
         assert_eq!(model.wire_format, WireFormat::Responses);
-        assert_eq!(model.model_name, "grok-4.3");
+        assert_eq!(model.model_name, "grok-4.5");
         assert_eq!(model.base_url.as_deref(), Some(tellm_openai::XAI_BASE_URL));
         assert_eq!(model.api_key_secret.as_deref(), Some(secrets::XAI_API_KEY));
         assert!(model.telegram_chat_ids.is_empty());

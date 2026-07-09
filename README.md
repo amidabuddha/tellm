@@ -113,7 +113,7 @@ thinking = "high"
 
 [models.grok]
 wire_format = "responses"
-model_name = "grok-4.3"
+model_name = "grok-4.5"
 base_url = "https://api.x.ai/v1"
 api_key_secret = "xai_api_key"
 telegram_chat_ids = []
