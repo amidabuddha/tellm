@@ -8,6 +8,8 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/amidabuddha/tellm"
 authors = ["Stefan"]
+# Floor set by let-chains, stabilized in 1.88 for edition 2024.
+rust-version = "1.88"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +46,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tellm-core.workspace = true
