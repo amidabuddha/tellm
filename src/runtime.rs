@@ -939,14 +939,14 @@ async fn dispatch_provider(
 ) -> Result<ChatResponse, String> {
     match model.wire_format {
         WireFormat::Anthropic => {
-            let api_key = required_api_key(model)?;
+            let api_key = required_api_key(model).await?;
             Anthropic::new(api_key, model.base_url.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
         }
         WireFormat::Responses => {
-            let api_key = required_api_key(model)?;
+            let api_key = required_api_key(model).await?;
             Responses::new(api_key, model.base_url.clone())
                 .chat(request)
                 .await
@@ -959,7 +959,7 @@ async fn dispatch_provider(
                 .ok_or_else(|| "compat model is missing base_url".to_string())?;
             ensure_local_ollama_ready(&base_url).await?;
             let requested_model = request.model.clone();
-            let api_key = compat_api_key(model)?;
+            let api_key = compat_api_key(model).await?;
             let response = Compat::new(api_key, base_url.clone())
                 .chat(request)
                 .await
@@ -968,7 +968,7 @@ async fn dispatch_provider(
             Ok(response)
         }
         WireFormat::Gemini => {
-            let api_key = required_api_key(model)?;
+            let api_key = required_api_key(model).await?;
             Gemini::new(api_key, model.base_url.clone())
                 .chat(request)
                 .await
@@ -2379,19 +2379,29 @@ fn configured_model_key(config: &Config, requested: &str) -> Option<String> {
         .cloned()
 }
 
-fn required_api_key(model: &ModelConfig) -> Result<String, String> {
+async fn required_api_key(model: &ModelConfig) -> Result<String, String> {
     let secret_name = model
         .api_key_secret
-        .as_deref()
+        .clone()
         .ok_or_else(|| format!("model {} has no api_key_secret", model.model_name))?;
-    secrets::get(secret_name).ok_or_else(|| missing_provider_secret_error(secret_name))
+    fetch_secret(secret_name).await
 }
 
-fn compat_api_key(model: &ModelConfig) -> Result<String, String> {
-    let Some(secret_name) = model.api_key_secret.as_deref() else {
+async fn compat_api_key(model: &ModelConfig) -> Result<String, String> {
+    let Some(secret_name) = model.api_key_secret.clone() else {
         return Ok(String::new());
     };
-    secrets::get(secret_name).ok_or_else(|| missing_provider_secret_error(secret_name))
+    fetch_secret(secret_name).await
+}
+
+/// OS keychain access blocks (and can prompt on macOS); keep the per-request
+/// secret read off the async worker threads.
+async fn fetch_secret(secret_name: String) -> Result<String, String> {
+    spawn_blocking(move || {
+        secrets::get(&secret_name).ok_or_else(|| missing_provider_secret_error(&secret_name))
+    })
+    .await
+    .map_err(|error| format!("secret lookup task failed: {error}"))?
 }
 
 fn missing_provider_secret_error(secret_name: &str) -> String {
@@ -3272,15 +3282,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compat_api_key_distinguishes_keyless_from_missing_secret() {
+    #[tokio::test]
+    async fn compat_api_key_distinguishes_keyless_from_missing_secret() {
         let mut keyless = test_model(WireFormat::Compat, &[]);
         keyless.api_key_secret = None;
-        assert_eq!(compat_api_key(&keyless).unwrap(), "");
+        assert_eq!(compat_api_key(&keyless).await.unwrap(), "");
 
         let mut keyed = test_model(WireFormat::Compat, &[]);
         keyed.api_key_secret = Some("definitely_missing_tellm_test_secret".to_string());
-        let error = compat_api_key(&keyed).unwrap_err();
+        let error = compat_api_key(&keyed).await.unwrap_err();
         assert!(
             error.contains("definitely_missing_tellm_test_secret"),
             "{error}"
