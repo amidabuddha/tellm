@@ -15,7 +15,9 @@
 //! don't do it.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -178,15 +180,46 @@ pub fn load() -> Result<Config, ConfigError> {
 pub fn save(config: &Config) -> Result<(), ConfigError> {
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(config_path()?, toml::to_string_pretty(config)?)?;
+    write_atomic(&config_path()?, &toml::to_string_pretty(config)?)?;
+    Ok(())
+}
+
+/// Write via a same-directory temp file + rename so a crash mid-write can
+/// never truncate the previous version. These files are rewritten on every
+/// /allow, /model, and toggle — and credentials.toml may hold every API key.
+pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_atomic_with_mode(path, contents, None)
+}
+
+fn write_atomic_with_mode(path: &Path, contents: &str, mode: Option<u32>) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+        })?;
+    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(&tmp)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
 /// Secret storage facade: env-var override, OS keychain, then `0600` file.
 pub mod secrets {
     use std::collections::BTreeMap;
-    use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::fs;
     use std::path::PathBuf;
     #[cfg(feature = "keychain")]
     use std::sync::OnceLock;
@@ -397,13 +430,7 @@ pub mod secrets {
             fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(secrets)?;
-        let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&path)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
+        super::write_atomic_with_mode(&path, &text, Some(0o600))?;
         ensure_credentials_permissions(&path)?;
         Ok(())
     }

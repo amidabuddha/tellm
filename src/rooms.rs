@@ -222,7 +222,7 @@ pub fn save_settings(settings: &BTreeMap<i64, RoomSettings>) -> Result<(), Confi
             .map(|(chat_id, settings)| (chat_id.to_string(), settings.clone()))
             .collect(),
     };
-    fs::write(path, toml::to_string_pretty(&file)?)?;
+    tellm_config::write_atomic(&path, &toml::to_string_pretty(&file)?)?;
     Ok(())
 }
 
