@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 use serde::{Deserialize, Serialize};
 use tellm_core::ThinkingLevel;
@@ -220,11 +220,11 @@ fn write_atomic_with_mode(path: &Path, contents: &str, mode: Option<u32>) -> std
 pub mod secrets {
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     #[cfg(feature = "keychain")]
     use std::sync::OnceLock;
-
-    use super::*;
 
     const KEYCHAIN_SERVICE: &str = "tellm";
     const CREDENTIALS_FILE: &str = "credentials.toml";

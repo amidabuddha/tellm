@@ -25,7 +25,13 @@ dirs = "6"
 keyring-core = "1.0.0"
 apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 windows-native-keyring-store = "1.1.0"
-zbus-secret-service-keyring-store = "1.0.0"
+# secret-service requires picking a runtime + crypto feature. async-io keeps
+# the store independent of tellm's tokio runtime (the secret facade is sync,
+# called at startup and from spawn_blocking); rust crypto avoids OpenSSL
+# linkage per the distribution rule.
+zbus-secret-service-keyring-store = { version = "1.0.0", features = [
+    "rt-async-io-crypto-rust",
+] }
 getrandom = "0.3"
 rpassword = "7"
 base64 = "0.22"
