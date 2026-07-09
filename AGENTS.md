@@ -47,6 +47,10 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 (`--workspace` matters: from the root, plain `cargo test` runs only the
 binary crate and silently skips every library's tests.)
 
+CI (`.github/workflows/ci.yml`) runs this same gate on Linux, macOS, and
+Windows for every push and pull request — the keychain stores are
+platform-gated, so only CI compiles all three.
+
 ## Hard boundaries (do not cross without a DESIGN.md change)
 
 - No streaming. No MCP. No agent tooling beyond provider-native web search /
