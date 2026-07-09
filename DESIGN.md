@@ -177,7 +177,9 @@ Notes:
 - **Strictly ordered execution per chat via one tokio mpsc task per chat**
   (decided 2026-07-04; idle tasks are reaped). The channel gives ordering and
   backpressure for free and is the tokio-native equivalent of the parent's
-  chained-futures design.
+  chained-futures design. The queue is bounded (32 per chat); when a room
+  backs up behind a slow turn, further messages are dropped with a busy
+  notice instead of blocking the poll loop for every other chat.
 - In-memory conversations; **room settings persist** across restarts
   (model pin, mode, role, optional thinking override, web-search toggle,
   image-generation toggle) in `config_dir()/rooms.toml` — runtime state

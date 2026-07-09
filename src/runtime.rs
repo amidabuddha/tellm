@@ -14,6 +14,7 @@ use tellm_core::{ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provide
 use tellm_gemini::Gemini;
 use tellm_openai::Responses;
 use tellm_telegram::{Document, IncomingMessage, PhotoSize, Telegram, TelegramError};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::{Instant as TokioInstant, sleep, timeout};
@@ -392,7 +393,7 @@ impl Runtime {
 
         match access {
             ChatAccess::Allowed => {
-                send_to_chat_worker(chat_id, kind, message, handles, dispatchers).await;
+                send_to_chat_worker(chat_id, kind, message, handles, dispatchers);
             }
             ChatAccess::Unknown { send_hint } => {
                 // Arm (or refresh) this room's pairing code on any contact;
@@ -428,37 +429,48 @@ impl Runtime {
     }
 }
 
-async fn send_to_chat_worker(
+/// Queue the update for its chat worker without ever blocking the poll
+/// loop: awaiting a full queue would stall dispatch for every chat behind
+/// one slow room, so a full queue drops the message with a busy notice.
+fn send_to_chat_worker(
     chat_id: i64,
     kind: UpdateKind,
     message: IncomingMessage,
     handles: &RuntimeHandles,
     dispatchers: &mut BTreeMap<i64, ChatDispatcher>,
 ) {
-    dispatchers
+    let dispatcher = dispatchers
         .entry(chat_id)
         .or_insert_with(|| spawn_chat_worker(chat_id, handles.clone()));
 
-    let send_result = dispatchers
-        .get(&chat_id)
-        .expect("dispatcher inserted")
+    let dispatch = match dispatcher
         .sender
-        .send(DispatchMessage {
-            kind,
-            message: message.clone(),
-        })
-        .await;
+        .try_send(DispatchMessage { kind, message })
+    {
+        Ok(()) => return,
+        Err(TrySendError::Full(_)) => {
+            eprintln!("chat {chat_id} queue is full; dropping message");
+            let telegram = handles.telegram.clone();
+            tokio::spawn(async move {
+                let _ = telegram
+                    .send_message(
+                        chat_id,
+                        "Too many queued messages in this chat; this one was dropped. \
+                         Resend it after the current reply.",
+                    )
+                    .await;
+            });
+            return;
+        }
+        // The worker reaped itself after idling; respawn and retry.
+        Err(TrySendError::Closed(dispatch)) => dispatch,
+    };
 
-    if send_result.is_err() {
-        dispatchers.remove(&chat_id);
-        dispatchers.insert(chat_id, spawn_chat_worker(chat_id, handles.clone()));
-        let _ = dispatchers
-            .get(&chat_id)
-            .expect("dispatcher respawned")
-            .sender
-            .send(DispatchMessage { kind, message })
-            .await;
+    let dispatcher = spawn_chat_worker(chat_id, handles.clone());
+    if dispatcher.sender.try_send(dispatch).is_err() {
+        eprintln!("chat {chat_id} dispatch failed: fresh worker rejected the message");
     }
+    dispatchers.insert(chat_id, dispatcher);
 }
 
 fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
