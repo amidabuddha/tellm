@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "tellm"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom 0.3.4",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "tellm-anthropic"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "tellm-compat"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "tellm-config"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
  "dirs",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "tellm-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "tellm-gemini"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "tellm-openai"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "tellm-telegram"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
