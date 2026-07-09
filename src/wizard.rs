@@ -41,6 +41,8 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 // developers.openai.com API model docs, and docs.x.ai model docs.
 // Checked 2026-07-09 against dev.meta.ai Model API docs for Muse Spark.
 // Checked 2026-07-09 against docs.x.ai model docs for Grok 4.5.
+// Checked 2026-07-09 against developers.openai.com latest-model guide for
+// GPT-5.6 Sol (Responses API; reasoning.effort low/medium/high/xhigh/max).
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -52,9 +54,9 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         key: "openai",
-        label: "OpenAI GPT-5.5",
+        label: "OpenAI GPT-5.6 Sol",
         wire_format: WireFormat::Responses,
-        model_name: "gpt-5.5",
+        model_name: "gpt-5.6-sol",
         base_url: None,
         api_key_secret: secrets::OPENAI_API_KEY,
     },

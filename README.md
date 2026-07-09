@@ -106,7 +106,7 @@ thinking = "max"
 
 [models.gpt]
 wire_format = "responses"
-model_name = "gpt-5.5"
+model_name = "gpt-5.6-sol"
 api_key_secret = "openai_api_key"
 telegram_chat_ids = []
 thinking = "high"

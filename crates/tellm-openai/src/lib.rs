@@ -184,8 +184,8 @@ fn request_body(request: &ChatRequest, user_message: Value, is_xai: bool) -> Val
         body["max_output_tokens"] = json!(max_tokens);
     }
 
-    if let Some(effort) = responses_effort(request.thinking, is_xai) {
-        // Checked 2026-07-05 against OpenAI/xAI Responses reasoning docs.
+    if let Some(effort) = responses_effort(request.thinking, &request.model, is_xai) {
+        // Checked 2026-07-09 against OpenAI/xAI/Meta Responses reasoning docs.
         body["reasoning"] = json!({ "effort": effort });
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
@@ -251,20 +251,40 @@ fn content_parts_to_responses(parts: &[ContentPart]) -> Vec<Value> {
         .collect()
 }
 
-/// Checked 2026-07-05: OpenAI effort values are none/minimal/low/medium/
-/// high/xhigh (model-dependent subsets; xhigh only on models that list it).
-/// xAI grok-4.5 accepts low/medium/high, defaults to high, and cannot disable
-/// reasoning — no xhigh — so Off omits the field and Max clamps to "high" on
-/// xAI requests. Checked 2026-07-09 against docs.x.ai reasoning docs.
-fn responses_effort(thinking: ThinkingLevel, is_xai: bool) -> Option<&'static str> {
+/// Maps our five thinking levels onto each Responses model family's accepted
+/// `reasoning.effort` vocabulary. `Off` always omits the field (every family
+/// then reasons at its own default — Grok and Muse Spark cannot disable
+/// reasoning at all, so omission is the closest honest mapping). The families
+/// differ only at the top tier:
+/// - GPT-5.6 (sol/terra/luna): none/low/medium/high/xhigh/**max** — Max→"max"
+///   (checked 2026-07-09 against developers.openai.com latest-model guide).
+/// - Older OpenAI (gpt-5.5 …): none/minimal/low/medium/high/xhigh — Max→"xhigh".
+/// - Meta Muse Spark 1.1: minimal/low/medium/high/xhigh, no "none" — Max→"xhigh"
+///   (checked 2026-07-09 against dev.meta.ai reasoning docs).
+/// - xAI Grok 4.5: low/medium/high, default high, cannot disable — Max→"high"
+///   (checked 2026-07-09 against docs.x.ai reasoning docs).
+fn responses_effort(
+    thinking: ThinkingLevel,
+    model_name: &str,
+    is_xai: bool,
+) -> Option<&'static str> {
     match thinking {
         ThinkingLevel::Off => None,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),
         ThinkingLevel::Max if is_xai => Some("high"),
+        ThinkingLevel::Max if supports_max_effort(model_name) => Some("max"),
         ThinkingLevel::Max => Some("xhigh"),
     }
+}
+
+/// Whether the model accepts the `max` reasoning effort tier above `xhigh`.
+/// Only the OpenAI GPT-5.6 family lists it today; everything else (older
+/// OpenAI, Grok, Muse Spark) tops out at xhigh/high, so unverified models stay
+/// on the safe xhigh mapping until their docs are checked and added here.
+fn supports_max_effort(model_name: &str) -> bool {
+    model_name.starts_with("gpt-5.6")
 }
 
 fn extract_text(output: &[Value]) -> String {
@@ -320,4 +340,77 @@ fn trim_trailing_slash(mut value: String) -> String {
         value.pop();
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effort_off_omits_field_for_every_family() {
+        for (model, is_xai) in [
+            ("gpt-5.6-sol", false),
+            ("gpt-5.5", false),
+            ("muse-spark-1.1", false),
+            ("grok-4.5", true),
+        ] {
+            assert_eq!(
+                responses_effort(ThinkingLevel::Off, model, is_xai),
+                None,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_low_medium_high_are_family_independent() {
+        for (model, is_xai) in [("gpt-5.6-sol", false), ("gpt-5.5", false), ("grok-4.5", true)] {
+            assert_eq!(responses_effort(ThinkingLevel::Low, model, is_xai), Some("low"));
+            assert_eq!(
+                responses_effort(ThinkingLevel::Medium, model, is_xai),
+                Some("medium")
+            );
+            assert_eq!(
+                responses_effort(ThinkingLevel::High, model, is_xai),
+                Some("high")
+            );
+        }
+    }
+
+    #[test]
+    fn max_maps_to_the_top_tier_each_family_accepts() {
+        // GPT-5.6 family gains the new "max" tier.
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, "gpt-5.6-sol", false),
+            Some("max")
+        );
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, "gpt-5.6", false),
+            Some("max")
+        );
+        // Older OpenAI and Meta Muse Spark top out at xhigh.
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, "gpt-5.5", false),
+            Some("xhigh")
+        );
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, "muse-spark-1.1", false),
+            Some("xhigh")
+        );
+        // Grok cannot exceed high, even though "gpt-5.6" would — is_xai wins.
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, "grok-4.5", true),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn supports_max_effort_only_recognizes_gpt_5_6_family() {
+        assert!(supports_max_effort("gpt-5.6"));
+        assert!(supports_max_effort("gpt-5.6-sol"));
+        assert!(supports_max_effort("gpt-5.6-terra"));
+        assert!(!supports_max_effort("gpt-5.5"));
+        assert!(!supports_max_effort("grok-4.5"));
+        assert!(!supports_max_effort("muse-spark-1.1"));
+    }
 }

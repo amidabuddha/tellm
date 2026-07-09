@@ -90,10 +90,13 @@ xAI Grok 4.5 refreshed 2026-07-09):
 
 Validity caveats (2026-07-05):
 - **"off" means provider default everywhere, not "no thinking"**: Sonnet 5 /
-  Fable 5 think anyway, gpt-5.5 defaults to medium, grok-4.5 defaults to high,
+  Fable 5 think anyway, gpt-5.6-sol reasons at its own default, grok-4.5 defaults to high,
   Gemini thinks dynamically. User-facing text must say "default", not "off".
-- OpenAI `xhigh` is officially model-dependent; an unsupported value errors
-  explicitly and the user can lower the room's level.
+- OpenAI effort is model-dependent: the GPT-5.6 family (sol/terra/luna) adds a
+  `max` tier above `xhigh`, so `/reasoning max` sends `max` there and `xhigh` on
+  older OpenAI and Meta Muse Spark; Grok 4.5 has no tier above `high` and cannot
+  disable reasoning, so its `Max` clamps to `high` and `Off` omits the field. An
+  unsupported value errors explicitly and the user can lower the room's level.
 - Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
   model should be configured with `thinking = "low"` or `thinking = "high"`;
   gemini-3.1-pro and 3.5-flash accept medium.
@@ -321,7 +324,7 @@ restart and local room-setting changes.
   No encrypted-file theater.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
-  from the built-in list (checked 2026-07-04: Claude Fable 5, GPT-5.5,
+  from the built-in list (checked 2026-07-09: Claude Fable 5, GPT-5.6 Sol,
   Grok 4.5, Muse Spark 1.1, Gemini 3.5 Flash), stores Telegram/provider
   secrets via the secret facade, writes nonsecret config, and explains the
   `/pair CODE` claim step.
