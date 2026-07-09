@@ -17,7 +17,7 @@ pub struct CommandContext<'a> {
 }
 
 /// What the room's effective model can honor, statically known from its
-/// wire format (plus the xAI endpoint check). Toggling a capability ON in a
+/// wire format plus provider endpoint checks. Toggling a capability ON in a
 /// room that can never honor it is refused at the toggle instead of arming
 /// a per-message failure.
 #[derive(Debug, Clone, PartialEq, Eq)]

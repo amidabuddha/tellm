@@ -223,6 +223,50 @@ async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
 }
 
 #[tokio::test]
+async fn meta_model_api_uses_responses_with_xhigh_search_and_no_generation() {
+    let mock = MockOpenAi::start(vec![MockResponse::json(
+        200,
+        json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "ok" }]
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.model = "muse-spark-1.1".to_string();
+    req.history = Vec::new();
+    req.input = vec![ContentPart::Text {
+        text: "Search the web.".to_string(),
+    }];
+    req.thinking = ThinkingLevel::Max;
+    req.web_search = true;
+    req.image_generation = false;
+    req.max_tokens = None;
+
+    let response = client(&mock).chat(&req).await.unwrap();
+
+    assert_eq!(response.text, "ok");
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["instructions"], "Be concise.");
+    assert_eq!(body["reasoning"], json!({ "effort": "xhigh" }));
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(body["tools"], json!([{ "type": "web_search" }]));
+    assert_eq!(
+        body["input"],
+        json!([
+            {
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Search the web." }]
+            }
+        ])
+    );
+}
+
+#[tokio::test]
 async fn off_reasoning_and_no_options_omit_optional_fields() {
     let mock = MockOpenAi::start(vec![MockResponse::json(
         200,
@@ -308,6 +352,22 @@ async fn api_error_uses_responses_error_message() {
 async fn xai_image_generation_is_reported_unsupported_before_network() {
     let mut req = request();
     req.model = "grok-4.3".to_string();
+    req.image_generation = true;
+
+    let error = Responses::new("test-key", Some("http://127.0.0.1:9".to_string()))
+        .chat(&req)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ProviderError::Unsupported(message) if message.contains("image_generation"))
+    );
+}
+
+#[tokio::test]
+async fn meta_image_generation_is_reported_unsupported_before_network() {
+    let mut req = request();
+    req.model = "muse-spark-1.1".to_string();
     req.image_generation = true;
 
     let error = Responses::new("test-key", Some("http://127.0.0.1:9".to_string()))

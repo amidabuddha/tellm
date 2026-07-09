@@ -39,6 +39,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 
 // Checked 2026-07-04 against platform.claude.com model docs,
 // developers.openai.com API model docs, and docs.x.ai model docs.
+// Checked 2026-07-09 against dev.meta.ai Model API docs for Muse Spark.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -63,6 +64,14 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         model_name: "grok-4.3",
         base_url: Some(tellm_openai::XAI_BASE_URL),
         api_key_secret: secrets::XAI_API_KEY,
+    },
+    ProviderPreset {
+        key: "meta",
+        label: "Meta Muse Spark 1.1",
+        wire_format: WireFormat::Responses,
+        model_name: "muse-spark-1.1",
+        base_url: Some(tellm_openai::META_MODEL_API_BASE_URL),
+        api_key_secret: secrets::META_MODEL_API_KEY,
     },
     ProviderPreset {
         key: "gemini",

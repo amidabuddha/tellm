@@ -1,8 +1,9 @@
-//! OpenAI Responses API client (`POST /v1/responses`) - used for both
-//! OpenAI models and xAI (Grok) via `base_url` switch.
+//! OpenAI Responses API client (`POST /v1/responses`) - used for OpenAI,
+//! Meta Model API, and xAI (Grok) via `base_url` switch.
 //!
 //! Mapping notes (checked 2026-07-04 against platform.openai.com and
-//! docs.x.ai - re-check live provider docs before changing these mappings):
+//! docs.x.ai, and 2026-07-09 against dev.meta.ai - re-check live provider
+//! docs before changing these mappings):
 //! - Reasoning: `reasoning: {"effort": ...}`; omit for ThinkingLevel::Off.
 //!   Include `reasoning.encrypted_content` when reasoning is requested so
 //!   stateless history can replay reasoning items later.
@@ -10,10 +11,11 @@
 //!   `ChatRequest::history` / `ChatResponse::turn_items`.
 //! - System prompts: OpenAI uses top-level `instructions`; xAI currently
 //!   rejects `instructions`, so system prompts are sent as input message items.
-//! - Web search: OpenAI uses `{"type": "web_search"}`; xAI uses
-//!   `web_search` plus `x_search` for tellm's search toggle.
+//! - Web search: OpenAI and Meta Model API use `{"type": "web_search"}`;
+//!   xAI uses `web_search` plus `x_search` for tellm's search toggle.
 //! - Image generation: `{"type": "image_generation"}` tool (OpenAI only);
-//!   results come back as base64 in `image_generation_call` output items.
+//!   Meta Model API supports image understanding, not image generation.
+//!   Results come back as base64 in `image_generation_call` output items.
 //! - Files/images: `input_file` / `input_image` content parts.
 
 use std::time::Duration;
@@ -24,6 +26,7 @@ use tellm_core::{
 };
 
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const META_MODEL_API_BASE_URL: &str = "https://api.meta.ai/v1";
 pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -60,9 +63,16 @@ impl Responses {
 impl Provider for Responses {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let is_xai = self.is_xai_request(request);
+        let is_meta = self.is_meta_model_api_request(request);
         if is_xai && request.image_generation {
             return Err(ProviderError::Unsupported(
                 "xAI Responses does not support OpenAI image_generation".to_string(),
+            ));
+        }
+        if is_meta && request.image_generation {
+            return Err(ProviderError::Unsupported(
+                "Meta Model API Responses supports image understanding, not image_generation"
+                    .to_string(),
             ));
         }
 
@@ -118,6 +128,10 @@ impl Responses {
     fn is_xai_request(&self, request: &ChatRequest) -> bool {
         is_xai_endpoint(Some(&self.base_url), &request.model)
     }
+
+    fn is_meta_model_api_request(&self, request: &ChatRequest) -> bool {
+        is_meta_model_api_endpoint(Some(&self.base_url), &request.model)
+    }
 }
 
 /// Whether a Responses request targets xAI rather than OpenAI. Shared with
@@ -127,6 +141,17 @@ pub fn is_xai_endpoint(base_url: Option<&str>, model_name: &str) -> bool {
         || model_name
             .get(..5)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("grok-"))
+}
+
+/// Whether a Responses request targets Meta Model API. Shared with the
+/// runtime so `/imagegen` gating matches the provider backstop.
+pub fn is_meta_model_api_endpoint(base_url: Option<&str>, model_name: &str) -> bool {
+    // Checked 2026-07-09 against dev.meta.ai Model API docs: the Responses
+    // base URL is https://api.meta.ai/v1 and the launch model is muse-spark-1.1.
+    base_url.is_some_and(|url| url.contains("api.meta.ai"))
+        || model_name
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("muse-spark"))
 }
 
 fn request_body(request: &ChatRequest, user_message: Value, is_xai: bool) -> Value {
@@ -182,7 +207,8 @@ fn tools(request: &ChatRequest, is_xai: bool) -> Vec<Value> {
             tools.push(json!({ "type": "web_search" }));
             tools.push(json!({ "type": "x_search" }));
         } else {
-            // Checked 2026-07-04 against OpenAI web search docs.
+            // Checked 2026-07-04 against OpenAI web search docs and
+            // 2026-07-09 against Meta Model API search-grounding docs.
             tools.push(json!({ "type": "web_search" }));
         }
     }

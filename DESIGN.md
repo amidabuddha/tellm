@@ -26,8 +26,8 @@ which remains the reference implementation and the author's fallback during the 
         ┌────────────┬───┴────────┬──────────────┐
   tellm-anthropic tellm-openai tellm-compat  tellm-gemini
    Messages API   Responses API chat completions Interactions API
-   (Anthropic)    (OpenAI, xAI) (Ollama, DeepSeek, (Gemini)
-                                 OpenRouter, ...)
+   Anthropic      OpenAI/xAI/Meta Ollama/DeepSeek Gemini
+                                OpenRouter/...
 ```
 
 **No middleware.** Each wire-format crate talks to the provider's latest
@@ -42,7 +42,7 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | `tellm-telegram` | Bot API client: long polling, rich→HTML→plain delivery chain, chunking, markdown→HTML |
 | `tellm-config` | TOML config (non-secrets), keychain/0600 secret store, explicit capability routing |
 | `tellm-anthropic` | Anthropic Messages API |
-| `tellm-openai` | OpenAI Responses API (OpenAI + xAI via base_url) |
+| `tellm-openai` | OpenAI Responses API (OpenAI, xAI, Meta via base_url) |
 | `tellm-compat` | OpenAI chat-completions dialect (Ollama, DeepSeek, OpenRouter, any compatible) |
 | `tellm-gemini` | Google Interactions API (Gemini) |
 | root binary | Runtime loop, command router, sessions, pairing, wizard |
@@ -100,7 +100,7 @@ Validity caveats (2026-07-05):
   max_tokens, and 4096 risked mid-thought truncation at high/max effort.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
   `/websearch on` refuse in rooms whose wire format or model id can never
-  honor them (image generation: Anthropic/compat/xAI/non-image Gemini models;
+  honor them (image generation: Anthropic/compat/xAI/Meta/non-image Gemini models;
   web search: compat), naming the model and endpoint. Support that still varies
   per model *inside* a capable format (for example, which OpenAI models can use
   the image tool) stays a request-time error, with the error reply suggesting
@@ -123,7 +123,7 @@ Notes:
   continuing the request with the paused assistant message appended; return all
   assistant messages from the loop in `turn_items` so opaque history remains
   replayable.
-- OpenAI/xAI Responses are used statelessly (`store: false`): prior
+- OpenAI/Meta/xAI Responses are used statelessly (`store: false`): prior
   provider-native input/output items are replayed in `input`, and every
   response `output` item is returned in `turn_items` verbatim. When reasoning
   is requested, `include: ["reasoning.encrypted_content"]` is set so encrypted
@@ -133,9 +133,12 @@ Notes:
   2026-07-04).
 - OpenAI Responses web search uses the `web_search` tool. xAI Responses uses
   `web_search` plus `x_search` for tellm's search toggle (checked
-  2026-07-04). OpenAI image generation uses `image_generation`, and
+  2026-07-04). Meta Model API Responses uses the same `web_search` tool,
+  supports image understanding through `input_image` and `input_file`, and
+  does not document image generation on this surface (checked 2026-07-09
+  against dev.meta.ai). OpenAI image generation uses `image_generation`, and
   `image_generation_call.result` base64 payloads become `GeneratedImage`; xAI
-  image generation is unsupported in the Responses crate.
+  and Meta image generation are unsupported in the Responses crate.
 - Chat-completions compat uses the broad OpenAI/Ollama dialect: `messages`,
   `stream: false`, `max_tokens`, `reasoning_effort`, and image input via
   `image_url` data URLs (checked 2026-07-04). Web search, image generation,
@@ -317,8 +320,9 @@ restart and local room-setting changes.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
   from the built-in list (checked 2026-07-04: Claude Fable 5, GPT-5.5,
-  Grok 4.3, Gemini 3.5 Flash), stores Telegram/provider secrets via the secret
-  facade, writes nonsecret config, and explains the `/pair CODE` claim step.
+  Grok 4.3, Muse Spark 1.1, Gemini 3.5 Flash), stores Telegram/provider
+  secrets via the secret facade, writes nonsecret config, and explains the
+  `/pair CODE` claim step.
   Target: install-to-chatting under two minutes, zero file editing.
 
 ## Porting method

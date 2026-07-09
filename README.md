@@ -58,7 +58,7 @@ then prints a pairing code. Message your bot `/pair 123456` on Telegram. Done
 | Wire format | Providers |
 |---|---|
 | Anthropic Messages | Claude (with prompt caching + adaptive thinking) |
-| OpenAI Responses | OpenAI, xAI (web search, image generation) |
+| OpenAI Responses | OpenAI, xAI, Meta Model API (web search; OpenAI image generation) |
 | Chat completions | Ollama, DeepSeek, OpenRouter, any compatible endpoint |
 | Google Interactions | Gemini (including image models) |
 
@@ -119,6 +119,14 @@ api_key_secret = "xai_api_key"
 telegram_chat_ids = []
 thinking = "high"
 
+[models.meta]
+wire_format = "responses"
+model_name = "muse-spark-1.1"
+base_url = "https://api.meta.ai/v1"
+api_key_secret = "meta_model_api_key"
+telegram_chat_ids = []
+thinking = "max"
+
 [models.gemini]
 wire_format = "gemini"
 model_name = "gemini-3.5-flash"
@@ -153,7 +161,7 @@ The four wiring shapes are:
 
 - Built-in provider default endpoint: omit `base_url`, set `api_key_secret`.
 - Provider variant on the same wire format: set `base_url` and `api_key_secret`
-  (xAI through `responses` is the built-in example).
+  (xAI and Meta Model API through `responses` are built-in examples).
 - Remote chat-completions-compatible endpoint: `wire_format = "compat"` with
   both `base_url` and `api_key_secret`.
 - Local/keyless compatible endpoint: `wire_format = "compat"` with `base_url`

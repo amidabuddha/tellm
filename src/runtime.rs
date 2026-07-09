@@ -1654,8 +1654,8 @@ async fn pair_code_from_message(
 }
 
 /// Compute what the room's effective model can honor. Statically
-/// knowable from the wire format plus the xAI endpoint check; model-level
-/// variation inside a capable format stays a request-time error.
+/// knowable from the wire format plus endpoint checks; model-level variation
+/// inside a capable format stays a request-time error.
 fn room_capabilities(
     config: &Config,
     room: &RoomState,
@@ -1671,6 +1671,11 @@ fn room_capabilities(
         WireFormat::Responses => {
             if tellm_openai::is_xai_endpoint(model.base_url.as_deref(), &model.model_name) {
                 (true, false, "xAI Responses")
+            } else if tellm_openai::is_meta_model_api_endpoint(
+                model.base_url.as_deref(),
+                &model.model_name,
+            ) {
+                (true, false, "Meta Model API Responses")
             } else {
                 (true, true, "OpenAI Responses")
             }
@@ -3157,6 +3162,30 @@ mod tests {
         let capabilities = room_capabilities(&config, &room, 42);
         assert!(capabilities.web_search);
         assert!(capabilities.image_generation);
+    }
+
+    #[test]
+    fn meta_model_api_responses_disable_image_generation_capability() {
+        let room = RoomState::new(crate::rooms::RoomSettings {
+            model_key: Some("meta".to_string()),
+            ..crate::rooms::RoomSettings::default()
+        });
+        let mut config = Config {
+            default_model: "meta".to_string(),
+            models: BTreeMap::new(),
+            telegram: tellm_config::TelegramConfig::default(),
+        };
+
+        let mut meta = test_model(WireFormat::Responses, &[]);
+        meta.model_name = "muse-spark-1.1".to_string();
+        meta.base_url = Some(tellm_openai::META_MODEL_API_BASE_URL.to_string());
+        config.models.insert("meta".to_string(), meta);
+
+        let capabilities = room_capabilities(&config, &room, 42);
+
+        assert!(capabilities.web_search);
+        assert!(!capabilities.image_generation);
+        assert_eq!(capabilities.endpoint, "Meta Model API Responses");
     }
 
     #[test]

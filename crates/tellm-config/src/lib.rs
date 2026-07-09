@@ -43,7 +43,7 @@ pub enum ConfigError {
 pub enum WireFormat {
     /// Anthropic Messages API.
     Anthropic,
-    /// OpenAI Responses API (OpenAI, xAI).
+    /// OpenAI Responses API (OpenAI, xAI, Meta Model API).
     Responses,
     /// OpenAI chat-completions-compatible (Ollama, DeepSeek, OpenRouter, ...).
     Compat,
@@ -203,6 +203,7 @@ pub mod secrets {
     pub const ANTHROPIC_API_KEY: &str = "anthropic_api_key";
     pub const OPENAI_API_KEY: &str = "openai_api_key";
     pub const XAI_API_KEY: &str = "xai_api_key";
+    pub const META_MODEL_API_KEY: &str = "meta_model_api_key";
     pub const GEMINI_API_KEY: &str = "gemini_api_key";
 
     #[derive(Debug, thiserror::Error)]

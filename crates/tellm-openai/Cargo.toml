@@ -1,6 +1,6 @@
 [package]
 name = "tellm-openai"
-description = "OpenAI Responses API client for tellm (OpenAI and xAI models)"
+description = "OpenAI Responses API client for tellm (OpenAI, xAI, and Meta models)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
