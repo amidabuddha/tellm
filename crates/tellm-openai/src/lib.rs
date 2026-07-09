@@ -364,8 +364,15 @@ mod tests {
 
     #[test]
     fn effort_low_medium_high_are_family_independent() {
-        for (model, is_xai) in [("gpt-5.6-sol", false), ("gpt-5.5", false), ("grok-4.5", true)] {
-            assert_eq!(responses_effort(ThinkingLevel::Low, model, is_xai), Some("low"));
+        for (model, is_xai) in [
+            ("gpt-5.6-sol", false),
+            ("gpt-5.5", false),
+            ("grok-4.5", true),
+        ] {
+            assert_eq!(
+                responses_effort(ThinkingLevel::Low, model, is_xai),
+                Some("low")
+            );
             assert_eq!(
                 responses_effort(ThinkingLevel::Medium, model, is_xai),
                 Some("medium")
