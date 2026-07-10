@@ -162,6 +162,24 @@ async fn text_only_input_uses_plain_string_content_and_omits_optional_fields() {
 }
 
 #[tokio::test]
+async fn keyless_client_omits_authorization_header_entirely() {
+    let mock = MockCompat::start(vec![MockResponse::json(
+        200,
+        json!({
+            "choices": [{ "message": { "role": "assistant", "content": "local" } }]
+        }),
+    )]);
+
+    let response = Compat::new("   ", mock.base_url())
+        .chat(&request())
+        .await
+        .unwrap();
+
+    assert_eq!(response.text, "local");
+    assert_eq!(mock.requests()[0].header("authorization"), None);
+}
+
+#[tokio::test]
 async fn unsupported_features_are_reported_before_network() {
     let client = Compat::new("test-key", "http://127.0.0.1:9");
 

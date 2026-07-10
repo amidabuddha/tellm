@@ -13,6 +13,7 @@
 //!   `ProviderError::Unsupported` so the user gets told instead of guessing.
 //! - Images: `image_url` content parts (data URLs); documents: unsupported.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -26,13 +27,13 @@ pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Clone)]
 pub struct Compat {
     http: reqwest::Client,
-    base_url: String,
-    api_key: String,
+    chat_completions_url: String,
+    api_key: Option<String>,
 }
 
 impl Compat {
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self::with_base_url_and_timeout(api_key, base_url, PROVIDER_REQUEST_TIMEOUT)
+        Self::with_client(api_key, base_url, default_http_client())
     }
 
     pub fn with_base_url_and_timeout(
@@ -40,14 +41,20 @@ impl Compat {
         base_url: impl Into<String>,
         request_timeout: Duration,
     ) -> Self {
+        let http = build_http_client(request_timeout);
+        Self::with_client(api_key, base_url, http)
+    }
+
+    fn with_client(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        http: reqwest::Client,
+    ) -> Self {
+        let api_key = api_key.into();
         Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(PROVIDER_CONNECT_TIMEOUT.min(request_timeout))
-                .timeout(request_timeout)
-                .build()
-                .expect("valid reqwest client configuration"),
-            base_url: trim_trailing_slash(base_url.into()),
-            api_key: api_key.into(),
+            http,
+            chat_completions_url: chat_completions_url(base_url.into()),
+            api_key: (!api_key.trim().is_empty()).then_some(api_key),
         }
     }
 }
@@ -92,13 +99,11 @@ impl Provider for Compat {
 
 impl Compat {
     async fn send_request(&self, body: Value) -> Result<Value, ProviderError> {
-        let response = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
+        let mut request = self.http.post(&self.chat_completions_url);
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.json(&body).send().await?;
 
         let status = response.status();
         let response_body: Value = response.json().await?;
@@ -253,4 +258,27 @@ fn trim_trailing_slash(mut value: String) -> String {
         value.pop();
     }
     value
+}
+
+fn chat_completions_url(base_url: String) -> String {
+    let mut url = trim_trailing_slash(base_url);
+    url.push_str("/chat/completions");
+    url
+}
+
+fn default_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    // Client clones retain the same connection pool, so models using the
+    // default timeout do not rebuild TLS and pooling state per message.
+    CLIENT
+        .get_or_init(|| build_http_client(PROVIDER_REQUEST_TIMEOUT))
+        .clone()
+}
+
+fn build_http_client(request_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT.min(request_timeout))
+        .timeout(request_timeout)
+        .build()
+        .expect("valid reqwest client configuration")
 }

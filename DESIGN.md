@@ -168,8 +168,10 @@ Notes:
   are called non-streaming. This deletes the largest complexity class of the
   parent app.
 - HTTP clients use explicit timeouts. Provider calls have a 10s connect timeout
-  and long total timeout for multi-minute turns; Telegram calls use bounded
-  request/upload/download timeouts and long-poll timeout plus a grace window.
+  and long total timeout for multi-minute turns; production instances of each
+  wire-format client share a process-wide `reqwest` connection pool. Telegram
+  calls use bounded request/upload/download timeouts and long-poll timeout plus
+  a grace window.
 
 ## Runtime model (ported from console-chat-gpt)
 
@@ -297,7 +299,7 @@ restart and local room-setting changes.
   Provider credentials are referenced by secret name (`api_key_secret`),
   never stored inline. Keyless endpoints, especially local Ollama, omit
   `api_key_secret`; `/model add KEY` must not open a key prompt for those
-  configured models.
+  configured models, and their compat requests omit `Authorization` entirely.
 - Local Ollama convenience: for compat models whose `base_url` points at the
   default local HTTP Ollama endpoint (`http://localhost:11434`,
   `http://127.0.0.1:11434`, or `http://[::1]:11434`, with or without `/v1`),
