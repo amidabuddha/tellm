@@ -180,7 +180,7 @@ impl Telegram {
             &json!({
                 "offset": offset,
                 "timeout": timeout_s,
-                "allowed_updates": ["message", "edited_message", "my_chat_member"],
+                "allowed_updates": ["message", "my_chat_member"],
             }),
             Duration::from_secs(u64::from(timeout_s)) + TELEGRAM_LONG_POLL_GRACE,
         )

@@ -64,6 +64,7 @@ struct RuntimeHandles {
     room_persist: Arc<Mutex<()>>,
     persistence: PersistenceWriter,
     workers: WorkerRegistry,
+    queue_full_notices: Arc<StdMutex<BTreeSet<i64>>>,
 }
 
 #[derive(Clone)]
@@ -200,6 +201,20 @@ impl AbortOnDrop {
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+struct QueueFullNoticeGuard {
+    chat_id: i64,
+    pending: Arc<StdMutex<BTreeSet<i64>>>,
+}
+
+impl Drop for QueueFullNoticeGuard {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.chat_id);
     }
 }
 
@@ -385,9 +400,11 @@ impl Runtime {
             room_persist: Arc::new(Mutex::new(())),
             persistence,
             workers: Arc::clone(&workers),
+            queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
         };
         let mut dispatchers = BTreeMap::new();
         let mut offset = 0_i64;
+        let mut terminal_controls_open = true;
         let shutdown_signal = shutdown_signal();
         tokio::pin!(shutdown_signal);
 
@@ -397,15 +414,19 @@ impl Runtime {
                     eprintln!("Shutdown requested from {signal}.");
                     break;
                 }
-                command = self.terminal_rx.recv() => {
+                command = self.terminal_rx.recv(), if terminal_controls_open => {
                     match command {
                         Some(TerminalCommand::Reset) => {
                             self.rooms.lock().await.reset_all_history();
                             eprintln!("All in-memory chat histories cleared; room settings kept.");
                         }
-                        Some(TerminalCommand::Shutdown) | None => {
+                        Some(TerminalCommand::Shutdown) => {
                             eprintln!("Shutdown requested from terminal.");
                             break;
+                        }
+                        None => {
+                            terminal_controls_open = false;
+                            eprintln!("Terminal input closed; terminal controls disabled.");
                         }
                     }
                 }
@@ -419,14 +440,21 @@ impl Runtime {
                 updates = self.telegram.get_updates(offset, LONG_POLL_TIMEOUT_S) => {
                     match updates {
                         Ok(updates) => {
-                            for update in updates {
+                            for mut update in updates {
                                 offset = offset.max(update.update_id + 1);
-                                if let Some(membership) = update.my_chat_member {
+                                if let Some(membership) = update.my_chat_member.take() {
                                     self.handle_membership_change(membership, &handles).await;
-                                } else if let Some(message) = update.message {
-                                    self.handle_update(UpdateKind::Message, message, &handles, &mut dispatchers).await;
+                                } else if let Some((kind, message)) = dispatchable_message(&mut update) {
+                                    self.handle_update(kind, message, &handles, &mut dispatchers).await;
                                 } else if let Some(message) = update.edited_message {
-                                    self.handle_update(UpdateKind::EditedMessage, message, &handles, &mut dispatchers).await;
+                                    // Updates already queued before edited messages were removed
+                                    // from allowed_updates can still arrive. Never turn an edit
+                                    // into a second billed provider call.
+                                    log_update_route(
+                                        message.chat.id,
+                                        UpdateKind::EditedMessage,
+                                        UpdateRoute::Ignored,
+                                    );
                                 }
                             }
                         }
@@ -511,7 +539,10 @@ impl Runtime {
                         eprintln!("{}", group_privacy_hint(chat_id));
                     }
                     let setup = room_setup_reply(chat_id, false, handles).await;
-                    let _ = handles.telegram.send_message(chat_id, &setup).await;
+                    let telegram = handles.telegram.clone();
+                    tokio::spawn(async move {
+                        let _ = telegram.send_message(chat_id, &setup).await;
+                    });
                     return;
                 }
 
@@ -582,16 +613,27 @@ impl Runtime {
                     }
                 } else if send_hint {
                     log_update_route(chat_id, kind, UpdateRoute::Ignored);
-                    let _ = self
-                        .telegram
-                        .send_message(chat_id, &unknown_chat_hint(chat_id))
-                        .await;
+                    let telegram = self.telegram.clone();
+                    tokio::spawn(async move {
+                        let _ = telegram
+                            .send_message(chat_id, &unknown_chat_hint(chat_id))
+                            .await;
+                    });
                 } else {
                     log_update_route(chat_id, kind, UpdateRoute::Ignored);
                 }
             }
         }
     }
+}
+
+fn dispatchable_message(
+    update: &mut tellm_telegram::Update,
+) -> Option<(UpdateKind, IncomingMessage)> {
+    update
+        .message
+        .take()
+        .map(|message| (UpdateKind::Message, message))
 }
 
 /// Queue the update for its chat worker without ever blocking the poll
@@ -615,16 +657,22 @@ fn send_to_chat_worker(
         Ok(()) => return,
         Err(TrySendError::Full(_)) => {
             eprintln!("chat {chat_id} queue is full; dropping message");
-            let telegram = handles.telegram.clone();
-            tokio::spawn(async move {
-                let _ = telegram
-                    .send_message(
-                        chat_id,
-                        "Too many queued messages in this chat; this one was dropped. \
-                         Resend it after the current reply.",
-                    )
-                    .await;
-            });
+            let should_send_notice =
+                reserve_queue_full_notice(&handles.queue_full_notices, chat_id);
+            if should_send_notice {
+                let telegram = handles.telegram.clone();
+                let pending = Arc::clone(&handles.queue_full_notices);
+                tokio::spawn(async move {
+                    let _guard = QueueFullNoticeGuard { chat_id, pending };
+                    let _ = telegram
+                        .send_message(
+                            chat_id,
+                            "Too many queued messages in this chat; this one was dropped. \
+                             Resend it after the current reply.",
+                        )
+                        .await;
+                });
+            }
             return;
         }
         // The worker reaped itself after idling; respawn and retry.
@@ -636,6 +684,13 @@ fn send_to_chat_worker(
         eprintln!("chat {chat_id} dispatch failed: fresh worker rejected the message");
     }
     dispatchers.insert(chat_id, dispatcher);
+}
+
+fn reserve_queue_full_notice(pending: &Arc<StdMutex<BTreeSet<i64>>>, chat_id: i64) -> bool {
+    pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(chat_id)
 }
 
 fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
@@ -3178,6 +3233,7 @@ mod tests {
             room_persist: Arc::new(Mutex::new(())),
             persistence: persistence.clone(),
             workers: Arc::new(StdMutex::new(BTreeMap::new())),
+            queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
         };
 
         let error = persist_provisional_pair(42, Some(7), &handles)
@@ -3278,6 +3334,7 @@ mod tests {
             room_persist: Arc::new(Mutex::new(())),
             persistence: persistence.clone(),
             workers,
+            queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
         };
 
         let task_handles = handles.clone();
@@ -3343,6 +3400,47 @@ mod tests {
             .await
             .expect("background task should be aborted")
             .expect("drop notification should arrive");
+    }
+
+    #[test]
+    fn queue_full_notice_is_coalesced_per_room_until_send_finishes() {
+        let pending = Arc::new(StdMutex::new(BTreeSet::new()));
+        assert!(reserve_queue_full_notice(&pending, 42));
+        assert!(!reserve_queue_full_notice(&pending, 42));
+        assert!(reserve_queue_full_notice(&pending, 7));
+
+        drop(QueueFullNoticeGuard {
+            chat_id: 42,
+            pending: Arc::clone(&pending),
+        });
+
+        assert!(reserve_queue_full_notice(&pending, 42));
+    }
+
+    #[test]
+    fn edited_updates_are_never_dispatchable_as_model_or_command_messages() {
+        let edited = IncomingMessage {
+            chat: tellm_telegram::Chat {
+                id: 42,
+                title: None,
+                kind: None,
+            },
+            from: None,
+            date: 1000,
+            text: Some("edited prompt".to_string()),
+            caption: None,
+            photo: None,
+            document: None,
+        };
+        let mut update = tellm_telegram::Update {
+            update_id: 7,
+            message: None,
+            edited_message: Some(edited),
+            my_chat_member: None,
+        };
+
+        assert!(dispatchable_message(&mut update).is_none());
+        assert!(update.edited_message.is_some());
     }
 
     #[test]

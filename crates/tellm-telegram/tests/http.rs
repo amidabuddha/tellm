@@ -110,7 +110,7 @@ async fn get_updates_posts_long_poll_payload_and_parses_messages() {
         json!({
             "offset": 99,
             "timeout": 5,
-            "allowed_updates": ["message", "edited_message", "my_chat_member"]
+            "allowed_updates": ["message", "my_chat_member"]
         })
     );
 }

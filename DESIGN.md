@@ -186,7 +186,8 @@ Notes:
   backpressure for free and is the tokio-native equivalent of the parent's
   chained-futures design. The queue is bounded (32 per chat); when a room
   backs up behind a slow turn, further messages are dropped with a busy
-  notice instead of blocking the poll loop for every other chat.
+  notice instead of blocking the poll loop for every other chat. At most one
+  busy-notice send may be outstanding per room.
 - In-memory conversations; **room settings persist** across restarts
   (model pin, mode, role, optional thinking override, web-search toggle,
   image-generation toggle) in `config_dir()/rooms.toml` — runtime state
@@ -203,6 +204,8 @@ Notes:
   system prompt. Terminal `reset` clears all in-memory histories while keeping
   room settings. Monotonic room generations prevent an older in-flight result
   or rollback from repopulating reset or revoked state.
+- Edited-message updates are deliberately ignored so correcting a Telegram
+  message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
   chunking at 32000/3900 chars. Fallback triggers ported from the Python
   implementation's error-marker list.
@@ -210,8 +213,9 @@ Notes:
   stops polling, marks every room worker cancelled, aborts and joins them, and
   only then performs Ollama unload/child cleanup. Draining provider turns could
   block exit for minutes, while unloading before their futures are gone can
-  immediately reload a model. Only the tellm-started Ollama child gets automatic
-  graceful cleanup (see § Configuration).
+  immediately reload a model. Closing stdin merely disables terminal controls;
+  it does not stop a daemonized runtime. Only the tellm-started Ollama child
+  gets automatic graceful cleanup (see § Configuration).
 
 ### Telegram commands (v1)
 
