@@ -1910,9 +1910,9 @@ async fn send_model_response(
     }
 
     for image in response.images {
-        let bytes = decode_image(image)?;
+        let (media_type, bytes) = decode_image(image)?;
         telegram
-            .send_photo(chat_id, bytes)
+            .send_photo(chat_id, bytes, &media_type)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -2966,10 +2966,11 @@ fn is_text_document(document: &Document, media_type: &str) -> bool {
             .is_some_and(|name| name.to_ascii_lowercase().ends_with(".txt"))
 }
 
-fn decode_image(image: GeneratedImage) -> Result<Vec<u8>, String> {
-    BASE64
+fn decode_image(image: GeneratedImage) -> Result<(String, Vec<u8>), String> {
+    let bytes = BASE64
         .decode(image.base64)
-        .map_err(|error| format!("generated image was not valid base64: {error}"))
+        .map_err(|error| format!("generated image was not valid base64: {error}"))?;
+    Ok((image.media_type, bytes))
 }
 
 fn mode_name(mode: ChatMode) -> &'static str {

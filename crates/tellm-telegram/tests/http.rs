@@ -387,30 +387,61 @@ async fn get_file_bytes_stops_an_unknown_length_body_at_the_limit() {
 }
 
 #[tokio::test]
-async fn send_photo_uploads_multipart_body() {
-    let mock = MockTelegram::start(vec![MockResponse::json_ok(json!({ "message_id": 6 }))]);
+async fn send_photo_preserves_supported_media_types_in_multipart_body() {
+    let mock = MockTelegram::start(vec![
+        MockResponse::json_ok(json!({ "message_id": 6 })),
+        MockResponse::json_ok(json!({ "message_id": 7 })),
+        MockResponse::json_ok(json!({ "message_id": 8 })),
+    ]);
+    let cases = [
+        ("image/png", "image.png", b"PNGDATA".as_slice()),
+        ("image/jpeg", "image.jpg", b"JPEGDATA".as_slice()),
+        ("image/webp", "image.webp", b"WEBPDATA".as_slice()),
+    ];
 
-    client(&mock)
-        .send_photo(42, b"PNGDATA".to_vec())
-        .await
-        .unwrap();
+    for (media_type, _, bytes) in cases {
+        client(&mock)
+            .send_photo(42, bytes.to_vec(), media_type)
+            .await
+            .unwrap();
+    }
 
     let requests = mock.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].path, format!("/bot{TOKEN}/sendPhoto"));
-    assert!(
-        requests[0]
-            .header("content-type")
-            .unwrap()
-            .starts_with("multipart/form-data; boundary=")
-    );
-    assert!(body_contains(
-        &requests[0].body,
-        b"Content-Disposition: form-data; name=\"chat_id\""
-    ));
-    assert!(body_contains(
-        &requests[0].body,
-        b"Content-Disposition: form-data; name=\"photo\"; filename=\"image.png\""
-    ));
-    assert!(body_contains(&requests[0].body, b"PNGDATA"));
+    assert_eq!(requests.len(), cases.len());
+    for (request, (media_type, filename, bytes)) in requests.iter().zip(cases) {
+        assert_eq!(request.path, format!("/bot{TOKEN}/sendPhoto"));
+        assert!(
+            request
+                .header("content-type")
+                .unwrap()
+                .starts_with("multipart/form-data; boundary=")
+        );
+        assert!(body_contains(
+            &request.body,
+            b"Content-Disposition: form-data; name=\"chat_id\""
+        ));
+        assert!(body_contains(
+            &request.body,
+            format!("Content-Disposition: form-data; name=\"photo\"; filename=\"{filename}\"")
+                .as_bytes()
+        ));
+        assert!(body_contains(
+            &request.body,
+            format!("Content-Type: {media_type}").as_bytes()
+        ));
+        assert!(body_contains(&request.body, bytes));
+    }
+}
+
+#[tokio::test]
+async fn send_photo_rejects_unsupported_media_type_without_an_http_request() {
+    let mock = MockTelegram::start(Vec::new());
+
+    let error = client(&mock)
+        .send_photo(42, b"GIFDATA".to_vec(), "image/gif")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TelegramError::UnsupportedPhotoMediaType));
+    assert!(mock.requests().is_empty());
 }

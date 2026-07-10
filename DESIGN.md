@@ -211,7 +211,8 @@ Notes:
   message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
   chunking at 32000/3900 chars. Fallback triggers ported from the Python
-  implementation's error-marker list. Telegram transport and API errors strip
+  implementation's error-marker list. Generated images preserve their provider
+  MIME type when uploaded. Telegram transport and API errors strip
   token-bearing request URLs and redact any echoed bot token before the error can
   reach logs or operator-facing output.
 - Shutdown (terminal `exit`/`quit`, Telegram `/shutdown`, SIGINT/SIGTERM)

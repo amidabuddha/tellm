@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
@@ -40,6 +41,8 @@ pub enum TelegramError {
     MissingFilePath,
     #[error("telegram file is too large ({size} bytes; maximum {max_bytes} bytes)")]
     FileTooLarge { size: usize, max_bytes: usize },
+    #[error("unsupported Telegram photo media type; expected image/png, image/jpeg, or image/webp")]
+    UnsupportedPhotoMediaType,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,11 +250,20 @@ impl Telegram {
         &self,
         chat_id: i64,
         image_bytes: Vec<u8>,
+        media_type: &str,
     ) -> Result<(), TelegramError> {
-        // Checked 2026-07-04 against core.telegram.org/bots/api#sendphoto.
-        let (content_type, body) = photo_multipart_body(chat_id, &image_bytes);
-        self.post_bytes::<Value>("sendPhoto", content_type, body)
-            .await?;
+        // Checked 2026-07-10 against core.telegram.org/bots/api#sendphoto and
+        // #sending-files. The whitelist also prevents caller-controlled MIME
+        // values from entering multipart headers.
+        let media_type = PhotoMediaType::parse(media_type)?;
+        let photo = Part::bytes(image_bytes)
+            .file_name(media_type.filename())
+            .mime_str(media_type.content_type())
+            .map_err(|error| self.http_error(error))?;
+        let form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("photo", photo);
+        self.post_multipart::<Value>("sendPhoto", form).await?;
         Ok(())
     }
 
@@ -375,17 +387,15 @@ impl Telegram {
         self.parse_api_response(method, response).await
     }
 
-    async fn post_bytes<T: DeserializeOwned>(
+    async fn post_multipart<T: DeserializeOwned>(
         &self,
         method: &str,
-        content_type: String,
-        body: Vec<u8>,
+        form: Form,
     ) -> Result<T, TelegramError> {
         let response = self
             .http
             .post(self.method_url(method))
-            .header(reqwest::header::CONTENT_TYPE, content_type)
-            .body(body)
+            .multipart(form)
             .timeout(self.request_timeout)
             .send()
             .await
@@ -468,6 +478,40 @@ struct TelegramFile {
     file_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhotoMediaType {
+    Png,
+    Jpeg,
+    WebP,
+}
+
+impl PhotoMediaType {
+    fn parse(value: &str) -> Result<Self, TelegramError> {
+        match value {
+            "image/png" => Ok(Self::Png),
+            "image/jpeg" => Ok(Self::Jpeg),
+            "image/webp" => Ok(Self::WebP),
+            _ => Err(TelegramError::UnsupportedPhotoMediaType),
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::WebP => "image/webp",
+        }
+    }
+
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Png => "image.png",
+            Self::Jpeg => "image.jpg",
+            Self::WebP => "image.webp",
+        }
+    }
+}
+
 fn trim_trailing_slash(mut value: String) -> String {
     while value.ends_with('/') {
         value.pop();
@@ -494,25 +538,6 @@ fn should_fallback_from_rich_message_error(error: &TelegramError) -> bool {
 fn should_fallback_from_html_message_error(error: &TelegramError) -> bool {
     let error_text = error.to_string().to_lowercase();
     error_text.contains("parse entities") || error_text.contains("can't parse entities")
-}
-
-fn photo_multipart_body(chat_id: i64, image_bytes: &[u8]) -> (String, Vec<u8>) {
-    let boundary = "tellm-telegram-photo-boundary-20260704";
-    let mut body = Vec::new();
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n");
-    body.extend_from_slice(chat_id.to_string().as_bytes());
-    body.extend_from_slice(b"\r\n");
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
-        b"Content-Disposition: form-data; name=\"photo\"; filename=\"image.png\"\r\n",
-    );
-    body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
-    body.extend_from_slice(image_bytes);
-    body.extend_from_slice(b"\r\n");
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-
-    (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
 /// Split `text` into chunks of at most `chunk_size`, preferring to break at
