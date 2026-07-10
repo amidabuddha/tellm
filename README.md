@@ -41,7 +41,23 @@ no skill to poison, no control UI to leak a token. If you want an autonomous
 agent, run one — in a VM. If you just want to *talk to models* from your phone
 without handing anything the keys to your machine, that's tellm.
 
-## Install From Source
+## Install
+
+Prebuilt archives for macOS (Apple Silicon and Intel), Linux (arm64 and
+x86_64), and Windows (x86_64) are available on
+[GitHub Releases](https://github.com/amidabuddha/tellm/releases).
+Download the archive for your platform, verify it against `sha256.sum`, extract
+the `tellm` binary, and put it on your `PATH`.
+
+On macOS or Linux, after extracting the archive:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 0755 tellm "$HOME/.local/bin/tellm"
+tellm
+```
+
+### Build From Source
 
 ```sh
 git clone https://github.com/amidabuddha/tellm.git

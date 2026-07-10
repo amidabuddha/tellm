@@ -403,8 +403,10 @@ are written. Network fallback chains get a small mocked-Telegram harness.
 
 ## Distribution
 
-- `cargo-dist` → GitHub Releases with static binaries (macOS arm64/x86_64,
-  Linux x86_64/arm64, Windows). rustls (no OpenSSL linkage).
+- `cargo-dist` → GitHub Releases with standalone archives (macOS arm64/x86_64,
+  Linux GNU x86_64/arm64, Windows x86_64) plus SHA-256 checksums. rustls keeps
+  provider transport free of OpenSSL linkage; the GNU Linux builds retain their
+  normal glibc runtime dependency and are not described as fully static.
 - Brew tap once there's traction. A sample Dockerfile may exist but is never
   the headline (binary-first, not anti-Docker).
 

@@ -1,12 +1,11 @@
 //! Configuration and secret storage.
 //!
-//! Non-secrets live in a human-editable TOML file at
-//! `~/.config/tellm/config.toml` (XDG on Linux, `~/Library/Application
-//! Support` is deliberately NOT used — self-hosters expect dotfile-style
-//! config they can diff and back up; `dirs::config_dir()` gives us the
-//! platform-appropriate location).
+//! Non-secrets live in a human-editable `tellm/config.toml` below the
+//! platform configuration directory returned by `dirs::config_dir()` (for
+//! example, XDG config on Linux and `~/Library/Application Support` on
+//! macOS).
 //!
-//! Secrets (bot token, API keys) never enter the TOML. Target design:
+//! Secrets (bot token, API keys) never enter `config.toml`. Target design:
 //! OS keychain via `keyring-core` with direct platform-store registration
 //! (Apple native keychain, Windows native, or zbus Secret Service; checked
 //! 2026-07-05 against keyring 4.1.3's broken `v1` wrapper), falling back to a
