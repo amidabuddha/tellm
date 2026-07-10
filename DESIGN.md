@@ -201,7 +201,8 @@ Notes:
 - Runtime command mutations are serialized through the same per-chat queue as
   model turns. `/model` and `/role` reset that room's in-memory history so
   provider-native opaque state is not replayed under a different model or
-  system prompt. Terminal `reset` clears all in-memory histories while keeping
+  system prompt; `/model unpin` does the same even if the effective wire format
+  does not change. Terminal `reset` clears all in-memory histories while keeping
   room settings. Monotonic room generations prevent an older in-flight result
   or rollback from repopulating reset or revoked state.
 - Telegram downloads accept images, PDFs, and text documents up to 20 MiB.

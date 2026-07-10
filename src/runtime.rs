@@ -976,9 +976,7 @@ async fn handle_command(
         CommandAction::SetModel { model_key } => {
             mutate_room(handles, chat_id, |room| {
                 room.settings.model_key = Some(model_key.clone());
-                room.settings.thinking = None;
-                room.wire_format = None;
-                room.reset_history();
+                reset_room_model_context(room);
             })
             .await?;
             send_command_reply(handles, chat_id, &model_set_reply(&model_key)).await
@@ -986,20 +984,19 @@ async fn handle_command(
         CommandAction::PinModel { model_key } => {
             {
                 let mut config = handles.config.lock().await;
+                let before = config.clone();
                 for model in config.models.values_mut() {
                     model.telegram_chat_ids.retain(|pinned| *pinned != chat_id);
                 }
                 if let Some(model) = config.models.get_mut(&model_key) {
                     model.telegram_chat_ids.push(chat_id);
                 }
-                save_config(handles, &config).await?;
+                if let Err(error) = save_config(handles, &config).await {
+                    *config = before;
+                    return Err(format!("failed to persist model pin: {error}"));
+                }
             }
-            mutate_room(handles, chat_id, |room| {
-                room.settings.thinking = None;
-                room.wire_format = None;
-                room.reset_history();
-            })
-            .await?;
+            mutate_room(handles, chat_id, reset_room_model_context).await?;
             send_command_reply(
                 handles,
                 chat_id,
@@ -1012,6 +1009,7 @@ async fn handle_command(
         CommandAction::UnpinModel => {
             let was_pinned = {
                 let mut config = handles.config.lock().await;
+                let before = config.clone();
                 let mut was_pinned = false;
                 for model in config.models.values_mut() {
                     let before = model.telegram_chat_ids.len();
@@ -1024,12 +1022,16 @@ async fn handle_command(
                     config.telegram.allowed_chat_ids.push(chat_id);
                 }
                 if was_pinned {
-                    save_config(handles, &config).await?;
+                    if let Err(error) = save_config(handles, &config).await {
+                        *config = before;
+                        return Err(format!("failed to persist model unpin: {error}"));
+                    }
                 }
                 was_pinned
             };
             let reply = if was_pinned {
-                "Room unpinned. /model KEY now switches models here."
+                mutate_room(handles, chat_id, reset_room_model_context).await?;
+                "Room unpinned. Chat history reset. /model KEY now switches models here."
             } else {
                 "This room isn't pinned."
             };
@@ -1059,11 +1061,15 @@ async fn handle_command(
                 if config.models.contains_key(preset.key) {
                     true
                 } else {
+                    let before = config.clone();
                     config.models.insert(
                         preset.key.to_string(),
                         crate::wizard::model_config_from_preset(preset),
                     );
-                    save_config(handles, &config).await?;
+                    if let Err(error) = save_config(handles, &config).await {
+                        *config = before;
+                        return Err(format!("failed to persist added model: {error}"));
+                    }
                     false
                 }
             };
@@ -1168,6 +1174,12 @@ async fn handle_command(
             send_command_reply(handles, chat_id, &format_reject(reason)).await
         }
     }
+}
+
+fn reset_room_model_context(room: &mut RoomState) {
+    room.settings.thinking = None;
+    room.wire_format = None;
+    room.reset_history();
 }
 
 async fn handle_model_message(
@@ -3343,6 +3355,25 @@ mod tests {
             .await
             .expect("join persistence thread")
             .expect("persistence thread should not panic");
+    }
+
+    #[test]
+    fn unpin_reset_drops_history_even_when_next_model_uses_same_wire_format() {
+        let mut room = RoomState::new(crate::rooms::RoomSettings {
+            thinking: Some(tellm_core::ThinkingLevel::High),
+            ..crate::rooms::RoomSettings::default()
+        });
+        room.append_turn(
+            WireFormat::Responses,
+            vec![serde_json::json!({ "provider": "xai", "opaque": true })],
+        );
+
+        reset_room_model_context(&mut room);
+        let reset = room.begin_turn(WireFormat::Responses);
+
+        assert!(room.history.is_empty());
+        assert!(room.settings.thinking.is_none());
+        assert!(matches!(reset, HistoryReset::WireFormatChanged { .. }));
     }
 
     #[tokio::test]
