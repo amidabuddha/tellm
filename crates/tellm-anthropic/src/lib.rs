@@ -20,6 +20,7 @@
 //! - Handle `stop_reason: "refusal"` before reading content
 //!   (`ProviderError::Refusal`).
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -49,7 +50,14 @@ pub struct Anthropic {
 
 impl Anthropic {
     pub fn new(api_key: impl Into<String>, base_url: Option<String>) -> Self {
-        Self::with_base_url_and_timeout(api_key, base_url, PROVIDER_REQUEST_TIMEOUT)
+        Self {
+            // Production calls share one pool so repeated Telegram turns reuse
+            // DNS, TLS sessions, and keep-alive connections. Timeout-specific
+            // test clients remain isolated below.
+            http: default_http_client(),
+            base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
+            api_key: api_key.into(),
+        }
     }
 
     pub fn with_base_url_and_timeout(
@@ -67,6 +75,19 @@ impl Anthropic {
             api_key: api_key.into(),
         }
     }
+}
+
+fn default_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PROVIDER_REQUEST_TIMEOUT)
+                .build()
+                .expect("valid reqwest client configuration")
+        })
+        .clone()
 }
 
 impl Provider for Anthropic {

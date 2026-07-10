@@ -18,6 +18,7 @@
 //! - Image generation: only Gemini image model ids (`*-image*`) are eligible;
 //!   request `response_format: {"type": "image"}`.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -38,7 +39,13 @@ pub struct Gemini {
 
 impl Gemini {
     pub fn new(api_key: impl Into<String>, base_url: Option<String>) -> Self {
-        Self::with_base_url_and_timeout(api_key, base_url, PROVIDER_REQUEST_TIMEOUT)
+        Self {
+            // Production turns share a keep-alive/TLS pool; custom-timeout
+            // clients remain independent for deterministic tests.
+            http: default_http_client(),
+            base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
+            api_key: api_key.into(),
+        }
     }
 
     pub fn with_base_url_and_timeout(
@@ -56,6 +63,19 @@ impl Gemini {
             api_key: api_key.into(),
         }
     }
+}
+
+fn default_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PROVIDER_REQUEST_TIMEOUT)
+                .build()
+                .expect("valid reqwest client configuration")
+        })
+        .clone()
 }
 
 pub fn is_image_generation_model(model_name: &str) -> bool {

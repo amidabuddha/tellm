@@ -18,6 +18,7 @@
 //!   Results come back as base64 in `image_generation_call` output items.
 //! - Files/images: `input_file` / `input_image` content parts.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -40,7 +41,13 @@ pub struct Responses {
 
 impl Responses {
     pub fn new(api_key: impl Into<String>, base_url: Option<String>) -> Self {
-        Self::with_base_url_and_timeout(api_key, base_url, PROVIDER_REQUEST_TIMEOUT)
+        Self {
+            // Reuse the production connection pool across rooms and model
+            // entries; authentication is still attached per request.
+            http: default_http_client(),
+            base_url: trim_trailing_slash(base_url.unwrap_or_else(|| OPENAI_BASE_URL.to_string())),
+            api_key: api_key.into(),
+        }
     }
 
     pub fn with_base_url_and_timeout(
@@ -58,6 +65,19 @@ impl Responses {
             api_key: api_key.into(),
         }
     }
+}
+
+fn default_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PROVIDER_REQUEST_TIMEOUT)
+                .build()
+                .expect("valid reqwest client configuration")
+        })
+        .clone()
 }
 
 impl Provider for Responses {
