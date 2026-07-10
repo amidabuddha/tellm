@@ -188,6 +188,17 @@ The four wiring shapes are:
   trusted LAN HTTP endpoint requires `allow_insecure_http = true` in that
   model's table; credential-bearing HTTP is always rejected.
 
+### Upgrading from v0.1.0
+
+v0.2.0 tightens startup validation, so review `config.toml` before replacing
+the binary. Model keys must be non-empty and contain no whitespace; model names
+must be non-empty; explicit base URLs must be valid absolute URLs without
+embedded credentials; and non-compat models require a non-empty
+`api_key_secret`. Credential-bearing endpoints must use HTTPS. Existing
+keyless loopback compat endpoints need no change; for a trusted keyless LAN
+HTTP endpoint, add `allow_insecure_http = true` under its `[models.KEY]` table.
+The opt-in never permits credentials over HTTP.
+
 `telegram_chat_ids` is only for locked room pins. Normal `/model KEY`
 selection is stored in `rooms.toml`, so these arrays usually stay empty.
 `thinking` in `config.toml` is the model default. A room only writes
