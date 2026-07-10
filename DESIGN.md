@@ -211,8 +211,9 @@ Notes:
   message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
   chunking at 32000/3900 chars. Fallback triggers ported from the Python
-  implementation's error-marker list. Generated images preserve their provider
-  MIME type when uploaded. Telegram transport and API errors strip
+  implementation's error-marker list. Model selection uses a one-time Telegram
+  reply keyboard with a text-command fallback. Generated images preserve their
+  provider MIME type when uploaded. Telegram transport and API errors strip
   token-bearing request URLs and redact any echoed bot token before the error can
   reach logs or operator-facing output.
 - Shutdown (terminal `exit`/`quit`, Telegram `/shutdown`, SIGINT/SIGTERM)
@@ -275,8 +276,8 @@ restart and local room-setting changes.
   impossible. Caveat: Telegram anonymous-admin mode hides `from` — owners must
   post non-anonymously (or use a private chat) for privileged commands.
 - After approval the room replies with its current model and the /model /
-  /model pin next steps; on group approval the console prints the privacy-
-  mode hint.
+  /model pin next steps plus a one-time model reply keyboard; on group approval
+  the console prints the privacy-mode hint.
 - Admin chats can approve or revoke rooms at runtime: `/allow CHAT_ID` adds the
   chat to `allowed_chat_ids`, persists config, and takes effect immediately;
   `/deny CHAT_ID` removes `allowed_chat_ids` and model pins for the chat,

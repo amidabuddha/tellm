@@ -43,6 +43,8 @@ pub enum TelegramError {
     FileTooLarge { size: usize, max_bytes: usize },
     #[error("unsupported Telegram photo media type; expected image/png, image/jpeg, or image/webp")]
     UnsupportedPhotoMediaType,
+    #[error("model picker requires at least one model")]
+    EmptyModelPicker,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,6 +233,55 @@ impl Telegram {
         }
 
         Ok(())
+    }
+
+    /// Send a compact Telegram reply keyboard whose buttons submit complete
+    /// `/model KEY` commands. This deliberately uses a separate plain
+    /// `sendMessage` request so normal rich-message delivery keeps its current
+    /// fallback semantics.
+    pub async fn send_model_picker(
+        &self,
+        chat_id: i64,
+        text: &str,
+        model_keys: &[String],
+    ) -> Result<(), TelegramError> {
+        if model_keys.is_empty() {
+            return Err(TelegramError::EmptyModelPicker);
+        }
+
+        let keyboard = model_keys
+            .chunks(2)
+            .map(|row| {
+                row.iter()
+                    .map(|key| format!("/model {key}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        // Checked 2026-07-10 against core.telegram.org/bots/api#sendmessage,
+        // #replykeyboardmarkup, and #keyboardbutton.
+        let picker = self
+            .post_json::<Value>(
+                "sendMessage",
+                &json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": {
+                        "keyboard": keyboard,
+                        "resize_keyboard": true,
+                        "one_time_keyboard": true,
+                    },
+                }),
+            )
+            .await;
+        match picker {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                eprintln!("Telegram model picker failed; sending text fallback: {error}");
+                self.send_message(chat_id, &model_picker_fallback_text(text, model_keys))
+                    .await
+            }
+        }
     }
 
     pub async fn send_chat_action(&self, chat_id: i64) -> Result<(), TelegramError> {
@@ -463,6 +514,15 @@ impl Telegram {
     fn method_url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.api_base_url, self.token, method)
     }
+}
+
+fn model_picker_fallback_text(text: &str, model_keys: &[String]) -> String {
+    let commands = model_keys
+        .iter()
+        .map(|key| format!("- /model {key}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{text}\n\n{commands}")
 }
 
 #[derive(Debug, Deserialize)]

@@ -270,6 +270,77 @@ async fn send_chat_action_posts_typing() {
 }
 
 #[tokio::test]
+async fn model_picker_sends_full_commands_in_a_compact_reply_keyboard() {
+    let mock = MockTelegram::start(vec![MockResponse::json_ok(json!({ "message_id": 7 }))]);
+    let models = vec![
+        "claude".to_string(),
+        "gemini".to_string(),
+        "openai".to_string(),
+    ];
+
+    client(&mock)
+        .send_model_picker(42, "Choose a model:", &models)
+        .await
+        .unwrap();
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, format!("/bot{TOKEN}/sendMessage"));
+    assert_eq!(
+        requests[0].json_body(),
+        json!({
+            "chat_id": 42,
+            "text": "Choose a model:",
+            "reply_markup": {
+                "keyboard": [
+                    ["/model claude", "/model gemini"],
+                    ["/model openai"]
+                ],
+                "resize_keyboard": true,
+                "one_time_keyboard": true
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn empty_model_picker_is_rejected_without_an_http_request() {
+    let mock = MockTelegram::start(Vec::new());
+
+    let error = client(&mock)
+        .send_model_picker(42, "Choose a model:", &[])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TelegramError::EmptyModelPicker));
+    assert!(mock.requests().is_empty());
+}
+
+#[tokio::test]
+async fn rejected_model_keyboard_falls_back_to_text_commands() {
+    let mock = MockTelegram::start(vec![
+        MockResponse::json_error(400, "keyboard rejected"),
+        MockResponse::json_ok(json!({ "message_id": 8 })),
+    ]);
+    let models = vec!["claude".to_string(), "openai".to_string()];
+
+    client(&mock)
+        .send_model_picker(42, "Choose a model:", &models)
+        .await
+        .unwrap();
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, format!("/bot{TOKEN}/sendMessage"));
+    assert_eq!(requests[1].path, format!("/bot{TOKEN}/sendRichMessage"));
+    let fallback_body = requests[1].json_body();
+    let markdown = fallback_body["rich_message"]["markdown"].as_str().unwrap();
+    assert!(markdown.contains("Choose a model:"), "{markdown}");
+    assert!(markdown.contains("/model claude"), "{markdown}");
+    assert!(markdown.contains("/model openai"), "{markdown}");
+}
+
+#[tokio::test]
 async fn stalled_api_request_times_out_instead_of_hanging() {
     let mock = MockTelegram::start_stalled();
 

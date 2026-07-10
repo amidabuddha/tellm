@@ -540,9 +540,9 @@ impl Runtime {
                         eprintln!("{}", group_privacy_hint(chat_id));
                     }
                     let setup = room_setup_reply(chat_id, false, handles).await;
-                    let telegram = handles.telegram.clone();
+                    let handles = handles.clone();
                     tokio::spawn(async move {
-                        let _ = telegram.send_message(chat_id, &setup).await;
+                        let _ = send_room_setup(chat_id, setup, &handles).await;
                     });
                     return;
                 }
@@ -961,8 +961,17 @@ async fn handle_command(
             pinned,
             available,
         } => {
-            let reply = format_model_status(selected, effective, pinned, available);
-            send_command_reply(handles, chat_id, &reply).await
+            let show_picker = pinned.is_none();
+            let reply = format_model_status(selected, effective, pinned, available.clone());
+            if show_picker {
+                handles
+                    .telegram
+                    .send_model_picker(chat_id, &reply, &available)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                send_command_reply(handles, chat_id, &reply).await
+            }
         }
         CommandAction::SetModel { model_key } => {
             mutate_room(handles, chat_id, |room| {
@@ -1954,7 +1963,7 @@ async fn handle_allow_chat(
     // member of the target chat yet).
     if changed && target_chat_id != admin_chat_id {
         let setup = room_setup_reply(target_chat_id, false, handles).await;
-        let _ = handles.telegram.send_message(target_chat_id, &setup).await;
+        let _ = send_room_setup(target_chat_id, setup, handles).await;
     }
 
     let reply = if changed {
@@ -2075,7 +2084,7 @@ async fn handle_pair_attempt(
                 eprintln!("{}", group_privacy_hint(chat_id));
             }
             let setup = room_setup_reply(chat_id, became_owner, handles).await;
-            send_command_reply(handles, chat_id, &setup).await
+            send_room_setup(chat_id, setup, handles).await
         }
         PairingAttempt::AlreadyAllowed => {
             send_command_reply(handles, chat_id, "This chat is already paired.").await
@@ -2485,29 +2494,47 @@ fn model_key_prompt_failed_reply(model_key: &str, secret_name: &str, error: &str
     )
 }
 
+struct RoomSetupReply {
+    text: String,
+    model_keys: Option<Vec<String>>,
+}
+
 /// The in-room setup prompt after a room is approved (via /pair or /allow):
-/// current model plus the actual picker, not just a pointer to it.
-async fn room_setup_reply(chat_id: i64, became_owner: bool, handles: &RuntimeHandles) -> String {
-    let (model_key, available) = {
+/// current model plus the actual picker, not just a pointer to it. Pinned
+/// rooms have no picker because every alternative would be rejected.
+async fn room_setup_reply(
+    chat_id: i64,
+    became_owner: bool,
+    handles: &RuntimeHandles,
+) -> RoomSetupReply {
+    let (model_key, pinned, available) = {
         let config = handles.config.lock().await;
         let mut rooms = handles.rooms.lock().await;
         let room = rooms.get_or_default(chat_id).clone();
         (
             selected_model_key(&config, &room, chat_id),
+            pinned_model_key(&config, chat_id).map(str::to_string),
             config.models.keys().cloned().collect::<Vec<_>>(),
         )
     };
-    // Blank lines matter: in Telegram's rich markdown a plain line after a
-    // list item is absorbed into the item.
-    let mut reply = "Room approved. Pick this room's model:\n\n".to_string();
-    for key in &available {
-        let marker = if *key == model_key { " (current)" } else { "" };
-        reply.push_str(&format!("- /model {key}{marker}\n"));
-    }
-    reply.push_str(
-        "\nLock it with /model pin KEY, add providers with /model add, or just start \
-         chatting to use the current model.",
-    );
+    build_room_setup_reply(&model_key, pinned.as_deref(), available, became_owner)
+}
+
+fn build_room_setup_reply(
+    model_key: &str,
+    pinned: Option<&str>,
+    available: Vec<String>,
+    became_owner: bool,
+) -> RoomSetupReply {
+    let mut reply = if let Some(pinned) = pinned {
+        format!(
+            "Room approved. This room is pinned to {pinned}. Use /model unpin before switching models."
+        )
+    } else {
+        format!(
+            "Room approved. Current model: {model_key}. Pick a model below, lock it with /model pin KEY, add providers with /model add, or just start chatting."
+        )
+    };
     if became_owner {
         reply.push_str(
             "\n\nYou are registered as this bot's owner: /allow, /deny, /shutdown, and \
@@ -2515,7 +2542,28 @@ async fn room_setup_reply(chat_id: i64, became_owner: bool, handles: &RuntimeHan
              approved automatically.",
         );
     }
-    reply
+    RoomSetupReply {
+        text: reply,
+        model_keys: pinned.is_none().then_some(available),
+    }
+}
+
+async fn send_room_setup(
+    chat_id: i64,
+    setup: RoomSetupReply,
+    handles: &RuntimeHandles,
+) -> Result<(), String> {
+    if !chat_is_allowed(chat_id, handles).await {
+        return Ok(());
+    }
+    match setup.model_keys {
+        Some(model_keys) => handles
+            .telegram
+            .send_model_picker(chat_id, &setup.text, &model_keys)
+            .await
+            .map_err(|error| error.to_string()),
+        None => send_command_reply(handles, chat_id, &setup.text).await,
+    }
 }
 
 async fn mutate_room(
@@ -3832,6 +3880,23 @@ mod tests {
             }),
             "This room is pinned to gpt; /model changes are disabled."
         );
+    }
+
+    #[test]
+    fn room_setup_uses_a_picker_only_when_model_switching_is_allowed() {
+        let available = vec!["claude".to_string(), "openai".to_string()];
+        let unpinned = build_room_setup_reply("claude", None, available.clone(), false);
+        assert_eq!(unpinned.model_keys, Some(available));
+        assert!(unpinned.text.contains("Current model: claude"));
+
+        let pinned = build_room_setup_reply(
+            "openai",
+            Some("openai"),
+            vec!["claude".to_string(), "openai".to_string()],
+            false,
+        );
+        assert!(pinned.model_keys.is_none());
+        assert!(pinned.text.contains("pinned to openai"));
     }
 
     #[test]

@@ -183,6 +183,9 @@ clears that room override and returns to the selected model's default.
 For one group per model, disable Telegram privacy mode via BotFather
 (`/setprivacy`) once, then add the bot to each group from your owner account.
 Owner-added rooms are approved automatically and get the model picker.
+The picker is a one-time Telegram reply keyboard; tapping a model sends the
+same `/model KEY` command you can type manually. If Telegram rejects the
+keyboard, tellm falls back to a normal message listing those commands.
 
 Use `/model KEY` for a room-local model selection. That persists in
 `rooms.toml` and intentionally leaves `telegram_chat_ids` empty. Use `/model pin
