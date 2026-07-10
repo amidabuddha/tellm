@@ -319,10 +319,11 @@ restart and local room-setting changes.
   never auto-started or unloaded. Owners can also send `/ollama unload` to
   unload local Ollama models invoked by the current tellm process without
   stopping tellm or `ollama serve`.
-- `config.toml`, `rooms.toml`, and `credentials.toml` are written atomically
-  (same-directory temp file + rename), so a crash mid-write cannot truncate
-  them — they are rewritten on every /allow, /model, and toggle, and
-  credentials.toml may hold every API key on headless hosts.
+- `config.toml`, `rooms.toml`, and `credentials.toml` use collision-safe unique
+  same-directory temp files, file sync, and rename, so a crash or concurrent
+  writer cannot expose a partial file. Unix parent-directory sync is attempted
+  after commit; failure is a durability warning, not a false failed-commit
+  signal.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists, compat models have a base_url, each chat is pinned to at most one
   model. All problems reported at once; the bot refuses to start on an

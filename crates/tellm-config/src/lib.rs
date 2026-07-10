@@ -15,7 +15,8 @@
 //! don't do it.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -192,27 +193,96 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 fn write_atomic_with_mode(path: &Path, contents: &str, mode: Option<u32>) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
-        })?;
-    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
-    let _ = std::fs::remove_file(&tmp);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        options.mode(mode);
+    let (tmp, mut file) = create_unique_temp(path, mode)?;
+    let result = (|| {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        publish_atomic_file(path, &tmp)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let mut file = options.open(&tmp)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
+    result
+}
+
+fn publish_atomic_file(path: &Path, tmp: &Path) -> std::io::Result<()> {
+    publish_atomic_file_with_sync(path, tmp, sync_parent_directory)
+}
+
+fn publish_atomic_file_with_sync(
+    path: &Path,
+    tmp: &Path,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)?;
+    // Once rename succeeds, the new file is the visible committed state.
+    // Report success to callers even if the platform/filesystem cannot fsync
+    // the directory; treating that durability warning as a failed commit
+    // would make callers roll memory back behind the already-published file.
+    if let Err(error) = sync_parent(path) {
+        eprintln!(
+            "warning: atomic file was published but its parent directory could not be synced: {error}"
+        );
+    }
+    Ok(())
+}
+
+fn create_unique_temp(path: &Path, mode: Option<u32>) -> std::io::Result<(PathBuf, File)> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+
+    for _ in 0..8 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|error| std::io::Error::other(format!("random temp-file name: {error}")))?;
+        let mut tmp_name = OsString::from(".");
+        tmp_name.push(file_name);
+        tmp_name.push(format!(
+            ".tmp-{}-{:032x}",
+            std::process::id(),
+            u128::from_ne_bytes(random)
+        ));
+        let tmp = path.with_file_name(tmp_name);
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+
+        match options.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique atomic-write temp file",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    // Opening directories as files is not portable on Windows. Atomic rename
+    // still protects the file contents there; Unix additionally attempts to
+    // persist the directory entry above.
     Ok(())
 }
 
@@ -596,6 +666,76 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_atomic_writers_never_collide_or_publish_partial_toml() {
+        const WRITERS: usize = 12;
+
+        with_temp_config_dir(|dir| {
+            let path = dir.join("concurrent.toml");
+            let candidates = (0..WRITERS)
+                .map(|writer| {
+                    format!(
+                        "writer = {writer}\npayload = \"{}\"\n",
+                        char::from(b'a' + writer as u8)
+                            .to_string()
+                            .repeat(128 * 1024)
+                    )
+                })
+                .collect::<Vec<_>>();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+            let handles = candidates
+                .iter()
+                .cloned()
+                .map(|candidate| {
+                    let path = path.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        write_atomic(&path, &candidate)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+
+            let published = std::fs::read_to_string(&path).unwrap();
+            let parsed: toml::Value = toml::from_str(&published).unwrap();
+            assert!(parsed.get("writer").is_some());
+            assert!(candidates.iter().any(|candidate| candidate == &published));
+            assert_no_atomic_temps(dir, "concurrent.toml");
+        });
+    }
+
+    #[test]
+    fn failed_atomic_rename_cleans_up_its_unique_temp_file() {
+        with_temp_config_dir(|dir| {
+            let target = dir.join("destination.toml");
+            std::fs::create_dir(&target).unwrap();
+
+            assert!(write_atomic(&target, "value = 1\n").is_err());
+            assert_no_atomic_temps(dir, "destination.toml");
+        });
+    }
+
+    #[test]
+    fn post_rename_directory_sync_failure_is_still_a_committed_write() {
+        with_temp_config_dir(|dir| {
+            let target = dir.join("committed.toml");
+            let tmp = dir.join(".committed.toml.test-tmp");
+            std::fs::write(&tmp, "value = 2\n").unwrap();
+
+            publish_atomic_file_with_sync(&target, &tmp, |_| {
+                Err(std::io::Error::other("injected directory sync failure"))
+            })
+            .expect("rename already committed the new file");
+
+            assert_eq!(std::fs::read_to_string(target).unwrap(), "value = 2\n");
+            assert!(!tmp.exists());
+        });
+    }
+
+    #[test]
     fn secrets_file_roundtrip_uses_credentials_toml() {
         with_temp_config_dir(|dir| {
             let destination = secrets::set("anthropic_api_key", "sk-ant-test").unwrap();
@@ -714,6 +854,16 @@ mod tests {
         let temp = TempConfigDir::new();
 
         test(&temp.path);
+    }
+
+    fn assert_no_atomic_temps(dir: &std::path::Path, file_name: &str) {
+        let prefix = format!(".{file_name}.tmp-");
+        let leftovers = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 
     struct TempConfigDir {
