@@ -365,6 +365,7 @@ mod tests {
             wire_format,
             model_name: "m".into(),
             base_url: base_url.map(Into::into),
+            allow_insecure_http: false,
             api_key_secret: None,
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: ThinkingLevel::default(),

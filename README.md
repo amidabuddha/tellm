@@ -23,9 +23,10 @@ client — usage billed directly by your API providers, not by a subscription.
   minutes, rate-limited per chat. Secrets use your OS keychain when available,
   with a permission-restricted credentials file as the headless fallback.
 - **Not an agent.** No shell access, no skills registry, no browser control,
-  no MCP. The whole attack surface is HTTPS calls to Telegram and your model
-  providers — nothing on your machine to inject into or steal, beyond keys
-  that live in your OS keychain.
+  no MCP. Its network surface is HTTPS to Telegram and model providers, plus
+  explicitly configured keyless HTTP for local compatible endpoints — nothing
+  on your machine to inject into or steal, beyond keys kept in your OS keychain
+  or the restricted headless fallback file.
 
 ## Why not OpenClaw?
 
@@ -162,11 +163,14 @@ The four wiring shapes are:
 
 - Built-in provider default endpoint: omit `base_url`, set `api_key_secret`.
 - Provider variant on the same wire format: set `base_url` and `api_key_secret`
-  (xAI and Meta Model API through `responses` are built-in examples).
+  (xAI and Meta Model API through `responses` are built-in examples). Custom
+  endpoints that receive a credential must use HTTPS.
 - Remote chat-completions-compatible endpoint: `wire_format = "compat"` with
   both `base_url` and `api_key_secret`.
 - Local/keyless compatible endpoint: `wire_format = "compat"` with `base_url`
-  and no `api_key_secret`, usually Ollama.
+  and no `api_key_secret`, usually Ollama. Loopback HTTP works by default. A
+  trusted LAN HTTP endpoint requires `allow_insecure_http = true` in that
+  model's table; credential-bearing HTTP is always rejected.
 
 `telegram_chat_ids` is only for locked room pins. Normal `/model KEY`
 selection is stored in `rooms.toml`, so these arrays usually stay empty.

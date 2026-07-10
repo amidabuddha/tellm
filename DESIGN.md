@@ -11,8 +11,10 @@ which remains the reference implementation and the author's fallback during the 
 
 - Usage is billed directly by your API providers. tellm never touches billing.
 - **Not an agent.** No shell, no skills registry, no browser control, no MCP.
-  The entire capability surface is HTTPS calls to Telegram and your model
-  providers. This is deliberate (see "Why not OpenClaw?" in the README).
+  The entire capability surface is calls to Telegram and model providers.
+  Provider traffic is HTTPS by default; cleartext is limited to keyless compat
+  endpoints on loopback or a per-model `allow_insecure_http = true` opt-in.
+  This is deliberate (see "Why not OpenClaw?" in the README).
 
 ## Architecture
 
@@ -300,6 +302,13 @@ restart and local room-setting changes.
   never stored inline. Keyless endpoints, especially local Ollama, omit
   `api_key_secret`; `/model add KEY` must not open a key prompt for those
   configured models, and their compat requests omit `Authorization` entirely.
+  Custom URLs are parsed as absolute URLs and reject embedded credentials.
+  Credential-bearing URLs always require HTTPS. Keyless compat URLs may use
+  HTTP on an explicit loopback host by default; a non-loopback HTTP endpoint
+  requires `allow_insecure_http = true` in that model's table, making the
+  cleartext LAN trust decision visible and local to that endpoint. The opt-in
+  never permits credentials over HTTP or permits another URL scheme. Model
+  keys are nonempty, whitespace-free command tokens.
 - Local Ollama convenience: for compat models whose `base_url` points at the
   default local HTTP Ollama endpoint (`http://localhost:11434`,
   `http://127.0.0.1:11434`, or `http://[::1]:11434`, with or without `/v1`),
@@ -325,9 +334,13 @@ restart and local room-setting changes.
   after commit; failure is a durability warning, not a false failed-commit
   signal.
 - **Semantic validation at startup** (`Config::validate()`): default model
-  exists, compat models have a base_url, each chat is pinned to at most one
-  model. All problems reported at once; the bot refuses to start on an
-  invalid config rather than misbehaving later.
+  exists; model keys are command-safe; model names and secret names are
+  nonempty and secret names cannot use tellm's internal marker prefix;
+  non-compat models name a secret; compat models have a valid absolute URL;
+  credential-bearing endpoints use HTTPS; non-loopback keyless compat HTTP has
+  the explicit per-model opt-in described above; URLs contain no embedded
+  credentials; and each chat is pinned to at most one model. All problems are
+  reported at once; the bot refuses invalid config.
 - Secrets (bot token, API keys): OS keychain via `keyring-core` plus direct
   platform-store registration (Apple native keychain, Windows native, zbus
   Secret Service; checked 2026-07-05 after keyring 4.1.3's `v1` wrapper failed

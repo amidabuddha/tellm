@@ -1628,6 +1628,7 @@ dependencies = [
  "tellm-core",
  "thiserror",
  "toml",
+ "url",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
 ]

@@ -31,6 +31,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
         wire_format: preset.wire_format,
         model_name: preset.model_name.to_string(),
         base_url: preset.base_url.map(str::to_string),
+        allow_insecure_http: false,
         api_key_secret: Some(preset.api_key_secret.to_string()),
         telegram_chat_ids: Vec::new(),
         thinking: ThinkingLevel::default(),

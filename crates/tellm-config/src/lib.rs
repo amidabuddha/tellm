@@ -62,6 +62,11 @@ pub struct ModelConfig {
     pub model_name: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Explicitly permit cleartext HTTP for a keyless, non-loopback compat
+    /// endpoint (for example, Ollama on a trusted LAN). Credential-bearing
+    /// endpoints still require HTTPS even when this is enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_insecure_http: bool,
     /// Name of the secret holding this model's provider API key. The secret
     /// value itself never enters `config.toml`.
     #[serde(default)]
@@ -108,11 +113,89 @@ impl Config {
 
         let mut pinned: std::collections::BTreeMap<i64, &str> = Default::default();
         for (key, model) in &self.models {
+            if key.trim().is_empty() {
+                problems.push("model key must not be empty".to_string());
+            } else if key.chars().any(char::is_whitespace) {
+                problems.push(format!(
+                    "model \"{key}\": key must not contain whitespace because /model commands use one token"
+                ));
+            }
+            if model.model_name.trim().is_empty() {
+                problems.push(format!("model \"{key}\": model_name must not be empty"));
+            }
+
             if model.wire_format == WireFormat::Compat && model.base_url.is_none() {
                 problems.push(format!(
                     "model \"{key}\": wire_format \"compat\" requires base_url (there is no default compat endpoint)"
                 ));
             }
+
+            let nonempty_base_url = match model.base_url.as_deref() {
+                Some(base_url) if base_url.trim().is_empty() => {
+                    problems.push(format!("model \"{key}\": base_url must not be empty"));
+                    None
+                }
+                base_url => base_url,
+            };
+            let parsed_base_url =
+                nonempty_base_url.and_then(|base_url| match url::Url::parse(base_url) {
+                    Ok(url) => Some(url),
+                    Err(error) => {
+                        problems.push(format!(
+                            "model \"{key}\": base_url is not a valid absolute URL: {error}"
+                        ));
+                        None
+                    }
+                });
+            let has_secret = match model.api_key_secret.as_deref() {
+                Some(secret_name) if secret_name.trim().is_empty() => {
+                    problems.push(format!("model \"{key}\": api_key_secret must not be empty"));
+                    false
+                }
+                Some(secret_name) if secrets::is_reserved_name(secret_name) => {
+                    problems.push(format!(
+                        "model \"{key}\": api_key_secret uses a reserved internal prefix"
+                    ));
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
+
+            if model.wire_format != WireFormat::Compat && !has_secret {
+                // An explicitly empty name already has the more actionable
+                // diagnostic above; avoid reporting the same defect twice.
+                if model.api_key_secret.is_none() {
+                    problems.push(format!(
+                        "model \"{key}\": wire_format \"{:?}\" requires api_key_secret",
+                        model.wire_format
+                    ));
+                }
+            }
+            if let Some(base_url) = parsed_base_url.as_ref()
+                && (!base_url.username().is_empty() || base_url.password().is_some())
+            {
+                problems.push(format!(
+                    "model \"{key}\": base_url must not contain embedded credentials"
+                ));
+            }
+            if let Some(base_url) = parsed_base_url.as_ref()
+                && base_url.scheme() != "https"
+            {
+                if has_secret {
+                    problems.push(format!(
+                        "model \"{key}\": credential-bearing base_url must use https://"
+                    ));
+                } else if model.wire_format != WireFormat::Compat
+                    || base_url.scheme() != "http"
+                    || (!is_loopback_http_url(base_url) && !model.allow_insecure_http)
+                {
+                    problems.push(format!(
+                        "model \"{key}\": base_url must use https:// unless it is a keyless loopback compat endpoint or allow_insecure_http = true explicitly permits keyless compat HTTP"
+                    ));
+                }
+            }
+
             for chat_id in &model.telegram_chat_ids {
                 if let Some(previous) = pinned.insert(*chat_id, key) {
                     problems.push(format!(
@@ -128,6 +211,20 @@ impl Config {
             Err(ConfigError::Invalid(problems))
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_loopback_http_url(value: &url::Url) -> bool {
+    value.scheme() == "http"
+        && match value.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        }
 }
 
 /// Load and semantically validate in one step — the runtime entry point.
@@ -840,7 +937,8 @@ mod tests {
             wire_format,
             model_name: "m".into(),
             base_url: base_url.map(Into::into),
-            api_key_secret: None,
+            allow_insecure_http: false,
+            api_key_secret: (wire_format != WireFormat::Compat).then(|| "test_api_key".to_string()),
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: ThinkingLevel::default(),
         }
@@ -926,16 +1024,218 @@ mod tests {
     }
 
     #[test]
+    fn empty_model_fields_and_missing_secrets_are_aggregated() {
+        let mut missing = model(WireFormat::Anthropic, Some("   "), &[]);
+        missing.model_name = "  ".to_string();
+        missing.api_key_secret = None;
+        let mut empty = model(WireFormat::Compat, Some("https://provider.example/v1"), &[]);
+        empty.api_key_secret = Some("\t".to_string());
+        let c = config(&[("missing", missing), ("empty", empty)], "missing");
+
+        let p = problems(&c);
+
+        assert_eq!(p.len(), 4, "{p:?}");
+        assert!(
+            p.iter().any(|problem| problem.contains("model_name")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter().any(|problem| problem.contains("base_url must")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|problem| problem.contains("requires api_key_secret")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|problem| problem.contains("api_key_secret must")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn model_keys_must_roundtrip_through_single_token_commands() {
+        let c = config(
+            &[
+                ("", model(WireFormat::Anthropic, None, &[])),
+                ("two words", model(WireFormat::Anthropic, None, &[])),
+            ],
+            "",
+        );
+
+        let p = problems(&c);
+
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(
+            p.iter()
+                .any(|problem| problem.contains("must not be empty"))
+        );
+        assert!(p.iter().any(|problem| problem.contains("whitespace")));
+    }
+
+    #[test]
+    fn internal_secret_marker_prefix_is_reserved() {
+        let reserved = "__tellm_prefer_credentials_file__:openai_api_key";
+        let mut configured = model(WireFormat::Responses, None, &[]);
+        configured.api_key_secret = Some(reserved.to_string());
+        let c = config(&[("openai", configured)], "openai");
+
+        let p = problems(&c);
+
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("reserved internal prefix"), "{p:?}");
+        with_temp_config_dir(|_| {
+            assert!(matches!(
+                secrets::set(reserved, "value").unwrap_err(),
+                secrets::SecretError::ReservedName(name) if name == reserved
+            ));
+            assert_eq!(secrets::get(reserved), None);
+        });
+    }
+
+    #[test]
+    fn credentialed_custom_url_requires_https_but_keyless_loopback_is_allowed() {
+        let credentialed = model(
+            WireFormat::Responses,
+            Some("http://provider.example/v1"),
+            &[],
+        );
+        let keyless_loopback = model(WireFormat::Compat, Some("http://127.0.0.1:11434/v1"), &[]);
+        let c = config(
+            &[("credentialed", credentialed), ("ollama", keyless_loopback)],
+            "credentialed",
+        );
+
+        let p = problems(&c);
+
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("https://"), "{p:?}");
+    }
+
+    #[test]
+    fn keyless_remote_http_endpoint_requires_explicit_opt_in() {
+        let mut remote = model(
+            WireFormat::Compat,
+            Some("http://192.168.1.20:11434/v1"),
+            &[],
+        );
+        let c = config(&[("remote", remote.clone())], "remote");
+
+        let p = problems(&c);
+
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("allow_insecure_http = true"), "{p:?}");
+
+        remote.allow_insecure_http = true;
+        assert!(config(&[("remote", remote)], "remote").validate().is_ok());
+    }
+
+    #[test]
+    fn insecure_http_opt_in_never_permits_credentials() {
+        let mut credentialed = model(
+            WireFormat::Compat,
+            Some("http://192.168.1.20:11434/v1"),
+            &[],
+        );
+        credentialed.api_key_secret = Some("ollama_api_key".to_string());
+        credentialed.allow_insecure_http = true;
+
+        let p = problems(&config(&[("remote", credentialed)], "remote"));
+
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("credential-bearing"), "{p:?}");
+    }
+
+    #[test]
+    fn insecure_http_opt_in_does_not_permit_other_schemes() {
+        let mut remote = model(WireFormat::Compat, Some("ftp://192.168.1.20:11434/v1"), &[]);
+        remote.allow_insecure_http = true;
+
+        let p = problems(&config(&[("remote", remote)], "remote"));
+
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("must use https://"), "{p:?}");
+    }
+
+    #[test]
+    fn credentialed_https_custom_url_is_valid() {
+        let c = config(
+            &[(
+                "proxy",
+                model(
+                    WireFormat::Responses,
+                    Some("HTTPS://provider.example/v1"),
+                    &[],
+                ),
+            )],
+            "proxy",
+        );
+
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn malformed_urls_and_embedded_credentials_are_rejected() {
+        let c = config(
+            &[
+                (
+                    "malformed",
+                    model(WireFormat::Responses, Some("https://"), &[]),
+                ),
+                (
+                    "embedded",
+                    model(
+                        WireFormat::Responses,
+                        Some("https://user:password@provider.example/v1"),
+                        &[],
+                    ),
+                ),
+            ],
+            "malformed",
+        );
+
+        let p = problems(&c);
+
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(
+            p.iter()
+                .any(|problem| problem.contains("valid absolute URL"))
+        );
+        assert!(
+            p.iter()
+                .any(|problem| problem.contains("embedded credentials"))
+        );
+    }
+
+    #[test]
     fn config_roundtrips_through_toml() {
         let c = config(
             &[("claude", model(WireFormat::Anthropic, None, &[1, 2]))],
             "claude",
         );
         let text = toml::to_string_pretty(&c).unwrap();
+        assert!(!text.contains("allow_insecure_http"));
         let back: Config = toml::from_str(&text).unwrap();
         assert!(back.validate().is_ok());
         assert_eq!(back.default_model, "claude");
         assert_eq!(back.models["claude"].telegram_chat_ids, vec![1, 2]);
+        assert!(!back.models["claude"].allow_insecure_http);
+    }
+
+    #[test]
+    fn insecure_http_opt_in_roundtrips_through_toml() {
+        let mut remote = model(WireFormat::Compat, Some("http://ollama.lan:11434/v1"), &[]);
+        remote.allow_insecure_http = true;
+        let c = config(&[("ollama", remote)], "ollama");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("allow_insecure_http = true"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+
+        assert!(back.models["ollama"].allow_insecure_http);
+        assert!(back.validate().is_ok());
     }
 
     #[test]
