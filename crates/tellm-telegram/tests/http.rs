@@ -325,7 +325,7 @@ async fn get_file_bytes_fetches_file_path_from_file_base_url() {
         MockResponse::bytes(200, "application/octet-stream", b"image-bytes".to_vec()),
     ]);
 
-    let bytes = client(&mock).get_file_bytes("file-1").await.unwrap();
+    let bytes = client(&mock).get_file_bytes("file-1", 1024).await.unwrap();
 
     assert_eq!(bytes, b"image-bytes");
     let requests = mock.requests();
@@ -338,6 +338,52 @@ async fn get_file_bytes_fetches_file_path_from_file_base_url() {
         requests[1].path,
         format!("/file/bot{TOKEN}/photos/photo.jpg")
     );
+}
+
+#[tokio::test]
+async fn get_file_bytes_rejects_declared_oversize_before_buffering() {
+    let mock = MockTelegram::start(vec![
+        MockResponse::json_ok(json!({
+            "file_id": "file-1",
+            "file_path": "documents/large.bin"
+        })),
+        MockResponse::bytes(200, "application/octet-stream", b"too-large".to_vec()),
+    ]);
+
+    let error = client(&mock).get_file_bytes("file-1", 4).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        TelegramError::FileTooLarge {
+            size: 9,
+            max_bytes: 4
+        }
+    ));
+}
+
+#[tokio::test]
+async fn get_file_bytes_stops_an_unknown_length_body_at_the_limit() {
+    let mock = MockTelegram::start(vec![
+        MockResponse::json_ok(json!({
+            "file_id": "file-1",
+            "file_path": "documents/chunked.bin"
+        })),
+        MockResponse::bytes_without_content_length(
+            200,
+            "application/octet-stream",
+            b"too-large".to_vec(),
+        ),
+    ]);
+
+    let error = client(&mock).get_file_bytes("file-1", 4).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        TelegramError::FileTooLarge {
+            size: 9,
+            max_bytes: 4
+        }
+    ));
 }
 
 #[tokio::test]

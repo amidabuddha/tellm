@@ -223,8 +223,8 @@ first model call in the current session; missing keys are reported but do not
 stop local/keyless models from running.
 
 To keep a long-running bot predictable, tellm retains at most 32 complete
-conversation turns or roughly 4 MiB of provider-native history per room. Edited
-Telegram messages are ignored
+conversation turns or roughly 4 MiB of provider-native history per room, and
+accepts Telegram attachments up to 20 MiB. Edited Telegram messages are ignored
 so an edit never creates a second billed model request; send a new message when
 you want a new answer. Closing redirected stdin disables terminal commands but
 does not stop the bot—use `/shutdown` or a process signal.

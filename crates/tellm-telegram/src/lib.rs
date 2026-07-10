@@ -38,6 +38,8 @@ pub enum TelegramError {
     InvalidResponse(String),
     #[error("telegram getFile response did not include file_path")]
     MissingFilePath,
+    #[error("telegram file is too large ({size} bytes; maximum {max_bytes} bytes)")]
+    FileTooLarge { size: usize, max_bytes: usize },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -255,7 +257,11 @@ impl Telegram {
 
     /// Fetch a user-sent file (photo or document) for native passthrough to
     /// the provider.
-    pub async fn get_file_bytes(&self, file_id: &str) -> Result<Vec<u8>, TelegramError> {
+    pub async fn get_file_bytes(
+        &self,
+        file_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TelegramError> {
         // Checked 2026-07-04 against core.telegram.org/bots/api#getfile.
         let file: TelegramFile = self
             .post_json("getFile", &json!({ "file_id": file_id }))
@@ -267,24 +273,44 @@ impl Telegram {
             self.token,
             file_path.trim_start_matches('/')
         );
-        let response = self
+        let mut response = self
             .http
             .get(url)
             .send()
             .await
             .map_err(|error| self.http_error(error))?;
         let status = response.status();
-        let bytes = response
-            .bytes()
+        if let Some(size) = response.content_length() {
+            let size = usize::try_from(size).unwrap_or(usize::MAX);
+            if size > max_bytes {
+                return Err(TelegramError::FileTooLarge { size, max_bytes });
+            }
+        }
+
+        let initial_capacity = response
+            .content_length()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0)
+            .min(max_bytes);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| self.http_error(error))?;
+            .map_err(|error| self.http_error(error))?
+        {
+            let size = bytes.len().saturating_add(chunk.len());
+            if size > max_bytes {
+                return Err(TelegramError::FileTooLarge { size, max_bytes });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if !status.is_success() {
             return Err(TelegramError::Api {
                 code: i64::from(status.as_u16()),
                 description: self.sanitize_error_text(&String::from_utf8_lossy(&bytes)),
             });
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     async fn send_legacy_message_part(

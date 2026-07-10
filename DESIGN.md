@@ -204,6 +204,9 @@ Notes:
   system prompt. Terminal `reset` clears all in-memory histories while keeping
   room settings. Monotonic room generations prevent an older in-flight result
   or rollback from repopulating reset or revoked state.
+- Telegram downloads accept images, PDFs, and text documents up to 20 MiB.
+  Declared oversize files are rejected before download; unknown-length bodies
+  are read incrementally and stopped at the same limit.
 - Edited-message updates are deliberately ignored so correcting a Telegram
   message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with

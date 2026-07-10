@@ -31,6 +31,7 @@ pub struct MockResponse {
     status: u16,
     content_type: String,
     body: Vec<u8>,
+    include_content_length: bool,
 }
 
 impl MockResponse {
@@ -54,6 +55,20 @@ impl MockResponse {
             status,
             content_type: content_type.to_string(),
             body: body.into(),
+            include_content_length: true,
+        }
+    }
+
+    pub fn bytes_without_content_length(
+        status: u16,
+        content_type: &str,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            status,
+            content_type: content_type.to_string(),
+            body: body.into(),
+            include_content_length: false,
         }
     }
 
@@ -62,6 +77,7 @@ impl MockResponse {
             status,
             content_type: "application/json".to_string(),
             body: serde_json::to_vec(&value).expect("mock JSON response must serialize"),
+            include_content_length: true,
         }
     }
 }
@@ -209,12 +225,14 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
     } else {
         "ERROR"
     };
+    let content_length = if response.include_content_length {
+        format!("Content-Length: {}\r\n", response.body.len())
+    } else {
+        String::new()
+    };
     let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.status,
-        reason,
-        response.content_type,
-        response.body.len()
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{content_length}Connection: close\r\n\r\n",
+        response.status, reason, response.content_type
     );
     stream
         .write_all(headers.as_bytes())

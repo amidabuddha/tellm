@@ -36,6 +36,7 @@ const OLLAMA_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const OLLAMA_TERMINATE_WAIT: Duration = Duration::from_secs(2);
 const OLLAMA_TERMINATE_POLL: Duration = Duration::from_millis(100);
 const TERMINAL_SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 static OLLAMA_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static OLLAMA_CHILD: OnceLock<StdMutex<Option<ManagedOllamaChild>>> = OnceLock::new();
 static OLLAMA_LOADED_MODELS: OnceLock<StdMutex<BTreeSet<OllamaLoadedModel>>> = OnceLock::new();
@@ -1821,10 +1822,7 @@ async fn content_parts_from_message(
     }
 
     if let Some(photo) = largest_photo(message.photo.as_deref()) {
-        let bytes = telegram
-            .get_file_bytes(&photo.file_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let bytes = download_attachment(telegram, &photo.file_id, photo.file_size, "photo").await?;
         parts.push(ContentPart::Image {
             media_type: "image/jpeg".to_string(),
             base64: BASE64.encode(bytes),
@@ -1832,10 +1830,9 @@ async fn content_parts_from_message(
     }
 
     if let Some(document) = &message.document {
-        let bytes = telegram
-            .get_file_bytes(&document.file_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let bytes =
+            download_attachment(telegram, &document.file_id, document.file_size, "document")
+                .await?;
         let media_type = document
             .mime_type
             .clone()
@@ -1859,6 +1856,45 @@ async fn content_parts_from_message(
     }
 
     Ok(parts)
+}
+
+async fn download_attachment(
+    telegram: &Telegram,
+    file_id: &str,
+    announced_size: Option<i64>,
+    kind: &str,
+) -> Result<Vec<u8>, String> {
+    if let Some(size) = announced_size
+        && size >= 0
+    {
+        validate_attachment_size(kind, size as usize)?;
+    }
+
+    let bytes = telegram
+        .get_file_bytes(file_id, MAX_ATTACHMENT_BYTES)
+        .await
+        .map_err(|error| match error {
+            TelegramError::FileTooLarge { size, .. } => attachment_too_large_error(kind, size),
+            error => error.to_string(),
+        })?;
+    validate_attachment_size(kind, bytes.len())?;
+    Ok(bytes)
+}
+
+fn validate_attachment_size(kind: &str, size: usize) -> Result<(), String> {
+    if size > MAX_ATTACHMENT_BYTES {
+        Err(attachment_too_large_error(kind, size))
+    } else {
+        Ok(())
+    }
+}
+
+fn attachment_too_large_error(kind: &str, size: usize) -> String {
+    format!(
+        "{kind} is too large ({:.1} MiB); maximum attachment size is {} MiB",
+        size as f64 / (1024.0 * 1024.0),
+        MAX_ATTACHMENT_BYTES / (1024 * 1024)
+    )
 }
 
 async fn send_model_response(
@@ -3817,6 +3853,14 @@ mod tests {
         ];
 
         assert_eq!(largest_photo(Some(&photos)).unwrap().file_id, "wide");
+    }
+
+    #[test]
+    fn attachment_size_limit_rejects_declared_or_downloaded_oversize_payloads() {
+        assert!(validate_attachment_size("photo", MAX_ATTACHMENT_BYTES).is_ok());
+        let error = validate_attachment_size("document", MAX_ATTACHMENT_BYTES + 1).unwrap_err();
+        assert!(error.contains("document is too large"), "{error}");
+        assert!(error.contains("20 MiB"), "{error}");
     }
 
     #[test]
