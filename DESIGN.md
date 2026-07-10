@@ -85,23 +85,25 @@ state, so:
   request/response pair is never split.
 
 Thinking-level translation (verified against live provider docs 2026-07-05;
-xAI Grok 4.5 refreshed 2026-07-09):
+OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10):
 
 | Level | Anthropic Messages | OpenAI Responses | xAI Responses | Chat completions | Gemini |
 |---|---|---|---|---|---|
 | off | omit `thinking` | omit `reasoning` | omit | omit `reasoning_effort` | omit `thinking_level` |
 | low/medium/high | adaptive + `output_config.effort` | `reasoning: {effort}` | same | `reasoning_effort` | `thinking_level` |
-| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "xhigh"` (model-dependent) | clamps to `"high"` (grok-4.5 has no xhigh) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
+| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "max"` on GPT-5.6, otherwise `"xhigh"` | clamps to `"high"` (grok-4.5 has no xhigh) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
 
-Validity caveats (2026-07-05):
+Validity caveats (OpenAI refreshed 2026-07-10):
 - **"off" means provider default everywhere, not "no thinking"**: Sonnet 5 /
   Fable 5 think anyway, gpt-5.6-sol reasons at its own default, grok-4.5 defaults to high,
   Gemini thinks dynamically. User-facing text must say "default", not "off".
-- OpenAI effort is model-dependent: the GPT-5.6 family (sol/terra/luna) adds a
-  `max` tier above `xhigh`, so `/reasoning max` sends `max` there and `xhigh` on
-  older OpenAI and Meta Muse Spark; Grok 4.5 has no tier above `high` and cannot
-  disable reasoning, so its `Max` clamps to `high` and `Off` omits the field. An
-  unsupported value errors explicitly and the user can lower the room's level.
+- OpenAI effort is model-dependent: the built-in GPT-5.6 Sol preset supports
+  `max`, while older OpenAI families top out at `xhigh`. `/reasoning max`
+  therefore sends `max` to GPT-5.6 and `xhigh` to older OpenAI models and Meta
+  Muse Spark. Grok 4.5
+  has no tier above `high` and cannot disable reasoning, so its `Max` clamps to
+  `high` and `Off` omits the field. An unsupported value errors explicitly and
+  the user can lower the room's level.
 - Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
   model should be configured with `thinking = "low"` or `thinking = "high"`;
   gemini-3.1-pro and 3.5-flash accept medium.

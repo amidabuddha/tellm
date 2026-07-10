@@ -42,8 +42,9 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 // developers.openai.com API model docs, and docs.x.ai model docs.
 // Checked 2026-07-09 against dev.meta.ai Model API docs for Muse Spark.
 // Checked 2026-07-09 against docs.x.ai model docs for Grok 4.5.
-// Checked 2026-07-09 against developers.openai.com latest-model guide for
-// GPT-5.6 Sol (Responses API; reasoning.effort low/medium/high/xhigh/max).
+// Checked 2026-07-10 against developers.openai.com API model docs: GPT-5.6
+// Sol is the flagship model, uses ID gpt-5.6-sol, supports Responses, and
+// accepts reasoning effort none/low/medium/high/xhigh/max.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -255,5 +256,14 @@ mod tests {
         assert_eq!(model.base_url.as_deref(), Some(tellm_openai::XAI_BASE_URL));
         assert_eq!(model.api_key_secret.as_deref(), Some(secrets::XAI_API_KEY));
         assert!(model.telegram_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn openai_preset_uses_current_flagship_gpt_5_6_sol() {
+        let preset = preset_by_key("openai").unwrap();
+
+        assert_eq!(preset.label, "OpenAI GPT-5.6 Sol");
+        assert_eq!(preset.model_name, "gpt-5.6-sol");
+        assert_eq!(preset.wire_format, WireFormat::Responses);
     }
 }
