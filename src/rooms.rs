@@ -189,6 +189,14 @@ impl RoomStates {
             .or_insert_with(|| RoomState::new(RoomSettings::default()))
     }
 
+    pub fn get(&self, chat_id: i64) -> Option<&RoomState> {
+        self.rooms.get(&chat_id)
+    }
+
+    pub fn get_mut(&mut self, chat_id: i64) -> Option<&mut RoomState> {
+        self.rooms.get_mut(&chat_id)
+    }
+
     pub fn settings(&self) -> BTreeMap<i64, RoomSettings> {
         self.rooms
             .iter()
@@ -202,8 +210,12 @@ impl RoomStates {
         }
     }
 
-    pub fn remove(&mut self, chat_id: i64) {
-        self.rooms.remove(&chat_id);
+    pub fn remove(&mut self, chat_id: i64) -> Option<RoomState> {
+        self.rooms.remove(&chat_id)
+    }
+
+    pub fn insert(&mut self, chat_id: i64, room: RoomState) {
+        self.rooms.insert(chat_id, room);
     }
 }
 

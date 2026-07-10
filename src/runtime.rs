@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
@@ -9,13 +10,13 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tellm_anthropic::Anthropic;
 use tellm_compat::Compat;
-use tellm_config::{Config, ConfigError, ModelConfig, WireFormat, secrets};
+use tellm_config::{Config, ModelConfig, WireFormat, secrets};
 use tellm_core::{ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider};
 use tellm_gemini::Gemini;
 use tellm_openai::Responses;
 use tellm_telegram::{Document, IncomingMessage, PhotoSize, Telegram, TelegramError};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::{Instant as TokioInstant, sleep, timeout};
 
@@ -58,6 +59,95 @@ struct RuntimeHandles {
     terminal_prompts: TerminalSecretPrompts,
     bot_username: Option<String>,
     shutdown_tx: mpsc::Sender<ShutdownReason>,
+    room_persist: Arc<Mutex<()>>,
+    persistence: PersistenceWriter,
+}
+
+#[derive(Clone)]
+struct PersistenceWriter {
+    sender: std_mpsc::Sender<PersistenceCommand>,
+}
+
+enum PersistenceCommand {
+    SaveConfig {
+        config: Config,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SaveRooms {
+        settings: BTreeMap<i64, rooms::RoomSettings>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+impl PersistenceWriter {
+    async fn save_config(&self, config: Config) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(PersistenceCommand::SaveConfig { config, reply })
+            .map_err(|_| "config persistence writer stopped".to_string())?;
+        result
+            .await
+            .map_err(|_| "config persistence writer stopped before replying".to_string())?
+    }
+
+    async fn save_rooms(&self, settings: BTreeMap<i64, rooms::RoomSettings>) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(PersistenceCommand::SaveRooms { settings, reply })
+            .map_err(|_| "room persistence writer stopped".to_string())?;
+        result
+            .await
+            .map_err(|_| "room persistence writer stopped before replying".to_string())?
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        let (reply, done) = oneshot::channel();
+        self.sender
+            .send(PersistenceCommand::Shutdown { reply })
+            .map_err(|_| "persistence writer already stopped".to_string())?;
+        done.await
+            .map_err(|_| "persistence writer stopped before shutdown completed".to_string())
+    }
+}
+
+fn spawn_persistence_writer() -> std::io::Result<(PersistenceWriter, std::thread::JoinHandle<()>)> {
+    spawn_persistence_writer_with(
+        |config| tellm_config::save(&config).map_err(|error| error.to_string()),
+        |settings| rooms::save_settings(&settings).map_err(|error| error.to_string()),
+    )
+}
+
+fn spawn_persistence_writer_with<SaveConfig, SaveRooms>(
+    save_config: SaveConfig,
+    save_rooms: SaveRooms,
+) -> std::io::Result<(PersistenceWriter, std::thread::JoinHandle<()>)>
+where
+    SaveConfig: Fn(Config) -> Result<(), String> + Send + 'static,
+    SaveRooms: Fn(BTreeMap<i64, rooms::RoomSettings>) -> Result<(), String> + Send + 'static,
+{
+    let (sender, receiver) = std_mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("tellm-persistence".to_string())
+        .spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    PersistenceCommand::SaveConfig { config, reply } => {
+                        let _ = reply.send(save_config(config));
+                    }
+                    PersistenceCommand::SaveRooms { settings, reply } => {
+                        let _ = reply.send(save_rooms(settings));
+                    }
+                    PersistenceCommand::Shutdown { reply } => {
+                        let _ = reply.send(());
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok((PersistenceWriter { sender }, thread))
 }
 
 struct ChatDispatcher {
@@ -234,6 +324,7 @@ impl Runtime {
             );
         }
 
+        let (persistence, persistence_thread) = spawn_persistence_writer()?;
         let handles = RuntimeHandles {
             telegram: self.telegram.clone(),
             config: Arc::clone(&self.config),
@@ -242,6 +333,8 @@ impl Runtime {
             terminal_prompts: Arc::clone(&self.terminal_prompts),
             bot_username,
             shutdown_tx: self.shutdown_tx.clone(),
+            room_persist: Arc::new(Mutex::new(())),
+            persistence,
         };
         let mut dispatchers = BTreeMap::new();
         let mut offset = 0_i64;
@@ -301,6 +394,14 @@ impl Runtime {
         }
 
         drop(dispatchers);
+        if let Err(error) = handles.persistence.shutdown().await {
+            eprintln!("failed to flush persistence writer during shutdown: {error}");
+        }
+        match spawn_blocking(move || persistence_thread.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => eprintln!("persistence writer panicked during shutdown"),
+            Err(error) => eprintln!("failed to join persistence writer: {error}"),
+        }
         stop_started_ollama().await;
         Ok(())
     }
@@ -326,13 +427,23 @@ impl Runtime {
                     None => false,
                 };
                 if let Some(user_id) = adder.filter(|_| trusted_adder) {
-                    let changed = {
+                    let persisted = {
                         let mut config = self.config.lock().await;
+                        let before = config.clone();
                         let changed = allow_chat_in_config(&mut config, chat_id);
-                        if changed && let Err(error) = tellm_config::save(&config) {
-                            eprintln!("failed to persist auto-approved chat {chat_id}: {error}");
+                        if changed && let Err(error) = save_config(handles, &config).await {
+                            *config = before;
+                            Err(error)
+                        } else {
+                            Ok(changed)
                         }
-                        changed
+                    };
+                    let changed = match persisted {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            eprintln!("failed to persist auto-approved chat {chat_id}: {error}");
+                            return;
+                        }
                     };
                     {
                         let mut access = self.access.lock().await;
@@ -650,7 +761,7 @@ async fn handle_command(
                 if let Some(model) = config.models.get_mut(&model_key) {
                     model.telegram_chat_ids.push(chat_id);
                 }
-                tellm_config::save(&config).map_err(|error| error.to_string())?;
+                save_config(handles, &config).await?;
             }
             mutate_room(handles, chat_id, |room| {
                 room.settings.thinking = None;
@@ -682,7 +793,7 @@ async fn handle_command(
                     config.telegram.allowed_chat_ids.push(chat_id);
                 }
                 if was_pinned {
-                    tellm_config::save(&config).map_err(|error| error.to_string())?;
+                    save_config(handles, &config).await?;
                 }
                 was_pinned
             };
@@ -721,7 +832,7 @@ async fn handle_command(
                         preset.key.to_string(),
                         crate::wizard::model_config_from_preset(preset),
                     );
-                    tellm_config::save(&config).map_err(|error| error.to_string())?;
+                    save_config(handles, &config).await?;
                     false
                 }
             };
@@ -1516,9 +1627,15 @@ async fn handle_allow_chat(
 ) -> Result<(), String> {
     let changed = {
         let mut config = handles.config.lock().await;
+        let before = config.clone();
         let changed = allow_chat_in_config(&mut config, target_chat_id);
         if changed {
-            tellm_config::save(&config).map_err(|error| error.to_string())?;
+            if let Err(error) = save_config(handles, &config).await {
+                *config = before;
+                return Err(format!(
+                    "failed to persist allowed chat {target_chat_id}: {error}"
+                ));
+            }
         }
         changed
     };
@@ -1555,24 +1672,35 @@ async fn handle_deny_chat(
 ) -> Result<(), String> {
     let config_result = {
         let mut config = handles.config.lock().await;
+        let before = config.clone();
         let result = deny_chat_in_config(&mut config, target_chat_id);
         if result.changed() {
-            tellm_config::save(&config).map_err(|error| error.to_string())?;
+            if let Err(error) = save_config(handles, &config).await {
+                *config = before;
+                return Err(format!(
+                    "failed to persist denied chat {target_chat_id}: {error}"
+                ));
+            }
         }
         result
     };
 
+    let _persist = handles.room_persist.lock().await;
     {
         let mut rooms = handles.rooms.lock().await;
-        rooms.remove(target_chat_id);
-        rooms::save_settings(&rooms.settings()).map_err(|error| error.to_string())?;
+        let removed = rooms.remove(target_chat_id);
+        let settings = rooms.settings();
+        if let Err(error) = save_room_settings(handles, settings).await {
+            if let Some(room) = removed {
+                rooms.insert(target_chat_id, room);
+            }
+            return Err(format!(
+                "failed to persist room cleanup for denied chat {target_chat_id}: {error}"
+            ));
+        }
     }
 
-    {
-        let mut access = handles.access.lock().await;
-        access.deny_chat(target_chat_id);
-    }
-
+    handles.access.lock().await.deny_chat(target_chat_id);
     send_command_reply(
         handles,
         admin_chat_id,
@@ -1594,9 +1722,7 @@ async fn handle_pair_attempt(
 
     match attempt {
         PairingAttempt::Paired => {
-            let became_owner = persist_paired_chat(chat_id, pairer_user_id, handles)
-                .await
-                .map_err(|error| error.to_string())?;
+            let became_owner = persist_provisional_pair(chat_id, pairer_user_id, handles).await?;
             if let Some(user_id) = pairer_user_id.filter(|_| became_owner) {
                 // Apply to the live access set too, or the new owner is
                 // rejected until restart.
@@ -1637,6 +1763,25 @@ async fn handle_pair_attempt(
                 ),
             )
             .await
+        }
+    }
+}
+
+async fn persist_provisional_pair(
+    chat_id: i64,
+    pairer_user_id: Option<i64>,
+    handles: &RuntimeHandles,
+) -> Result<bool, String> {
+    match persist_paired_chat(chat_id, pairer_user_id, handles).await {
+        Ok(became_owner) => Ok(became_owner),
+        Err(error) => {
+            // attempt_pair grants live access after a constant-time code
+            // match. Revoke that provisional grant if durability fails, or
+            // the room would remain usable until restart.
+            handles.access.lock().await.deny_chat(chat_id);
+            Err(format!(
+                "pairing matched but could not be persisted; access was revoked: {error}"
+            ))
         }
     }
 }
@@ -1720,8 +1865,9 @@ async fn persist_paired_chat(
     chat_id: i64,
     pairer_user_id: Option<i64>,
     handles: &RuntimeHandles,
-) -> Result<bool, ConfigError> {
+) -> Result<bool, String> {
     let mut config = handles.config.lock().await;
+    let before = config.clone();
     let mut changed = false;
     if !config.telegram.allowed_chat_ids.contains(&chat_id) {
         config.telegram.allowed_chat_ids.push(chat_id);
@@ -1739,7 +1885,10 @@ async fn persist_paired_chat(
         changed = true;
     }
     if changed {
-        tellm_config::save(&config)?;
+        if let Err(error) = save_config(handles, &config).await {
+            *config = before;
+            return Err(error);
+        }
     }
     Ok(became_owner)
 }
@@ -2032,12 +2181,49 @@ async fn mutate_room(
     chat_id: i64,
     mutate: impl FnOnce(&mut RoomState),
 ) -> Result<(), String> {
-    let settings = {
+    let _persist = handles.room_persist.lock().await;
+    let (before, settings) = {
         let mut rooms = handles.rooms.lock().await;
-        mutate(rooms.get_or_default(chat_id));
-        rooms.settings()
+        let before = rooms.get(chat_id).cloned();
+        let room = rooms.get_or_default(chat_id);
+        mutate(room);
+        (before, rooms.settings())
     };
-    rooms::save_settings(&settings).map_err(|error| error.to_string())
+    if let Err(error) = save_room_settings(handles, settings).await {
+        let mut rooms = handles.rooms.lock().await;
+        match before {
+            Some(before) => {
+                if let Some(current) = rooms.get_mut(chat_id) {
+                    // Only settings are durable. Roll them back, but never
+                    // resurrect history invalidated by this command or by a
+                    // concurrent terminal reset.
+                    current.settings = before.settings;
+                } else {
+                    rooms.insert(chat_id, before);
+                }
+            }
+            None => {
+                if rooms.get(chat_id).is_some() {
+                    rooms.remove(chat_id);
+                }
+            }
+        }
+        return Err(format!(
+            "failed to persist room {chat_id}; settings mutation rolled back: {error}"
+        ));
+    }
+    Ok(())
+}
+
+async fn save_room_settings(
+    handles: &RuntimeHandles,
+    settings: BTreeMap<i64, rooms::RoomSettings>,
+) -> Result<(), String> {
+    handles.persistence.save_rooms(settings).await
+}
+
+async fn save_config(handles: &RuntimeHandles, config: &Config) -> Result<(), String> {
+    handles.persistence.save_config(config.clone()).await
 }
 
 async fn send_command_reply(
@@ -2635,6 +2821,135 @@ mod tests {
             .unwrap()
             .contains("Anthropic")
         );
+    }
+
+    #[tokio::test]
+    async fn persistence_writer_orders_an_abandoned_write_before_the_next_snapshot() {
+        let observed = Arc::new(StdMutex::new(Vec::<Vec<i64>>::new()));
+        let thread_observed = Arc::clone(&observed);
+        let release_first = Arc::new(std::sync::Barrier::new(2));
+        let thread_release = Arc::clone(&release_first);
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (writer, thread) = spawn_persistence_writer_with(
+            |_config: Config| Ok(()),
+            move |settings| {
+                let ids = settings.keys().copied().collect::<Vec<_>>();
+                if ids == [1] {
+                    let _ = started_tx.send(());
+                    thread_release.wait();
+                }
+                thread_observed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(ids);
+                Ok(())
+            },
+        )
+        .expect("spawn persistence writer");
+
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .save_rooms(BTreeMap::from([(1, rooms::RoomSettings::default())]))
+                .await
+        });
+        spawn_blocking(move || started_rx.recv())
+            .await
+            .expect("join start wait")
+            .expect("first write should start");
+        first.abort();
+
+        let second_writer = writer.clone();
+        let second = tokio::spawn(async move {
+            second_writer
+                .save_rooms(BTreeMap::from([(2, rooms::RoomSettings::default())]))
+                .await
+        });
+        spawn_blocking(move || release_first.wait())
+            .await
+            .expect("release first write");
+
+        second
+            .await
+            .expect("second caller should run")
+            .expect("second write should succeed");
+        writer.shutdown().await.expect("writer should shut down");
+        spawn_blocking(move || thread.join())
+            .await
+            .expect("join persistence thread")
+            .expect("persistence thread should not panic");
+
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![vec![1], vec![2]]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pair_persistence_revokes_live_access_and_rearms_the_room() {
+        let mut codes = ["123456", "654321"].into_iter();
+        let mut access = AccessControl::new_with_generator(AccessConfig::default(), move || {
+            codes.next().expect("enough test pairing codes").to_string()
+        });
+        let now = now_access_time();
+        let first = access.arm_room(42, now).expect("room should arm");
+        assert_eq!(
+            access.attempt_pair(42, &first.code, now),
+            PairingAttempt::Paired
+        );
+        assert_eq!(access.check_chat(42), ChatAccess::Allowed);
+
+        let config = Config {
+            default_model: "openai".to_string(),
+            models: BTreeMap::from([(
+                "openai".to_string(),
+                test_model(WireFormat::Responses, &[]),
+            )]),
+            telegram: tellm_config::TelegramConfig::default(),
+        };
+        let config = Arc::new(Mutex::new(config));
+        let (persistence, thread) = spawn_persistence_writer_with(
+            |_config: Config| Err("injected config failure".to_string()),
+            |_settings| Ok(()),
+        )
+        .expect("spawn persistence writer");
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let handles = RuntimeHandles {
+            telegram: Telegram::new("test-token"),
+            config: Arc::clone(&config),
+            rooms: Arc::new(Mutex::new(RoomStates::default())),
+            access: Arc::new(Mutex::new(access)),
+            terminal_prompts: Arc::new(StdMutex::new(None)),
+            bot_username: None,
+            shutdown_tx,
+            room_persist: Arc::new(Mutex::new(())),
+            persistence: persistence.clone(),
+        };
+
+        let error = persist_provisional_pair(42, Some(7), &handles)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("access was revoked"), "{error}");
+        assert!(config.lock().await.telegram.allowed_chat_ids.is_empty());
+        let mut access = handles.access.lock().await;
+        assert!(matches!(access.check_chat(42), ChatAccess::Unknown { .. }));
+        let rearmed = access
+            .arm_room(42, now)
+            .expect("failed persistence should permit a new pairing attempt");
+        assert_eq!(rearmed.code, "654321");
+        drop(access);
+
+        persistence
+            .shutdown()
+            .await
+            .expect("writer should shut down");
+        spawn_blocking(move || thread.join())
+            .await
+            .expect("join persistence thread")
+            .expect("persistence thread should not panic");
     }
 
     #[test]

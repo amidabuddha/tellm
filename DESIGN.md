@@ -335,7 +335,12 @@ restart and local room-setting changes.
   same-directory temp files, file sync, and rename, so a crash or concurrent
   writer cannot expose a partial file. Unix parent-directory sync is attempted
   after commit; failure is a durability warning, not a false failed-commit
-  signal.
+  signal. One ordered persistence thread owns runtime config/room writes, so an
+  aborted worker cannot detach an older write that lands after `/deny`. Failed
+  mutations roll settings back without resurrecting invalidated history. The
+  files remain separate transactions: a reported I/O failure between config
+  and room persistence can leave stale room settings on disk, but never restores
+  access or conversation history.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists; model keys are command-safe; model names and secret names are
   nonempty and secret names cannot use tellm's internal marker prefix;
