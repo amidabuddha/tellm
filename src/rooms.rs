@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
@@ -9,6 +9,10 @@ use tellm_core::ThinkingLevel;
 use tellm_config::{ConfigError, WireFormat};
 
 const ROOMS_FILE: &str = "rooms.toml";
+/// Keep enough context for long conversations without allowing opaque provider
+/// state to grow without bound. Pruning always removes complete provider turns.
+pub const MAX_HISTORY_TURNS: usize = 32;
+pub const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +56,13 @@ pub struct RoomState {
     pub settings: RoomSettings,
     pub wire_format: Option<WireFormat>,
     pub history: Vec<Value>,
+    history_turns: VecDeque<HistoryTurn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistoryTurn {
+    item_count: usize,
+    approx_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +80,7 @@ impl RoomState {
             settings,
             wire_format: None,
             history: Vec::new(),
+            history_turns: VecDeque::new(),
         }
     }
 
@@ -76,7 +88,7 @@ impl RoomState {
         if self.wire_format != Some(wire_format) {
             let previous = self.wire_format;
             self.wire_format = Some(wire_format);
-            self.history.clear();
+            self.clear_history_storage();
             return HistoryReset::WireFormatChanged {
                 previous,
                 new: wire_format,
@@ -89,19 +101,70 @@ impl RoomState {
     pub fn append_turn(&mut self, wire_format: WireFormat, turn_items: Vec<Value>) {
         if self.wire_format != Some(wire_format) {
             self.wire_format = Some(wire_format);
-            self.history.clear();
+            self.clear_history_storage();
         }
 
         match self.settings.mode {
-            ChatMode::Chat => self.history.extend(turn_items),
+            ChatMode::Chat => self.push_turn(turn_items),
             // Message mode stays stateless at request time, but keeps the
             // latest exchange so `/mode chat` can continue from it.
-            ChatMode::Message => self.history = turn_items,
+            ChatMode::Message => {
+                self.clear_history_storage();
+                self.push_turn(turn_items);
+            }
         }
     }
 
     pub fn reset_history(&mut self) {
+        self.clear_history_storage();
+    }
+
+    fn clear_history_storage(&mut self) {
         self.history.clear();
+        self.history_turns.clear();
+    }
+
+    fn push_turn(&mut self, turn_items: Vec<Value>) {
+        let turn = HistoryTurn {
+            item_count: turn_items.len(),
+            approx_bytes: turn_items.iter().fold(0_usize, |total, value| {
+                total.saturating_add(approx_json_bytes(value))
+            }),
+        };
+        self.history.extend(turn_items);
+        self.history_turns.push_back(turn);
+
+        while self.history_turns.len() > MAX_HISTORY_TURNS
+            || self.history_bytes() > MAX_HISTORY_BYTES
+        {
+            let Some(oldest) = self.history_turns.pop_front() else {
+                break;
+            };
+            self.history.drain(..oldest.item_count);
+        }
+    }
+
+    fn history_bytes(&self) -> usize {
+        self.history_turns.iter().fold(0_usize, |total, turn| {
+            total.saturating_add(turn.approx_bytes)
+        })
+    }
+}
+
+fn approx_json_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(value) => usize::from(*value) + 4,
+        Value::Number(value) => value.to_string().len(),
+        Value::String(value) => value.len().saturating_add(2),
+        Value::Array(values) => values.iter().fold(2_usize, |total, value| {
+            total.saturating_add(approx_json_bytes(value).saturating_add(1))
+        }),
+        Value::Object(values) => values.iter().fold(2_usize, |total, (key, value)| {
+            total
+                .saturating_add(key.len().saturating_add(3))
+                .saturating_add(approx_json_bytes(value).saturating_add(1))
+        }),
     }
 }
 
@@ -361,6 +424,48 @@ mod tests {
             room.history,
             vec![serde_json::json!({ "role": "assistant", "content": "latest" })]
         );
+    }
+
+    #[test]
+    fn history_limit_prunes_complete_provider_turns() {
+        let mut room = RoomState::new(RoomSettings::default());
+        for turn in 0..=MAX_HISTORY_TURNS {
+            room.append_turn(
+                WireFormat::Responses,
+                vec![
+                    serde_json::json!({ "turn": turn, "role": "user" }),
+                    serde_json::json!({ "turn": turn, "role": "assistant" }),
+                ],
+            );
+        }
+
+        assert_eq!(room.history.len(), MAX_HISTORY_TURNS * 2);
+        assert_eq!(room.history[0]["turn"], 1);
+        assert_eq!(room.history[1]["turn"], 1);
+        assert_eq!(room.history.last().unwrap()["turn"], MAX_HISTORY_TURNS);
+    }
+
+    #[test]
+    fn history_byte_limit_never_keeps_half_a_provider_turn() {
+        let mut room = RoomState::new(RoomSettings::default());
+        let payload = "x".repeat(MAX_HISTORY_BYTES / 2);
+        room.append_turn(
+            WireFormat::Anthropic,
+            vec![
+                serde_json::json!({ "turn": 1, "content": payload }),
+                serde_json::json!({ "turn": 1, "marker": "complete" }),
+            ],
+        );
+        room.append_turn(
+            WireFormat::Anthropic,
+            vec![
+                serde_json::json!({ "turn": 2, "content": "y".repeat(MAX_HISTORY_BYTES / 2) }),
+                serde_json::json!({ "turn": 2, "marker": "complete" }),
+            ],
+        );
+
+        assert_eq!(room.history.len(), 2);
+        assert!(room.history.iter().all(|item| item["turn"] == 2));
     }
 
     #[test]

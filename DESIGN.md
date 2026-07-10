@@ -80,6 +80,9 @@ state, so:
   provider's own history shape); the runtime appends them verbatim.
 - Switching a room's wire format resets the opaque history (announced to the
   user).
+- History stays memory-bounded: retain at most 32 complete provider-native
+  turns and approximately 4 MiB per room, pruning oldest whole turns so a
+  request/response pair is never split.
 
 Thinking-level translation (verified against live provider docs 2026-07-05;
 xAI Grok 4.5 refreshed 2026-07-09):

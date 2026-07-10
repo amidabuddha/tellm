@@ -222,6 +222,9 @@ configured models. This surfaces OS keychain permission prompts before the
 first model call in the current session; missing keys are reported but do not
 stop local/keyless models from running.
 
+To keep a long-running bot predictable, tellm retains at most 32 complete
+conversation turns or roughly 4 MiB of provider-native history per room.
+
 ## Troubleshooting
 
 ### Group chats
