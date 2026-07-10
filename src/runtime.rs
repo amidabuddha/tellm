@@ -1021,11 +1021,9 @@ async fn handle_command(
                 if was_pinned && !config.telegram.allowed_chat_ids.contains(&chat_id) {
                     config.telegram.allowed_chat_ids.push(chat_id);
                 }
-                if was_pinned {
-                    if let Err(error) = save_config(handles, &config).await {
-                        *config = before;
-                        return Err(format!("failed to persist model unpin: {error}"));
-                    }
+                if was_pinned && let Err(error) = save_config(handles, &config).await {
+                    *config = before;
+                    return Err(format!("failed to persist model unpin: {error}"));
                 }
                 was_pinned
             };
@@ -1950,13 +1948,11 @@ async fn handle_allow_chat(
         let mut config = handles.config.lock().await;
         let before = config.clone();
         let changed = allow_chat_in_config(&mut config, target_chat_id);
-        if changed {
-            if let Err(error) = save_config(handles, &config).await {
-                *config = before;
-                return Err(format!(
-                    "failed to persist allowed chat {target_chat_id}: {error}"
-                ));
-            }
+        if changed && let Err(error) = save_config(handles, &config).await {
+            *config = before;
+            return Err(format!(
+                "failed to persist allowed chat {target_chat_id}: {error}"
+            ));
         }
         changed
     };
@@ -2015,22 +2011,22 @@ async fn handle_deny_chat(
             target_chat_id != admin_chat_id,
         );
 
-        if result.changed() {
-            if let Err(error) = save_config(handles, &config).await {
-                *config = before;
-                if was_allowed {
-                    handles.access.lock().await.allow_chat(target_chat_id);
-                }
-                // Only a self-deny leaves the task alive. Restore its flag so
-                // the normal worker error reply can report the failed save;
-                // an aborted target worker and its queued work stay dropped.
-                if target_chat_id == admin_chat_id {
-                    reactivate_chat_worker(&handles.workers, target_chat_id);
-                }
-                return Err(format!(
-                    "failed to persist denied chat {target_chat_id}: {error}"
-                ));
+        if result.changed()
+            && let Err(error) = save_config(handles, &config).await
+        {
+            *config = before;
+            if was_allowed {
+                handles.access.lock().await.allow_chat(target_chat_id);
             }
+            // Only a self-deny leaves the task alive. Restore its flag so
+            // the normal worker error reply can report the failed save;
+            // an aborted target worker and its queued work stay dropped.
+            if target_chat_id == admin_chat_id {
+                reactivate_chat_worker(&handles.workers, target_chat_id);
+            }
+            return Err(format!(
+                "failed to persist denied chat {target_chat_id}: {error}"
+            ));
         }
         result
     };
@@ -2247,11 +2243,9 @@ async fn persist_paired_chat(
         became_owner = true;
         changed = true;
     }
-    if changed {
-        if let Err(error) = save_config(handles, &config).await {
-            *config = before;
-            return Err(error);
-        }
+    if changed && let Err(error) = save_config(handles, &config).await {
+        *config = before;
+        return Err(error);
     }
     Ok(became_owner)
 }
