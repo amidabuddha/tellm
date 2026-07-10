@@ -208,7 +208,9 @@ Notes:
   message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
   chunking at 32000/3900 chars. Fallback triggers ported from the Python
-  implementation's error-marker list.
+  implementation's error-marker list. Telegram transport and API errors strip
+  token-bearing request URLs and redact any echoed bot token before the error can
+  reach logs or operator-facing output.
 - Shutdown (terminal `exit`/`quit`, Telegram `/shutdown`, SIGINT/SIGTERM)
   stops polling, marks every room worker cancelled, aborts and joins them, and
   only then performs Ollama unload/child cleanup. Draining provider turns could

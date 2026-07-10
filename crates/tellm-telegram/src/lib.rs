@@ -31,7 +31,7 @@ pub const RICH_CHUNK_SIZE: usize = 32000;
 #[derive(Debug, thiserror::Error)]
 pub enum TelegramError {
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("telegram api error {code}: {description}")]
     Api { code: i64, description: String },
     #[error("telegram api returned invalid response: {0}")]
@@ -267,13 +267,21 @@ impl Telegram {
             self.token,
             file_path.trim_start_matches('/')
         );
-        let response = self.http.get(url).send().await?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| self.http_error(error))?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| self.http_error(error))?;
         if !status.is_success() {
             return Err(TelegramError::Api {
                 code: i64::from(status.as_u16()),
-                description: String::from_utf8_lossy(&bytes).into_owned(),
+                description: self.sanitize_error_text(&String::from_utf8_lossy(&bytes)),
             });
         }
         Ok(bytes.to_vec())
@@ -336,7 +344,8 @@ impl Telegram {
             .json(payload)
             .timeout(timeout)
             .send()
-            .await?;
+            .await
+            .map_err(|error| self.http_error(error))?;
         self.parse_api_response(method, response).await
     }
 
@@ -353,7 +362,8 @@ impl Telegram {
             .body(body)
             .timeout(self.request_timeout)
             .send()
-            .await?;
+            .await
+            .map_err(|error| self.http_error(error))?;
         self.parse_api_response(method, response).await
     }
 
@@ -363,29 +373,54 @@ impl Telegram {
         response: reqwest::Response,
     ) -> Result<T, TelegramError> {
         let status = response.status();
-        let text = response.text().await?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| self.http_error(error))?;
         if !status.is_success() {
             return Err(TelegramError::Api {
                 code: i64::from(status.as_u16()),
-                description: format!("HTTP status from {method}: {text}"),
+                description: self
+                    .sanitize_error_text(&format!("HTTP status from {method}: {text}")),
             });
         }
 
         let response: ApiResponse<T> = serde_json::from_str(&text).map_err(|error| {
-            TelegramError::InvalidResponse(format!("{method}: non-JSON or malformed JSON: {error}"))
+            TelegramError::InvalidResponse(
+                self.sanitize_error_text(&format!("{method}: non-JSON or malformed JSON: {error}")),
+            )
         })?;
 
         if response.ok {
             response.result.ok_or_else(|| {
-                TelegramError::InvalidResponse(format!("{method}: ok response missing result"))
+                TelegramError::InvalidResponse(
+                    self.sanitize_error_text(&format!("{method}: ok response missing result")),
+                )
             })
         } else {
             Err(TelegramError::Api {
                 code: response.error_code.unwrap_or(0),
-                description: response
-                    .description
-                    .unwrap_or_else(|| "unknown error".to_string()),
+                description: self.sanitize_error_text(
+                    &response
+                        .description
+                        .unwrap_or_else(|| "unknown error".to_string()),
+                ),
             })
+        }
+    }
+
+    fn http_error(&self, error: reqwest::Error) -> TelegramError {
+        // reqwest attaches the request URL to transport and body errors. Bot
+        // API URLs contain the authentication token, so discard the URL
+        // before formatting and redact defensively before storing the error.
+        TelegramError::Http(self.sanitize_error_text(&error.without_url().to_string()))
+    }
+
+    fn sanitize_error_text(&self, text: &str) -> String {
+        if self.token.is_empty() {
+            text.to_string()
+        } else {
+            text.replace(&self.token, "[REDACTED]")
         }
     }
 

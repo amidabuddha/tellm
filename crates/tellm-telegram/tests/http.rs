@@ -282,10 +282,37 @@ async fn stalled_api_request_times_out_instead_of_hanging() {
     .unwrap_err();
 
     assert!(matches!(error, TelegramError::Http(_)), "{error}");
+    let rendered = error.to_string();
+    assert!(!rendered.contains(TOKEN), "token leaked in: {rendered}");
+    assert!(
+        !rendered.contains(&format!("/bot{TOKEN}/sendChatAction")),
+        "token-bearing URL leaked in: {rendered}"
+    );
     assert_eq!(
         mock.requests()[0].path,
         format!("/bot{TOKEN}/sendChatAction")
     );
+}
+
+#[tokio::test]
+async fn telegram_api_error_body_cannot_echo_the_bot_token() {
+    let mock = MockTelegram::start(vec![MockResponse::json_error(
+        500,
+        &format!(
+            "upstream failed at {}/bot{TOKEN}/getMe",
+            "https://api.telegram.org"
+        ),
+    )]);
+
+    let error = client(&mock).get_me().await.unwrap_err();
+    let rendered = error.to_string();
+
+    assert!(!rendered.contains(TOKEN), "token leaked in: {rendered}");
+    assert!(
+        !rendered.contains(&format!("/bot{TOKEN}/getMe")),
+        "token-bearing URL leaked in: {rendered}"
+    );
+    assert!(rendered.contains("[REDACTED]"), "{rendered}");
 }
 
 #[tokio::test]
