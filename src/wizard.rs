@@ -127,11 +127,13 @@ pub async fn run_first_run(
     let api_key = prompt_required(input, output, &format!("{} API key: ", preset.label))?;
 
     let config = config_for_preset(preset);
-    tellm_config::save(&config)?;
     let telegram_destination = secrets::set_nonempty(secrets::TELEGRAM_BOT_TOKEN, &telegram_token)?
         .expect("prompt_required returned a non-empty Telegram token");
     let provider_destination = secrets::set_nonempty(preset.api_key_secret, &api_key)?
         .expect("prompt_required returned a non-empty provider key");
+    // A config file marks setup complete, so publish it only after every
+    // referenced secret has been stored successfully.
+    tellm_config::save(&config)?;
 
     writeln!(output)?;
     writeln!(output, "Config saved to {}.", config_path()?.display())?;
@@ -197,7 +199,12 @@ fn prompt_optional(
     write!(output, "{prompt}")?;
     output.flush()?;
     let mut line = String::new();
-    input.read_line(&mut line)?;
+    if input.read_line(&mut line)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "first-run input ended before setup was complete",
+        ));
+    }
     Ok(line.trim().to_string())
 }
 
@@ -265,5 +272,20 @@ mod tests {
         assert_eq!(preset.label, "OpenAI GPT-5.6 Sol");
         assert_eq!(preset.model_name, "gpt-5.6-sol");
         assert_eq!(preset.wire_format, WireFormat::Responses);
+    }
+
+    #[test]
+    fn required_prompt_returns_unexpected_eof_after_one_prompt() {
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let error = prompt_required(&mut input, &mut output, "Telegram bot token: ").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            error.to_string(),
+            "first-run input ended before setup was complete"
+        );
+        assert_eq!(output, b"Telegram bot token: ");
     }
 }

@@ -386,10 +386,11 @@ restart and local room-setting changes.
   No encrypted-file theater.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
-  from the built-in list (checked 2026-07-09: Claude Fable 5, GPT-5.6 Sol,
+  from the built-in list (checked 2026-07-10: Claude Fable 5, GPT-5.6 Sol,
   Grok 4.5, Muse Spark 1.1, Gemini 3.5 Flash), stores Telegram/provider
-  secrets via the secret facade, writes nonsecret config, and explains the
-  `/pair CODE` claim step.
+  secrets via the secret facade, writes nonsecret config last, and explains the
+  `/pair CODE` claim step. EOF before completion exits once with an error rather
+  than repeatedly prompting on a closed input stream.
   Target: install-to-chatting under two minutes, zero file editing.
 
 ## Porting method
