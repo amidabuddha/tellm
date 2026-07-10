@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -38,6 +39,7 @@ const TERMINAL_SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 static OLLAMA_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static OLLAMA_CHILD: OnceLock<StdMutex<Option<ManagedOllamaChild>>> = OnceLock::new();
 static OLLAMA_LOADED_MODELS: OnceLock<StdMutex<BTreeSet<OllamaLoadedModel>>> = OnceLock::new();
+static NEXT_CHAT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Runtime {
     telegram: Telegram,
@@ -61,6 +63,7 @@ struct RuntimeHandles {
     shutdown_tx: mpsc::Sender<ShutdownReason>,
     room_persist: Arc<Mutex<()>>,
     persistence: PersistenceWriter,
+    workers: WorkerRegistry,
 }
 
 #[derive(Clone)]
@@ -153,6 +156,51 @@ where
 struct ChatDispatcher {
     sender: mpsc::Sender<DispatchMessage>,
     handle: JoinHandle<()>,
+    worker_id: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+type WorkerRegistry = Arc<StdMutex<BTreeMap<i64, WorkerRegistration>>>;
+
+struct WorkerRegistration {
+    worker_id: u64,
+    cancelled: Arc<AtomicBool>,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+struct WorkerRegistryGuard {
+    chat_id: i64,
+    worker_id: u64,
+    workers: WorkerRegistry,
+}
+
+impl Drop for WorkerRegistryGuard {
+    fn drop(&mut self) {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if workers
+            .get(&self.chat_id)
+            .is_some_and(|worker| worker.worker_id == self.worker_id)
+        {
+            workers.remove(&self.chat_id);
+        }
+    }
+}
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl AbortOnDrop {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +372,7 @@ impl Runtime {
             );
         }
 
+        let workers = Arc::new(StdMutex::new(BTreeMap::new()));
         let (persistence, persistence_thread) = spawn_persistence_writer()?;
         let handles = RuntimeHandles {
             telegram: self.telegram.clone(),
@@ -335,6 +384,7 @@ impl Runtime {
             shutdown_tx: self.shutdown_tx.clone(),
             room_persist: Arc::new(Mutex::new(())),
             persistence,
+            workers: Arc::clone(&workers),
         };
         let mut dispatchers = BTreeMap::new();
         let mut offset = 0_i64;
@@ -388,12 +438,16 @@ impl Runtime {
                 }
             }
 
-            dispatchers.retain(|_, dispatcher| {
-                !dispatcher.handle.is_finished() && !dispatcher.sender.is_closed()
+            dispatchers.retain(|chat_id, dispatcher| {
+                let keep = !dispatcher.handle.is_finished() && !dispatcher.sender.is_closed();
+                if !keep {
+                    remove_worker_registration(&workers, *chat_id, dispatcher.worker_id);
+                }
+                keep
             });
         }
 
-        drop(dispatchers);
+        stop_chat_workers(dispatchers, &workers).await;
         if let Err(error) = handles.persistence.shutdown().await {
             eprintln!("failed to flush persistence writer during shutdown: {error}");
         }
@@ -586,19 +640,48 @@ fn send_to_chat_worker(
 
 fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
     let (sender, mut receiver) = mpsc::channel::<DispatchMessage>(CHAT_QUEUE_SIZE);
+    let worker_id = NEXT_CHAT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let workers = Arc::clone(&handles.workers);
+    let worker_guard_registry = Arc::clone(&workers);
     let handle = tokio::spawn(async move {
+        let _registry_guard = WorkerRegistryGuard {
+            chat_id,
+            worker_id,
+            workers: worker_guard_registry,
+        };
         loop {
+            // A self-deny does not abort the task so it can send the command
+            // confirmation. Observe its flag before waiting for another item
+            // instead of retaining the denied room until the idle timeout.
+            if worker_cancelled.load(Ordering::Acquire) || !chat_is_allowed(chat_id, &handles).await
+            {
+                break;
+            }
             match timeout(CHAT_TASK_IDLE_TIMEOUT, receiver.recv()).await {
                 Ok(Some(dispatch)) => {
-                    if let Err(error) =
-                        handle_allowed_message(chat_id, dispatch.kind, dispatch.message, &handles)
-                            .await
+                    if worker_cancelled.load(Ordering::Acquire)
+                        || !chat_is_allowed(chat_id, &handles).await
+                    {
+                        break;
+                    }
+                    if let Err(error) = handle_allowed_message(
+                        chat_id,
+                        dispatch.kind,
+                        dispatch.message,
+                        &handles,
+                        &worker_cancelled,
+                    )
+                    .await
                     {
                         eprintln!("chat {chat_id} dispatch failed: {error}");
-                        let _ = handles
-                            .telegram
-                            .send_message(chat_id, &format!("tellm error: {error}"))
-                            .await;
+                        if worker_can_reply(chat_id, &handles, &worker_cancelled).await {
+                            let _ = handles
+                                .telegram
+                                .send_message(chat_id, &format!("tellm error: {error}"))
+                                .await;
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -610,7 +693,86 @@ fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
         }
     });
 
-    ChatDispatcher { sender, handle }
+    workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            chat_id,
+            WorkerRegistration {
+                worker_id,
+                cancelled: Arc::clone(&cancelled),
+                abort_handle: handle.abort_handle(),
+            },
+        );
+
+    ChatDispatcher {
+        sender,
+        handle,
+        worker_id,
+        cancelled,
+    }
+}
+
+fn remove_worker_registration(workers: &WorkerRegistry, chat_id: i64, worker_id: u64) {
+    let mut workers = workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if workers
+        .get(&chat_id)
+        .is_some_and(|worker| worker.worker_id == worker_id)
+    {
+        workers.remove(&chat_id);
+    }
+}
+
+fn cancel_chat_worker(workers: &WorkerRegistry, chat_id: i64, abort: bool) {
+    let abort_handle = {
+        let workers = workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        workers.get(&chat_id).map(|worker| {
+            worker.cancelled.store(true, Ordering::Release);
+            worker.abort_handle.clone()
+        })
+    };
+    if abort && let Some(abort_handle) = abort_handle {
+        abort_handle.abort();
+    }
+}
+
+fn reactivate_chat_worker(workers: &WorkerRegistry, chat_id: i64) {
+    let workers = workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(worker) = workers.get(&chat_id) {
+        worker.cancelled.store(false, Ordering::Release);
+    }
+}
+
+async fn stop_chat_workers(dispatchers: BTreeMap<i64, ChatDispatcher>, workers: &WorkerRegistry) {
+    let mut handles = Vec::with_capacity(dispatchers.len());
+    for (chat_id, dispatcher) in dispatchers {
+        dispatcher.cancelled.store(true, Ordering::Release);
+        dispatcher.handle.abort();
+        remove_worker_registration(workers, chat_id, dispatcher.worker_id);
+        handles.push((chat_id, dispatcher.handle));
+    }
+    for (chat_id, handle) in handles {
+        if let Err(error) = handle.await
+            && !error.is_cancelled()
+        {
+            eprintln!("chat {chat_id} worker join failed during shutdown: {error}");
+        }
+    }
+}
+
+async fn chat_is_allowed(chat_id: i64, handles: &RuntimeHandles) -> bool {
+    let access = handles.access.lock().await;
+    access.is_chat_allowed(chat_id)
+}
+
+async fn worker_can_reply(chat_id: i64, handles: &RuntimeHandles, cancelled: &AtomicBool) -> bool {
+    !cancelled.load(Ordering::Acquire) && chat_is_allowed(chat_id, handles).await
 }
 
 async fn handle_allowed_message(
@@ -618,6 +780,7 @@ async fn handle_allowed_message(
     kind: UpdateKind,
     message: IncomingMessage,
     handles: &RuntimeHandles,
+    cancelled: &AtomicBool,
 ) -> Result<(), String> {
     if let Some(text) = message_text(&message) {
         match route_command(
@@ -646,7 +809,7 @@ async fn handle_allowed_message(
         return Ok(());
     }
     log_update_route(chat_id, kind, UpdateRoute::Model);
-    handle_model_message(chat_id, message, handles).await
+    handle_model_message(chat_id, message, handles, cancelled).await
 }
 
 async fn route_command(
@@ -656,6 +819,9 @@ async fn route_command(
     sender_user_id: Option<i64>,
     handles: &RuntimeHandles,
 ) -> Result<Route, String> {
+    if !chat_is_allowed(chat_id, handles).await {
+        return Err("chat access was revoked".to_string());
+    }
     let (room, default_model, model_keys, pinned_model_key, model_thinking, capabilities) = {
         let config = handles.config.lock().await;
         let mut rooms = handles.rooms.lock().await;
@@ -943,48 +1109,79 @@ async fn handle_model_message(
     chat_id: i64,
     message: IncomingMessage,
     handles: &RuntimeHandles,
+    cancelled: &AtomicBool,
 ) -> Result<(), String> {
     let input = content_parts_from_message(&handles.telegram, &message).await?;
     if input.is_empty() {
         return Ok(());
     }
-
-    let (model_config, request, before_state, reset_notice) =
-        build_chat_request(chat_id, input, handles).await?;
-    if let Some(notice) = reset_notice {
-        let _ = handles.telegram.send_message(chat_id, &notice).await;
+    if !worker_can_reply(chat_id, handles, cancelled).await {
+        return Ok(());
     }
 
-    let typing = spawn_typing_indicator(handles.telegram.clone(), chat_id);
-    let response = dispatch_provider(&model_config, &request).await;
+    let prepared = build_chat_request(chat_id, input, handles).await?;
+    if let Some(notice) = prepared.reset_notice.as_deref()
+        && worker_can_reply(chat_id, handles, cancelled).await
+    {
+        let _ = handles.telegram.send_message(chat_id, notice).await;
+    }
+
+    let typing = AbortOnDrop(spawn_typing_indicator(handles.telegram.clone(), chat_id));
+    let response = dispatch_provider(&prepared.model_config, &prepared.request).await;
     typing.abort();
 
     match response {
-        Ok(response) => {
-            {
-                let mut rooms = handles.rooms.lock().await;
-                rooms
-                    .get_or_default(chat_id)
-                    .append_turn(model_config.wire_format, response.turn_items.clone());
+        Ok(mut response) => {
+            if !worker_can_reply(chat_id, handles, cancelled).await {
+                return Ok(());
             }
-            send_model_response(&handles.telegram, chat_id, response).await
+            let turn_items = std::mem::take(&mut response.turn_items);
+            let committed = {
+                let mut rooms = handles.rooms.lock().await;
+                rooms.get_mut(chat_id).is_some_and(|room| {
+                    room.append_turn_if_generation(
+                        prepared.generation,
+                        prepared.model_config.wire_format,
+                        turn_items,
+                    )
+                })
+            };
+            if committed && worker_can_reply(chat_id, handles, cancelled).await {
+                send_model_response(&handles.telegram, chat_id, response).await
+            } else {
+                Ok(())
+            }
         }
         Err(error) => {
-            {
+            let restored = {
                 let mut rooms = handles.rooms.lock().await;
-                *rooms.get_or_default(chat_id) = before_state;
-            }
+                if let Some(room) = rooms.get_mut(chat_id) {
+                    room.restore_failed_turn(prepared.generation, prepared.before_state)
+                } else {
+                    false
+                }
+            };
             // This reply IS the error handling — returning Err here would
             // make the chat worker send a second "tellm error" message for
             // the same failure.
             eprintln!("chat {chat_id} model call failed: {error}");
-            let _ = handles
-                .telegram
-                .send_message(chat_id, &provider_error_reply(&error))
-                .await;
+            if restored && worker_can_reply(chat_id, handles, cancelled).await {
+                let _ = handles
+                    .telegram
+                    .send_message(chat_id, &provider_error_reply(&error))
+                    .await;
+            }
             Ok(())
         }
     }
+}
+
+struct PreparedChatRequest {
+    model_config: ModelConfig,
+    request: ChatRequest,
+    before_state: RoomState,
+    generation: u64,
+    reset_notice: Option<String>,
 }
 
 /// The room's model can change after a toggle was accepted, so a capability
@@ -1006,7 +1203,10 @@ async fn build_chat_request(
     chat_id: i64,
     input: Vec<ContentPart>,
     handles: &RuntimeHandles,
-) -> Result<(ModelConfig, ChatRequest, RoomState, Option<String>), String> {
+) -> Result<PreparedChatRequest, String> {
+    if !chat_is_allowed(chat_id, handles).await {
+        return Err("chat access was revoked".to_string());
+    }
     let config = handles.config.lock().await;
     let mut rooms = handles.rooms.lock().await;
     let room = rooms.get_or_default(chat_id);
@@ -1020,8 +1220,15 @@ async fn build_chat_request(
     let reset = room.begin_turn(model_config.wire_format);
     let reset_notice = reset_notice(reset);
     let request = chat_request_from_room(room, &model_config, input);
+    let generation = room.generation();
 
-    Ok((model_config, request, before_state, reset_notice))
+    Ok(PreparedChatRequest {
+        model_config,
+        request,
+        before_state,
+        generation,
+        reset_notice,
+    })
 }
 
 fn chat_request_from_room(
@@ -1071,11 +1278,13 @@ async fn dispatch_provider(
             ensure_local_ollama_ready(&base_url).await?;
             let requested_model = request.model.clone();
             let api_key = compat_api_key(model).await?;
+            // Register before the request: an aborted task can still leave
+            // Ollama loading the model after the HTTP future is dropped.
+            remember_local_ollama_model(&base_url, &requested_model);
             let response = Compat::new(api_key, base_url.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())?;
-            remember_local_ollama_model(&base_url, &requested_model);
             Ok(response)
         }
         WireFormat::Gemini => {
@@ -1674,9 +1883,38 @@ async fn handle_deny_chat(
         let mut config = handles.config.lock().await;
         let before = config.clone();
         let result = deny_chat_in_config(&mut config, target_chat_id);
+
+        // Revocation is a live safety boundary, not a consequence of disk
+        // latency. Close it before waiting behind any older persistence work
+        // so an in-flight provider result cannot commit or send in the gap.
+        let was_allowed = {
+            let mut access = handles.access.lock().await;
+            let was_allowed = access.is_chat_allowed(target_chat_id);
+            access.deny_chat(target_chat_id);
+            was_allowed
+        };
+        // Flip the cancellation flag before aborting so even a provider future
+        // racing its final commit sees revocation synchronously. A command that
+        // denies its own chat is allowed to finish the confirmation reply; its
+        // worker exits before dequeuing anything else.
+        cancel_chat_worker(
+            &handles.workers,
+            target_chat_id,
+            target_chat_id != admin_chat_id,
+        );
+
         if result.changed() {
             if let Err(error) = save_config(handles, &config).await {
                 *config = before;
+                if was_allowed {
+                    handles.access.lock().await.allow_chat(target_chat_id);
+                }
+                // Only a self-deny leaves the task alive. Restore its flag so
+                // the normal worker error reply can report the failed save;
+                // an aborted target worker and its queued work stay dropped.
+                if target_chat_id == admin_chat_id {
+                    reactivate_chat_worker(&handles.workers, target_chat_id);
+                }
                 return Err(format!(
                     "failed to persist denied chat {target_chat_id}: {error}"
                 ));
@@ -1686,21 +1924,20 @@ async fn handle_deny_chat(
     };
 
     let _persist = handles.room_persist.lock().await;
-    {
+    let settings = {
         let mut rooms = handles.rooms.lock().await;
-        let removed = rooms.remove(target_chat_id);
-        let settings = rooms.settings();
-        if let Err(error) = save_room_settings(handles, settings).await {
-            if let Some(room) = removed {
-                rooms.insert(target_chat_id, room);
-            }
-            return Err(format!(
-                "failed to persist room cleanup for denied chat {target_chat_id}: {error}"
-            ));
-        }
+        rooms.remove(target_chat_id);
+        rooms.settings()
+    };
+    if let Err(error) = save_room_settings(handles, settings).await {
+        // Access remains denied and the in-memory room remains absent. A
+        // later settings save retries the complete snapshot; never recreate a
+        // denied room merely because cleanup persistence failed.
+        return Err(format!(
+            "chat {target_chat_id} was denied, but its room cleanup could not be persisted: {error}"
+        ));
     }
 
-    handles.access.lock().await.deny_chat(target_chat_id);
     send_command_reply(
         handles,
         admin_chat_id,
@@ -1722,7 +1959,21 @@ async fn handle_pair_attempt(
 
     match attempt {
         PairingAttempt::Paired => {
-            let became_owner = persist_provisional_pair(chat_id, pairer_user_id, handles).await?;
+            let became_owner = match persist_provisional_pair(chat_id, pairer_user_id, handles)
+                .await
+            {
+                Ok(became_owner) => became_owner,
+                Err(error) => {
+                    let _ = handles
+                        .telegram
+                        .send_message(
+                            chat_id,
+                            "Pairing could not be saved, so this chat remains denied. Contact the bot owner after fixing local config storage.",
+                        )
+                        .await;
+                    return Err(error);
+                }
+            };
             if let Some(user_id) = pairer_user_id.filter(|_| became_owner) {
                 // Apply to the live access set too, or the new owner is
                 // rejected until restart.
@@ -2926,6 +3177,7 @@ mod tests {
             shutdown_tx,
             room_persist: Arc::new(Mutex::new(())),
             persistence: persistence.clone(),
+            workers: Arc::new(StdMutex::new(BTreeMap::new())),
         };
 
         let error = persist_provisional_pair(42, Some(7), &handles)
@@ -2950,6 +3202,147 @@ mod tests {
             .await
             .expect("join persistence thread")
             .expect("persistence thread should not panic");
+    }
+
+    #[tokio::test]
+    async fn cancellation_registry_marks_and_aborts_in_flight_worker() {
+        let workers: WorkerRegistry = Arc::new(StdMutex::new(BTreeMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(std::future::pending::<()>());
+        workers.lock().unwrap().insert(
+            42,
+            WorkerRegistration {
+                worker_id: 1,
+                cancelled: Arc::clone(&cancelled),
+                abort_handle: handle.abort_handle(),
+            },
+        );
+
+        cancel_chat_worker(&workers, 42, true);
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(handle.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn deny_revokes_and_cancels_before_config_persistence_finishes() {
+        let config = Config {
+            default_model: "openai".to_string(),
+            models: BTreeMap::from([(
+                "openai".to_string(),
+                test_model(WireFormat::Responses, &[]),
+            )]),
+            telegram: tellm_config::TelegramConfig {
+                allowed_chat_ids: vec![42],
+                owner_user_ids: vec![7],
+            },
+        };
+        let access = AccessControl::new(AccessConfig::from_config(&config), now_access_time());
+        let config = Arc::new(Mutex::new(config));
+        let rooms = Arc::new(Mutex::new(RoomStates::default()));
+        rooms.lock().await.get_or_default(42).settings.role = Some("preserve me".to_string());
+
+        let release_save = Arc::new(std::sync::Barrier::new(2));
+        let writer_release = Arc::clone(&release_save);
+        let (save_started_tx, save_started_rx) = std_mpsc::channel();
+        let (persistence, writer_thread) = spawn_persistence_writer_with(
+            move |_config: Config| {
+                let _ = save_started_tx.send(());
+                writer_release.wait();
+                Err("injected config failure".to_string())
+            },
+            |_settings| Ok(()),
+        )
+        .expect("spawn persistence writer");
+
+        let workers: WorkerRegistry = Arc::new(StdMutex::new(BTreeMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let target_worker = tokio::spawn(std::future::pending::<()>());
+        workers.lock().unwrap().insert(
+            42,
+            WorkerRegistration {
+                worker_id: 1,
+                cancelled: Arc::clone(&cancelled),
+                abort_handle: target_worker.abort_handle(),
+            },
+        );
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let handles = RuntimeHandles {
+            telegram: Telegram::new("test-token"),
+            config: Arc::clone(&config),
+            rooms: Arc::clone(&rooms),
+            access: Arc::new(Mutex::new(access)),
+            terminal_prompts: Arc::new(StdMutex::new(None)),
+            bot_username: None,
+            shutdown_tx,
+            room_persist: Arc::new(Mutex::new(())),
+            persistence: persistence.clone(),
+            workers,
+        };
+
+        let task_handles = handles.clone();
+        let deny = tokio::spawn(async move { handle_deny_chat(7, 42, &task_handles).await });
+        spawn_blocking(move || save_started_rx.recv())
+            .await
+            .expect("join save-start wait")
+            .expect("config save should start");
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!handles.access.lock().await.is_chat_allowed(42));
+
+        spawn_blocking(move || release_save.wait())
+            .await
+            .expect("release failed config save");
+        let error = deny
+            .await
+            .expect("deny task should run")
+            .expect_err("injected save failure should be returned");
+        assert!(error.contains("injected config failure"), "{error}");
+
+        // A failed config transaction restores durable/live policy, while
+        // already-aborted provider work and its queue remain dropped.
+        assert!(config.lock().await.telegram.allowed_chat_ids.contains(&42));
+        assert!(handles.access.lock().await.is_chat_allowed(42));
+        assert_eq!(
+            rooms.lock().await.get(42).unwrap().settings.role.as_deref(),
+            Some("preserve me")
+        );
+        assert!(target_worker.await.unwrap_err().is_cancelled());
+
+        persistence
+            .shutdown()
+            .await
+            .expect("writer should shut down");
+        spawn_blocking(move || writer_thread.join())
+            .await
+            .expect("join persistence writer")
+            .expect("persistence writer should not panic");
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_owned_background_task() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _notify = NotifyOnDrop(Some(dropped_tx));
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        drop(AbortOnDrop(handle));
+
+        timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("background task should be aborted")
+            .expect("drop notification should arrive");
     }
 
     #[test]

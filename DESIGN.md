@@ -201,14 +201,17 @@ Notes:
   model turns. `/model` and `/role` reset that room's in-memory history so
   provider-native opaque state is not replayed under a different model or
   system prompt. Terminal `reset` clears all in-memory histories while keeping
-  room settings.
+  room settings. Monotonic room generations prevent an older in-flight result
+  or rollback from repopulating reset or revoked state.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
   chunking at 32000/3900 chars. Fallback triggers ported from the Python
   implementation's error-marker list.
 - Shutdown (terminal `exit`/`quit`, Telegram `/shutdown`, SIGINT/SIGTERM)
-  stops polling and cuts any in-flight provider turns — deliberately, since
-  draining could block exit for the length of a multi-minute turn. Only the
-  tellm-started Ollama child gets graceful cleanup (see § Configuration).
+  stops polling, marks every room worker cancelled, aborts and joins them, and
+  only then performs Ollama unload/child cleanup. Draining provider turns could
+  block exit for minutes, while unloading before their futures are gone can
+  immediately reload a model. Only the tellm-started Ollama child gets automatic
+  graceful cleanup (see § Configuration).
 
 ### Telegram commands (v1)
 
@@ -267,7 +270,12 @@ restart and local room-setting changes.
 - Admin chats can approve or revoke rooms at runtime: `/allow CHAT_ID` adds the
   chat to `allowed_chat_ids`, persists config, and takes effect immediately;
   `/deny CHAT_ID` removes `allowed_chat_ids` and model pins for the chat,
-  clears its room state, persists config/rooms, and takes effect immediately.
+  cancels and drops that room's queued/in-flight work, clears its room state,
+  persists config/rooms, and takes effect before any stale result can be sent
+  or committed. Live revocation and worker cancellation happen before waiting
+  for config persistence. If that config write fails, config and access are
+  restored, but already-aborted work stays dropped; after config commits, a
+  room-cleanup write failure never re-allows or recreates the denied room.
 - Model-room mappings count as allowed chats. They no longer suppress
   pairing (pairing is per-room now); the startup notice states how many
   chats are allowed and that new rooms pair on first contact.
@@ -319,7 +327,7 @@ restart and local room-setting changes.
   `ollama serve` once and waits briefly for readiness. A tellm-started Ollama
   child is stopped during tellm shutdown, including terminal `exit`/`quit`,
   Telegram `/shutdown`, SIGINT, SIGTERM, and ordinary panic unwinds, after
-  tellm asks Ollama to unload every local model that completed a request in the
+  tellm asks Ollama to unload every local model whose request began in the
   current tellm process via `keep_alive: 0` (checked 2026-07-05 against
   docs.ollama.com/api/generate). The child shutdown path sends SIGTERM, waits
   briefly, then falls back to SIGKILL. A 404 / not-found unload response means

@@ -172,6 +172,12 @@ impl AccessControl {
         }
     }
 
+    /// Non-mutating access check for queued/in-flight work. Unlike
+    /// `check_chat`, this must not consume the one-time unknown-chat hint.
+    pub fn is_chat_allowed(&self, chat_id: i64) -> bool {
+        self.allowed_chat_ids.contains(&chat_id)
+    }
+
     pub fn allow_chat(&mut self, chat_id: i64) {
         self.allowed_chat_ids.insert(chat_id);
         self.hinted_unknown_chats.remove(&chat_id);
@@ -436,6 +442,17 @@ mod tests {
         assert_eq!(access.room_code(99), None, "pending cleared on success");
         // Arming an allowed room is a no-op.
         assert!(access.arm_room(99, time(3)).is_none());
+    }
+
+    #[test]
+    fn non_mutating_access_check_does_not_consume_unknown_chat_hint() {
+        let mut access = access_with_codes(AccessConfig::default(), &["123456"]);
+
+        assert!(!access.is_chat_allowed(99));
+        assert_eq!(
+            access.check_chat(99),
+            ChatAccess::Unknown { send_hint: true }
+        );
     }
 
     #[test]

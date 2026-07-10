@@ -57,6 +57,7 @@ pub struct RoomState {
     pub wire_format: Option<WireFormat>,
     pub history: Vec<Value>,
     history_turns: VecDeque<HistoryTurn>,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,14 +82,20 @@ impl RoomState {
             wire_format: None,
             history: Vec::new(),
             history_turns: VecDeque::new(),
+            generation: 0,
         }
+    }
+
+    /// Changes whenever pending provider work must no longer affect this room.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn begin_turn(&mut self, wire_format: WireFormat) -> HistoryReset {
         if self.wire_format != Some(wire_format) {
             let previous = self.wire_format;
             self.wire_format = Some(wire_format);
-            self.clear_history_storage();
+            self.invalidate_history();
             return HistoryReset::WireFormatChanged {
                 previous,
                 new: wire_format,
@@ -101,7 +108,7 @@ impl RoomState {
     pub fn append_turn(&mut self, wire_format: WireFormat, turn_items: Vec<Value>) {
         if self.wire_format != Some(wire_format) {
             self.wire_format = Some(wire_format);
-            self.clear_history_storage();
+            self.invalidate_history();
         }
 
         match self.settings.mode {
@@ -116,7 +123,41 @@ impl RoomState {
     }
 
     pub fn reset_history(&mut self) {
+        self.invalidate_history();
+    }
+
+    /// Commit a provider turn only if no reset or model transition happened
+    /// while the request was in flight.
+    pub fn append_turn_if_generation(
+        &mut self,
+        expected_generation: u64,
+        wire_format: WireFormat,
+        turn_items: Vec<Value>,
+    ) -> bool {
+        if self.generation != expected_generation {
+            return false;
+        }
+        self.append_turn(wire_format, turn_items);
+        true
+    }
+
+    /// Roll back the speculative wire-format transition made by `begin_turn`
+    /// without overwriting a newer reset. The new generation remains
+    /// monotonic so other work can never mistake the restored state for the
+    /// generation that just failed.
+    pub fn restore_failed_turn(&mut self, expected_generation: u64, before: RoomState) -> bool {
+        if self.generation != expected_generation {
+            return false;
+        }
+        let next_generation = self.generation.wrapping_add(1);
+        *self = before;
+        self.generation = next_generation;
+        true
+    }
+
+    fn invalidate_history(&mut self) {
         self.clear_history_storage();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn clear_history_storage(&mut self) {
@@ -481,6 +522,48 @@ mod tests {
     }
 
     #[test]
+    fn reset_generation_rejects_stale_commit_and_rollback() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.append_turn(
+            WireFormat::Responses,
+            vec![serde_json::json!({ "turn": "before" })],
+        );
+        let before = room.clone();
+        assert_eq!(room.begin_turn(WireFormat::Responses), HistoryReset::None);
+        let request_generation = room.generation();
+
+        room.reset_history();
+
+        assert!(!room.append_turn_if_generation(
+            request_generation,
+            WireFormat::Responses,
+            vec![serde_json::json!({ "turn": "stale response" })],
+        ));
+        assert!(!room.restore_failed_turn(request_generation, before));
+        assert!(room.history.is_empty());
+    }
+
+    #[test]
+    fn failed_wire_transition_can_restore_prior_history_once() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.append_turn(
+            WireFormat::Anthropic,
+            vec![serde_json::json!({ "turn": "anthropic" })],
+        );
+        let before = room.clone();
+        assert!(matches!(
+            room.begin_turn(WireFormat::Responses),
+            HistoryReset::WireFormatChanged { .. }
+        ));
+        let request_generation = room.generation();
+
+        assert!(room.restore_failed_turn(request_generation, before));
+        assert_eq!(room.wire_format, Some(WireFormat::Anthropic));
+        assert_eq!(room.history[0]["turn"], "anthropic");
+        assert_ne!(room.generation(), request_generation);
+    }
+
+    #[test]
     fn room_states_extract_persistable_settings_without_history() {
         let mut settings = BTreeMap::new();
         settings.insert(
@@ -533,6 +616,26 @@ mod tests {
         states.remove(1);
 
         assert!(!states.settings().contains_key(&1));
+    }
+
+    #[test]
+    fn stale_provider_commit_does_not_recreate_removed_room() {
+        let mut states = RoomStates::default();
+        let room = states.get_or_default(1);
+        room.begin_turn(WireFormat::Responses);
+        let generation = room.generation();
+        states.remove(1);
+
+        let committed = states.get_mut(1).is_some_and(|room| {
+            room.append_turn_if_generation(
+                generation,
+                WireFormat::Responses,
+                vec![serde_json::json!({ "stale": true })],
+            )
+        });
+
+        assert!(!committed);
+        assert!(states.get(1).is_none());
     }
 
     fn with_temp_config_dir(test: impl FnOnce(&std::path::Path)) {
