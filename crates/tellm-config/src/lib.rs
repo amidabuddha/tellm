@@ -286,18 +286,20 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Secret storage facade: env-var override, OS keychain, then `0600` file.
+/// Secret storage facade: env-var override, then the explicitly selected
+/// persisted destination (legacy entries remain keychain-first).
 pub mod secrets {
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    #[cfg(feature = "keychain")]
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
+    #[cfg(feature = "keychain")]
     const KEYCHAIN_SERVICE: &str = "tellm";
     const CREDENTIALS_FILE: &str = "credentials.toml";
+    const FILE_PREFERENCE_PREFIX: &str = "__tellm_prefer_credentials_file__:";
 
     /// Well-known secret names.
     pub const TELEGRAM_BOT_TOKEN: &str = "telegram_bot_token";
@@ -317,6 +319,20 @@ pub mod secrets {
         Serialize(#[from] toml::ser::Error),
         #[error("no config directory available on this platform")]
         NoConfigDir,
+        #[error(
+            "cannot store secret \"{name}\" while environment variable {variable} overrides every persisted value; unset it first"
+        )]
+        EnvironmentOverride { name: String, variable: String },
+        #[error("secret name \"{0}\" uses a reserved internal prefix")]
+        ReservedName(String),
+        #[error(
+            "stored secret \"{name}\" in the OS keychain but failed to remove its stale credentials.toml fallback: {source}"
+        )]
+        FallbackCleanup {
+            name: String,
+            #[source]
+            source: Box<SecretError>,
+        },
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,18 +358,94 @@ pub mod secrets {
     }
 
     pub fn get(name: &str) -> Option<String> {
-        std::env::var(env_var_name(name))
-            .ok()
-            .or_else(|| keychain_get(name))
-            .or_else(|| file_get(name))
+        if is_reserved_name(name) {
+            return None;
+        }
+        if let Some(value) = std::env::var_os(env_var_name(name)) {
+            // Presence is authoritative even when the platform value is not
+            // UTF-8. Fail closed instead of silently using an older persisted
+            // credential the operator expected this variable to override.
+            return value.into_string().ok();
+        }
+
+        // Read the file before the keychain because its per-secret preference
+        // marker must outrank a stale keychain value. Keeping this read fresh
+        // also lets a running daemon observe `tellm secret set` rotations from
+        // a separate invocation without a restart.
+        let file_secrets = read_file_secrets().ok();
+        persisted_secret(name, file_secrets.as_ref(), || keychain_get(name))
+    }
+
+    fn persisted_secret(
+        name: &str,
+        file_secrets: Option<&BTreeMap<String, String>>,
+        keychain_get: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let file_value = file_secrets.and_then(|secrets| secrets.get(name).cloned());
+        let prefer_file =
+            file_secrets.is_some_and(|secrets| secrets.contains_key(&file_preference_key(name)));
+        if prefer_file {
+            return file_value;
+        }
+        keychain_get().or(file_value)
     }
 
     pub fn set(name: &str, value: &str) -> Result<SecretDestination, SecretError> {
-        if keychain_set(name, value) {
-            return Ok(SecretDestination::OsKeychain);
+        if is_reserved_name(name) {
+            return Err(SecretError::ReservedName(name.to_string()));
         }
-        file_set(name, value)?;
-        Ok(SecretDestination::CredentialsFile)
+        let variable = env_var_name(name);
+        if std::env::var_os(&variable).is_some() {
+            return Err(SecretError::EnvironmentOverride {
+                name: name.to_string(),
+                variable,
+            });
+        }
+        set_with_backends(
+            name,
+            value,
+            keychain_set,
+            keychain_read,
+            file_set,
+            file_remove,
+        )
+    }
+
+    fn set_with_backends(
+        name: &str,
+        value: &str,
+        keychain_set: impl FnOnce(&str, &str) -> bool,
+        keychain_get: impl FnOnce(&str) -> Result<Option<String>, String>,
+        file_set: impl FnOnce(&str, &str) -> Result<(), SecretError>,
+        file_remove: impl FnOnce(&str) -> Result<(), SecretError>,
+    ) -> Result<SecretDestination, SecretError> {
+        if keychain_set(name, value) {
+            return finish_keychain_write(name, file_remove);
+        }
+
+        match keychain_get(name) {
+            // A failed idempotent write is harmless: the requested value is
+            // already at the higher-priority destination.
+            Ok(Some(stored)) if stored == value => finish_keychain_write(name, file_remove),
+            // A file fallback records its own precedence marker atomically.
+            // It therefore remains authoritative if an older keychain value
+            // becomes readable again after a transient backend failure.
+            Ok(Some(_)) | Ok(None) | Err(_) => {
+                file_set(name, value)?;
+                Ok(SecretDestination::CredentialsFile)
+            }
+        }
+    }
+
+    fn finish_keychain_write(
+        name: &str,
+        file_remove: impl FnOnce(&str) -> Result<(), SecretError>,
+    ) -> Result<SecretDestination, SecretError> {
+        file_remove(name).map_err(|source| SecretError::FallbackCleanup {
+            name: name.to_string(),
+            source: Box::new(source),
+        })?;
+        Ok(SecretDestination::OsKeychain)
     }
 
     pub fn set_nonempty(name: &str, value: &str) -> Result<Option<SecretDestination>, SecretError> {
@@ -379,10 +471,21 @@ pub mod secrets {
     }
 
     #[cfg(feature = "keychain")]
+    fn keychain_read(name: &str) -> Result<Option<String>, String> {
+        if keychain_disabled_for_tests() {
+            return Ok(None);
+        }
+        let entry = keychain_entry(name)?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    #[cfg(feature = "keychain")]
     fn keychain_get(name: &str) -> Option<String> {
-        keychain_entry(name)
-            .ok()
-            .and_then(|entry| entry.get_password().ok())
+        keychain_read(name).ok().flatten()
     }
 
     #[cfg(feature = "keychain")]
@@ -455,6 +558,11 @@ pub mod secrets {
     }
 
     #[cfg(not(feature = "keychain"))]
+    fn keychain_read(_name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    #[cfg(not(feature = "keychain"))]
     fn keychain_get(_name: &str) -> Option<String> {
         None
     }
@@ -472,16 +580,42 @@ pub mod secrets {
         false
     }
 
-    fn file_get(name: &str) -> Option<String> {
-        read_file_secrets()
-            .ok()
-            .and_then(|secrets| secrets.get(name).cloned())
-    }
-
     fn file_set(name: &str, value: &str) -> Result<(), SecretError> {
+        let _guard = credentials_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut secrets = read_file_secrets()?;
         secrets.insert(name.to_string(), value.to_string());
+        secrets.insert(file_preference_key(name), "true".to_string());
         write_file_secrets(&secrets)
+    }
+
+    fn file_remove(name: &str) -> Result<(), SecretError> {
+        let _guard = credentials_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut secrets = read_file_secrets()?;
+        let removed_value = secrets.remove(name).is_some();
+        let removed_preference = secrets.remove(&file_preference_key(name)).is_some();
+        if removed_value || removed_preference {
+            // Replacing the credentials file atomically also makes removal of
+            // this entry atomic with respect to concurrent readers.
+            write_file_secrets(&secrets)?;
+        }
+        Ok(())
+    }
+
+    fn credentials_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn file_preference_key(name: &str) -> String {
+        format!("{FILE_PREFERENCE_PREFIX}{name}")
+    }
+
+    pub fn is_reserved_name(name: &str) -> bool {
+        name.starts_with(FILE_PREFERENCE_PREFIX)
     }
 
     fn read_file_secrets() -> Result<BTreeMap<String, String>, SecretError> {
@@ -526,6 +660,7 @@ pub mod secrets {
         Ok(())
     }
 
+    #[cfg(feature = "keychain")]
     fn keychain_disabled_for_tests() -> bool {
         #[cfg(test)]
         {
@@ -555,6 +690,144 @@ pub mod secrets {
     #[cfg(test)]
     pub(super) fn disable_keychain_for_tests(disabled: bool) {
         set_keychain_disabled_for_tests(disabled);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::Cell;
+
+        use super::*;
+
+        #[test]
+        fn failed_keychain_rotation_selects_the_durable_file_fallback() {
+            let wrote_file = Cell::new(false);
+            let removed_file = Cell::new(false);
+
+            let destination = set_with_backends(
+                "openai_api_key",
+                "new-value",
+                |_, _| false,
+                |_| Ok(Some("old-value".to_string())),
+                |_, _| {
+                    wrote_file.set(true);
+                    Ok(())
+                },
+                |_| {
+                    removed_file.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(destination, SecretDestination::CredentialsFile);
+            assert!(wrote_file.get());
+            assert!(!removed_file.get());
+        }
+
+        #[test]
+        fn transient_keychain_read_failure_selects_the_file_fallback() {
+            let wrote_file = Cell::new(false);
+
+            let destination = set_with_backends(
+                "openai_api_key",
+                "new-value",
+                |_, _| false,
+                |_| Err("keychain locked".to_string()),
+                |_, _| {
+                    wrote_file.set(true);
+                    Ok(())
+                },
+                |_| panic!("file fallback must not be removed"),
+            )
+            .unwrap();
+
+            assert_eq!(destination, SecretDestination::CredentialsFile);
+            assert!(wrote_file.get());
+        }
+
+        #[test]
+        fn preferred_file_value_shadows_a_recovered_stale_keychain() {
+            let name = "openai_api_key";
+            let file = BTreeMap::from([
+                (name.to_string(), "new-file-value".to_string()),
+                (file_preference_key(name), "true".to_string()),
+            ]);
+            let read_keychain = Cell::new(false);
+
+            let value = persisted_secret(name, Some(&file), || {
+                read_keychain.set(true);
+                Some("old-keychain-value".to_string())
+            });
+
+            assert_eq!(value.as_deref(), Some("new-file-value"));
+            assert!(!read_keychain.get());
+        }
+
+        #[test]
+        fn failed_idempotent_keychain_write_stays_keychain_first() {
+            let wrote_file = Cell::new(false);
+            let removed_file = Cell::new(false);
+
+            let destination = set_with_backends(
+                "openai_api_key",
+                "current-value",
+                |_, _| false,
+                |_| Ok(Some("current-value".to_string())),
+                |_, _| {
+                    wrote_file.set(true);
+                    Ok(())
+                },
+                |_| {
+                    removed_file.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(destination, SecretDestination::OsKeychain);
+            assert!(!wrote_file.get());
+            assert!(removed_file.get());
+        }
+
+        #[test]
+        fn successful_keychain_write_removes_stale_file_fallback() {
+            let removed_file = Cell::new(false);
+
+            let destination = set_with_backends(
+                "openai_api_key",
+                "new-value",
+                |_, _| true,
+                |_| panic!("successful keychain writes do not need a readback"),
+                |_, _| panic!("successful keychain writes must not fall back"),
+                |_| {
+                    removed_file.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(destination, SecretDestination::OsKeychain);
+            assert!(removed_file.get());
+        }
+
+        #[test]
+        fn keychain_fallback_cleanup_failure_is_reported_clearly() {
+            let error = set_with_backends(
+                "openai_api_key",
+                "new-value",
+                |_, _| true,
+                |_| panic!("successful keychain writes do not need a readback"),
+                |_, _| panic!("successful keychain writes must not fall back"),
+                |_| Err(SecretError::NoConfigDir),
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                SecretError::FallbackCleanup { name, source }
+                    if name == "openai_api_key" && matches!(*source, SecretError::NoConfigDir)
+            ));
+        }
     }
 }
 
@@ -816,6 +1089,12 @@ mod tests {
                 std::env::set_var("TELLM_TEST_SECRET", "env-value");
             }
             assert_eq!(secrets::get("test_secret"), Some("env-value".to_string()));
+            let error = secrets::set("test_secret", "rotated-value").unwrap_err();
+            assert!(matches!(
+                error,
+                secrets::SecretError::EnvironmentOverride { name, variable }
+                    if name == "test_secret" && variable == "TELLM_TEST_SECRET"
+            ));
             unsafe {
                 std::env::remove_var("TELLM_TEST_SECRET");
             }

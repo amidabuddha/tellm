@@ -333,7 +333,13 @@ restart and local room-setting changes.
   Secret Service; checked 2026-07-05 after keyring 4.1.3's `v1` wrapper failed
   to register a default store), fallback `0600` file for headless hosts,
   env-var override (`TELLM_<SECRET_NAME>`). Secret writes report the actual
-  destination.
+  destination. A successful keychain write removes the stale file entry. A new
+  file fallback records an internal preference marker atomically with the value,
+  so a recovered stale keychain cannot shadow it; legacy unmarked files remain
+  keychain-first. An active environment override must be unset before rotation,
+  since it remains the effective value. Credentials-file read/modify/write is
+  serialized within one process; multiple tellm processes must not share and
+  mutate the same config directory concurrently.
   No encrypted-file theater.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice

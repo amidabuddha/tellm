@@ -20,8 +20,8 @@ client — usage billed directly by your API providers, not by a subscription.
   chats.
 - **Secure by default.** An unpaired bot answers to nobody: claim it with a
   one-time code printed in its terminal (`/pair 123456`), rotated every 10
-  minutes, rate-limited per chat. Secrets live in your OS keychain, not in a
-  dotfile.
+  minutes, rate-limited per chat. Secrets use your OS keychain when available,
+  with a permission-restricted credentials file as the headless fallback.
 - **Not an agent.** No shell access, no skills registry, no browser control,
   no MCP. The whole attack surface is HTTPS calls to Telegram and your model
   providers — nothing on your machine to inject into or steal, beyond keys
@@ -88,6 +88,8 @@ Send these to the bot in any allowed chat. Owner-only commands are marked.
 
 `config.toml` contains routing and room policy only. Secret values stay in the
 OS keychain or `credentials.toml`; `api_key_secret` is just the lookup name.
+`TELLM_<SECRET_NAME>` environment variables take precedence over both stores;
+unset an active override before rotating that secret.
 
 ```toml
 default_model = "claude"
