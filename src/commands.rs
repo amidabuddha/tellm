@@ -126,7 +126,6 @@ pub enum CommandAction {
         pinned_model_key: Option<String>,
     },
     Reject {
-        command: KnownCommand,
         reason: CommandReject,
     },
 }
@@ -261,7 +260,6 @@ fn route_mode(args: &str, settings: &rooms::RoomSettings) -> CommandAction {
             mode: rooms::ChatMode::Message,
         },
         _ => CommandAction::Reject {
-            command: KnownCommand::Mode,
             reason: CommandReject::UnknownMode {
                 value: value.to_string(),
             },
@@ -289,13 +287,13 @@ fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
     match value.to_ascii_lowercase().as_str() {
         "pin" => return route_model_pin(args, context),
         "unpin" => {
-            return match admin_gate(KnownCommand::Model, context.shutdown_access) {
+            return match admin_gate(context.shutdown_access) {
                 Some(reject) => reject,
                 None => CommandAction::UnpinModel,
             };
         }
         "add" => {
-            return match admin_gate(KnownCommand::Model, context.shutdown_access) {
+            return match admin_gate(context.shutdown_access) {
                 Some(reject) => reject,
                 None => match args.split_whitespace().nth(1) {
                     Some(preset_key) => CommandAction::AddModel {
@@ -310,7 +308,6 @@ fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
 
     if let Some(model_key) = context.pinned_model_key {
         return CommandAction::Reject {
-            command: KnownCommand::Model,
             reason: CommandReject::PinnedModel {
                 model_key: model_key.to_string(),
             },
@@ -324,7 +321,6 @@ fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
     }
 
     CommandAction::Reject {
-        command: KnownCommand::Model,
         reason: CommandReject::UnknownModel {
             value: value.to_string(),
             available: available_models(context.model_keys),
@@ -363,7 +359,6 @@ fn route_reasoning(
     match parse_thinking_setting(value) {
         Some(thinking) => CommandAction::SetReasoning { thinking },
         None => CommandAction::Reject {
-            command: KnownCommand::Reasoning,
             reason: CommandReject::UnknownReasoning {
                 value: value.to_string(),
             },
@@ -378,7 +373,7 @@ fn route_web_search(
 ) -> CommandAction {
     let gate = |enabled: bool| {
         if enabled && !capabilities.web_search {
-            capability_reject(KnownCommand::WebSearch, "Web search", capabilities)
+            capability_reject("Web search", capabilities)
         } else {
             CommandAction::SetWebSearch { enabled }
         }
@@ -395,7 +390,6 @@ fn route_web_search(
         _ => match parse_bool(value) {
             Some(enabled) => gate(enabled),
             None => CommandAction::Reject {
-                command: KnownCommand::WebSearch,
                 reason: CommandReject::UnknownBoolean {
                     value: value.to_string(),
                 },
@@ -411,11 +405,7 @@ fn route_image_generation(
 ) -> CommandAction {
     let gate = |enabled: bool| {
         if enabled && !capabilities.image_generation {
-            capability_reject(
-                KnownCommand::ImageGeneration,
-                "Image generation",
-                capabilities,
-            )
+            capability_reject("Image generation", capabilities)
         } else {
             CommandAction::SetImageGeneration { enabled }
         }
@@ -432,7 +422,6 @@ fn route_image_generation(
         _ => match parse_bool(value) {
             Some(enabled) => gate(enabled),
             None => CommandAction::Reject {
-                command: KnownCommand::ImageGeneration,
                 reason: CommandReject::UnknownBoolean {
                     value: value.to_string(),
                 },
@@ -441,13 +430,8 @@ fn route_image_generation(
     }
 }
 
-fn capability_reject(
-    command: KnownCommand,
-    feature: &str,
-    capabilities: &RoomCapabilities,
-) -> CommandAction {
+fn capability_reject(feature: &str, capabilities: &RoomCapabilities) -> CommandAction {
     CommandAction::Reject {
-        command,
         reason: CommandReject::CapabilityUnsupported {
             feature: feature.to_string(),
             model_key: capabilities.model_key.clone(),
@@ -458,14 +442,12 @@ fn capability_reject(
 
 /// Admin gate shared by /allow, /deny, and /model pin|unpin. Returns the
 /// rejection when the caller isn't an allowed, fresh admin message.
-fn admin_gate(command: KnownCommand, access: access::ShutdownAccess) -> Option<CommandAction> {
+fn admin_gate(access: access::ShutdownAccess) -> Option<CommandAction> {
     match access {
         access::ShutdownAccess::NotAdmin => Some(CommandAction::Reject {
-            command,
             reason: CommandReject::AdminNotAllowed,
         }),
         access::ShutdownAccess::Stale => Some(CommandAction::Reject {
-            command,
             reason: CommandReject::AdminStale,
         }),
         access::ShutdownAccess::Allowed => None,
@@ -475,7 +457,7 @@ fn admin_gate(command: KnownCommand, access: access::ShutdownAccess) -> Option<C
 /// `/model pin [KEY]` — pin this room to KEY (or its current effective
 /// model when KEY is omitted).
 fn route_model_pin(args: &str, context: &CommandContext<'_>) -> CommandAction {
-    if let Some(reject) = admin_gate(KnownCommand::Model, context.shutdown_access) {
+    if let Some(reject) = admin_gate(context.shutdown_access) {
         return reject;
     }
 
@@ -491,7 +473,6 @@ fn route_model_pin(args: &str, context: &CommandContext<'_>) -> CommandAction {
         CommandAction::PinModel { model_key: key_arg }
     } else {
         CommandAction::Reject {
-            command: KnownCommand::Model,
             reason: CommandReject::UnknownModel {
                 value: key_arg,
                 available: available_models(context.model_keys),
@@ -505,31 +486,17 @@ fn route_chat_approval(
     args: &str,
     access: access::ShutdownAccess,
 ) -> CommandAction {
-    match access {
-        access::ShutdownAccess::NotAdmin => {
-            return CommandAction::Reject {
-                command,
-                reason: CommandReject::AdminNotAllowed,
-            };
-        }
-        access::ShutdownAccess::Stale => {
-            return CommandAction::Reject {
-                command,
-                reason: CommandReject::AdminStale,
-            };
-        }
-        access::ShutdownAccess::Allowed => {}
+    if let Some(reject) = admin_gate(access) {
+        return reject;
     }
 
     let Some(value) = first_arg(args) else {
         return CommandAction::Reject {
-            command,
             reason: CommandReject::MissingChatId { command },
         };
     };
     let Ok(chat_id) = value.parse::<i64>() else {
         return CommandAction::Reject {
-            command,
             reason: CommandReject::InvalidChatId {
                 value: value.to_string(),
             },
@@ -549,21 +516,19 @@ fn route_pair(args: &str) -> CommandAction {
             code: code.to_string(),
         },
         None => CommandAction::Reject {
-            command: KnownCommand::Pair,
             reason: CommandReject::MissingPairingCode,
         },
     }
 }
 
 fn route_ollama(args: &str, access: access::ShutdownAccess) -> CommandAction {
-    if let Some(reject) = admin_gate(KnownCommand::Ollama, access) {
+    if let Some(reject) = admin_gate(access) {
         return reject;
     }
 
     match first_arg(args) {
         Some(action) if action.eq_ignore_ascii_case("unload") => CommandAction::UnloadOllama,
         value => CommandAction::Reject {
-            command: KnownCommand::Ollama,
             reason: CommandReject::UnknownOllamaAction {
                 value: value.map(str::to_string),
             },
@@ -575,11 +540,9 @@ fn route_shutdown(access: access::ShutdownAccess) -> CommandAction {
     match access {
         access::ShutdownAccess::Allowed => CommandAction::Shutdown,
         access::ShutdownAccess::NotAdmin => CommandAction::Reject {
-            command: KnownCommand::Shutdown,
             reason: CommandReject::ShutdownNotAdmin,
         },
         access::ShutdownAccess::Stale => CommandAction::Reject {
-            command: KnownCommand::Shutdown,
             reason: CommandReject::ShutdownStale,
         },
     }
@@ -752,7 +715,6 @@ mod tests {
         assert_eq!(
             route_command_with_default_settings("/mode nope", settings),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Mode,
                 reason: CommandReject::UnknownMode {
                     value: "nope".to_string(),
                 },
@@ -803,7 +765,6 @@ mod tests {
                 &["claude", "gpt"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Model,
                 reason: CommandReject::UnknownModel {
                     value: "missing".to_string(),
                     available: vec!["claude".to_string(), "gpt".to_string()],
@@ -845,7 +806,6 @@ mod tests {
                 Some("gpt"),
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Model,
                 reason: CommandReject::PinnedModel {
                     model_key: "gpt".to_string(),
                 },
@@ -962,7 +922,6 @@ mod tests {
         assert_eq!(
             route_command_with_default_settings("/reasoning nope", rooms::RoomSettings::default()),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Reasoning,
                 reason: CommandReject::UnknownReasoning {
                     value: "nope".to_string(),
                 },
@@ -996,7 +955,6 @@ mod tests {
         assert_eq!(
             route_command_with_default_settings("/websearch maybe", enabled),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::WebSearch,
                 reason: CommandReject::UnknownBoolean {
                     value: "maybe".to_string(),
                 },
@@ -1030,7 +988,6 @@ mod tests {
         assert_eq!(
             route_command_with_default_settings("/imagegen maybe", enabled),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::ImageGeneration,
                 reason: CommandReject::UnknownBoolean {
                     value: "maybe".to_string(),
                 },
@@ -1049,7 +1006,6 @@ mod tests {
         assert_eq!(
             route_command("/pair"),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Pair,
                 reason: CommandReject::MissingPairingCode,
             })
         );
@@ -1094,7 +1050,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Allow,
                 reason: CommandReject::MissingChatId {
                     command: KnownCommand::Allow,
                 },
@@ -1109,7 +1064,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Deny,
                 reason: CommandReject::InvalidChatId {
                     value: "nope".to_string(),
                 },
@@ -1124,7 +1078,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Allow,
                 reason: CommandReject::AdminNotAllowed,
             })
         );
@@ -1137,7 +1090,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Deny,
                 reason: CommandReject::AdminStale,
             })
         );
@@ -1164,7 +1116,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Shutdown,
                 reason: CommandReject::ShutdownNotAdmin,
             })
         );
@@ -1177,7 +1128,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Shutdown,
                 reason: CommandReject::ShutdownStale,
             })
         );
@@ -1204,7 +1154,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Ollama,
                 reason: CommandReject::UnknownOllamaAction { value: None },
             })
         );
@@ -1217,7 +1166,6 @@ mod tests {
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                command: KnownCommand::Ollama,
                 reason: CommandReject::AdminNotAllowed,
             })
         );

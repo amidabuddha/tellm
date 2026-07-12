@@ -1152,7 +1152,7 @@ async fn handle_command(
             let help = help_text(pinned_model_key.as_deref());
             send_command_reply(handles, chat_id, &help).await
         }
-        CommandAction::Reject { reason, .. } => {
+        CommandAction::Reject { reason } => {
             send_command_reply(handles, chat_id, &format_reject(reason)).await
         }
     }
