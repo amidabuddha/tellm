@@ -123,7 +123,7 @@ pub struct AccessControl {
 }
 
 impl AccessControl {
-    pub fn new(config: AccessConfig, _now: AccessTime) -> Self {
+    pub fn new(config: AccessConfig) -> Self {
         Self::new_with_generator(config, secure_pairing_code)
     }
 

@@ -156,7 +156,7 @@ where
 }
 
 struct ChatDispatcher {
-    sender: mpsc::Sender<DispatchMessage>,
+    sender: mpsc::Sender<IncomingMessage>,
     handle: JoinHandle<()>,
     worker_id: u64,
     cancelled: Arc<AtomicBool>,
@@ -217,12 +217,6 @@ impl Drop for QueueFullNoticeGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.chat_id);
     }
-}
-
-#[derive(Debug, Clone)]
-struct DispatchMessage {
-    kind: UpdateKind,
-    message: IncomingMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,7 +346,7 @@ impl Runtime {
         let room_settings = rooms::load_settings()?;
         let access_config = AccessConfig::from_config(&config);
         let group_chat_ids = allowed_group_chat_ids(&access_config);
-        let access = AccessControl::new(access_config, now_access_time());
+        let access = AccessControl::new(access_config);
         warm_configured_provider_secrets(&config);
         print_startup_notice(access.startup_notice());
         print_group_privacy_hints(&group_chat_ids);
@@ -445,8 +439,8 @@ impl Runtime {
                                 offset = offset.max(update.update_id + 1);
                                 if let Some(membership) = update.my_chat_member.take() {
                                     self.handle_membership_change(membership, &handles).await;
-                                } else if let Some((kind, message)) = dispatchable_message(&mut update) {
-                                    self.handle_update(kind, message, &handles, &mut dispatchers).await;
+                                } else if let Some(message) = dispatchable_message(&mut update) {
+                                    self.handle_update(message, &handles, &mut dispatchers).await;
                                 } else if let Some(message) = update.edited_message {
                                     // Updates already queued before edited messages were removed
                                     // from allowed_updates can still arrive. Never turn an edit
@@ -577,7 +571,6 @@ impl Runtime {
 
     async fn handle_update(
         &self,
-        kind: UpdateKind,
         message: IncomingMessage,
         handles: &RuntimeHandles,
         dispatchers: &mut BTreeMap<i64, ChatDispatcher>,
@@ -590,7 +583,7 @@ impl Runtime {
 
         match access {
             ChatAccess::Allowed => {
-                send_to_chat_worker(chat_id, kind, message, handles, dispatchers);
+                send_to_chat_worker(chat_id, message, handles, dispatchers);
             }
             ChatAccess::Unknown { send_hint } => {
                 // Arm (or refresh) this room's pairing code on any contact;
@@ -609,13 +602,13 @@ impl Runtime {
                 if let Some(code) =
                     pair_code_from_message(&message, handles.bot_username.as_deref())
                 {
-                    log_update_route(chat_id, kind, UpdateRoute::Command);
+                    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Command);
                     let pairer = message.from.as_ref().map(|user| user.id);
                     if let Err(error) = handle_pair_attempt(chat_id, code, pairer, handles).await {
                         eprintln!("pairing attempt for chat {chat_id} failed: {error}");
                     }
                 } else if send_hint {
-                    log_update_route(chat_id, kind, UpdateRoute::Ignored);
+                    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
                     let telegram = self.telegram.clone();
                     tokio::spawn(async move {
                         let _ = telegram
@@ -623,20 +616,15 @@ impl Runtime {
                             .await;
                     });
                 } else {
-                    log_update_route(chat_id, kind, UpdateRoute::Ignored);
+                    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
                 }
             }
         }
     }
 }
 
-fn dispatchable_message(
-    update: &mut tellm_telegram::Update,
-) -> Option<(UpdateKind, IncomingMessage)> {
-    update
-        .message
-        .take()
-        .map(|message| (UpdateKind::Message, message))
+fn dispatchable_message(update: &mut tellm_telegram::Update) -> Option<IncomingMessage> {
+    update.message.take()
 }
 
 /// Queue the update for its chat worker without ever blocking the poll
@@ -644,7 +632,6 @@ fn dispatchable_message(
 /// one slow room, so a full queue drops the message with a busy notice.
 fn send_to_chat_worker(
     chat_id: i64,
-    kind: UpdateKind,
     message: IncomingMessage,
     handles: &RuntimeHandles,
     dispatchers: &mut BTreeMap<i64, ChatDispatcher>,
@@ -653,10 +640,7 @@ fn send_to_chat_worker(
         .entry(chat_id)
         .or_insert_with(|| spawn_chat_worker(chat_id, handles.clone()));
 
-    let dispatch = match dispatcher
-        .sender
-        .try_send(DispatchMessage { kind, message })
-    {
+    let message = match dispatcher.sender.try_send(message) {
         Ok(()) => return,
         Err(TrySendError::Full(_)) => {
             eprintln!("chat {chat_id} queue is full; dropping message");
@@ -679,11 +663,11 @@ fn send_to_chat_worker(
             return;
         }
         // The worker reaped itself after idling; respawn and retry.
-        Err(TrySendError::Closed(dispatch)) => dispatch,
+        Err(TrySendError::Closed(message)) => message,
     };
 
     let dispatcher = spawn_chat_worker(chat_id, handles.clone());
-    if dispatcher.sender.try_send(dispatch).is_err() {
+    if dispatcher.sender.try_send(message).is_err() {
         eprintln!("chat {chat_id} dispatch failed: fresh worker rejected the message");
     }
     dispatchers.insert(chat_id, dispatcher);
@@ -697,7 +681,7 @@ fn reserve_queue_full_notice(pending: &Arc<StdMutex<BTreeSet<i64>>>, chat_id: i6
 }
 
 fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
-    let (sender, mut receiver) = mpsc::channel::<DispatchMessage>(CHAT_QUEUE_SIZE);
+    let (sender, mut receiver) = mpsc::channel::<IncomingMessage>(CHAT_QUEUE_SIZE);
     let worker_id = NEXT_CHAT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
@@ -718,20 +702,14 @@ fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
                 break;
             }
             match timeout(CHAT_TASK_IDLE_TIMEOUT, receiver.recv()).await {
-                Ok(Some(dispatch)) => {
+                Ok(Some(message)) => {
                     if worker_cancelled.load(Ordering::Acquire)
                         || !chat_is_allowed(chat_id, &handles).await
                     {
                         break;
                     }
-                    if let Err(error) = handle_allowed_message(
-                        chat_id,
-                        dispatch.kind,
-                        dispatch.message,
-                        &handles,
-                        &worker_cancelled,
-                    )
-                    .await
+                    if let Err(error) =
+                        handle_allowed_message(chat_id, message, &handles, &worker_cancelled).await
                     {
                         eprintln!("chat {chat_id} dispatch failed: {error}");
                         if worker_can_reply(chat_id, &handles, &worker_cancelled).await {
@@ -835,7 +813,6 @@ async fn worker_can_reply(chat_id: i64, handles: &RuntimeHandles, cancelled: &At
 
 async fn handle_allowed_message(
     chat_id: i64,
-    kind: UpdateKind,
     message: IncomingMessage,
     handles: &RuntimeHandles,
     cancelled: &AtomicBool,
@@ -851,11 +828,11 @@ async fn handle_allowed_message(
         .await?
         {
             Route::Command(action) => {
-                log_update_route(chat_id, kind, UpdateRoute::Command);
+                log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Command);
                 return handle_command(chat_id, action, handles).await;
             }
             Route::Ignore => {
-                log_update_route(chat_id, kind, UpdateRoute::Ignored);
+                log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
                 return Ok(());
             }
             Route::UserMessage => {}
@@ -863,10 +840,10 @@ async fn handle_allowed_message(
     }
 
     if !message_has_model_input(&message) {
-        log_update_route(chat_id, kind, UpdateRoute::Ignored);
+        log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
         return Ok(());
     }
-    log_update_route(chat_id, kind, UpdateRoute::Model);
+    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Model);
     handle_model_message(chat_id, message, handles, cancelled).await
 }
 
@@ -3297,7 +3274,7 @@ mod tests {
                 owner_user_ids: vec![7],
             },
         };
-        let access = AccessControl::new(AccessConfig::from_config(&config), now_access_time());
+        let access = AccessControl::new(AccessConfig::from_config(&config));
         let config = Arc::new(Mutex::new(config));
         let rooms = Arc::new(Mutex::new(RoomStates::default()));
         rooms.lock().await.get_or_default(42).settings.role = Some("preserve me".to_string());
