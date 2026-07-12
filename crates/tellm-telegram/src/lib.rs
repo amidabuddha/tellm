@@ -63,7 +63,6 @@ pub struct ChatMemberUpdated {
     pub chat: Chat,
     /// The user who performed the membership change (e.g. added the bot).
     pub from: Option<User>,
-    pub date: i64,
     pub new_chat_member: ChatMember,
 }
 
@@ -88,8 +87,6 @@ pub struct IncomingMessage {
 pub struct Chat {
     pub id: i64,
     pub title: Option<String>,
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
 }
 
 impl Chat {
@@ -113,7 +110,6 @@ pub struct User {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PhotoSize {
     pub file_id: String,
-    pub file_unique_id: Option<String>,
     pub width: i64,
     pub height: i64,
     pub file_size: Option<i64>,
@@ -122,7 +118,6 @@ pub struct PhotoSize {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Document {
     pub file_id: String,
-    pub file_unique_id: Option<String>,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
     pub file_size: Option<i64>,

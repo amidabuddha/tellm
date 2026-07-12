@@ -3404,7 +3404,6 @@ mod tests {
             chat: tellm_telegram::Chat {
                 id: 42,
                 title: None,
-                kind: None,
             },
             from: None,
             date: 1000,
@@ -3797,14 +3796,12 @@ mod tests {
         let photos = vec![
             PhotoSize {
                 file_id: "small".to_string(),
-                file_unique_id: None,
                 width: 10,
                 height: 10,
                 file_size: None,
             },
             PhotoSize {
                 file_id: "wide".to_string(),
-                file_unique_id: None,
                 width: 50,
                 height: 20,
                 file_size: None,
@@ -3826,7 +3823,6 @@ mod tests {
     fn text_document_detection_accepts_mime_or_extension() {
         let mut document = Document {
             file_id: "f".to_string(),
-            file_unique_id: None,
             file_name: Some("notes.TXT".to_string()),
             mime_type: None,
             file_size: None,
@@ -3892,7 +3888,6 @@ mod tests {
             chat: tellm_telegram::Chat {
                 id: 42,
                 title: None,
-                kind: None,
             },
             from: None,
             date: 1000,
@@ -3908,7 +3903,6 @@ mod tests {
         message.text = None;
         message.photo = Some(vec![PhotoSize {
             file_id: "p".to_string(),
-            file_unique_id: None,
             width: 1,
             height: 1,
             file_size: None,

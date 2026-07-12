@@ -1616,7 +1616,6 @@ name = "tellm-anthropic"
 version = "0.2.0"
 dependencies = [
  "reqwest",
- "serde",
  "serde_json",
  "tellm-core",
  "tellm-test-support",
@@ -1628,7 +1627,6 @@ name = "tellm-compat"
 version = "0.2.0"
 dependencies = [
  "reqwest",
- "serde",
  "serde_json",
  "tellm-core",
  "tellm-test-support",
@@ -1644,7 +1642,6 @@ dependencies = [
  "getrandom 0.3.4",
  "keyring-core",
  "serde",
- "serde_json",
  "tellm-core",
  "thiserror",
  "toml",
@@ -1668,7 +1665,6 @@ name = "tellm-gemini"
 version = "0.2.0"
 dependencies = [
  "reqwest",
- "serde",
  "serde_json",
  "tellm-core",
  "tellm-test-support",
@@ -1680,7 +1676,6 @@ name = "tellm-openai"
 version = "0.2.0"
 dependencies = [
  "reqwest",
- "serde",
  "serde_json",
  "tellm-core",
  "tellm-test-support",
