@@ -35,7 +35,7 @@ pub const API_VERSION: &str = "2023-06-01";
 pub const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20260318";
 pub const WEB_SEARCH_MAX_USES: u32 = 5;
 /// Thinking tokens count toward max_tokens; Anthropic's adaptive-thinking
-/// examples use 16000 to leave room for thinking + text (checked 2026-07-05).
+/// examples use 16000 to leave room for thinking + text (checked 2026-07-12).
 pub const DEFAULT_MAX_TOKENS: u32 = 16000;
 pub const MAX_PAUSE_TURN_CONTINUATIONS: usize = 5;
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -195,7 +195,7 @@ impl Anthropic {
 fn request_body(request: &ChatRequest, messages: Vec<Value>) -> Value {
     let mut body = json!({
         "model": request.model,
-        "max_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "max_tokens": DEFAULT_MAX_TOKENS,
         "messages": messages,
     });
 

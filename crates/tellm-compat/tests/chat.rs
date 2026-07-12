@@ -38,7 +38,6 @@ fn request() -> ChatRequest {
         thinking: ThinkingLevel::High,
         web_search: false,
         image_generation: false,
-        max_tokens: Some(300),
     }
 }
 
@@ -95,7 +94,7 @@ async fn chat_maps_request_and_preserves_assistant_message_verbatim() {
     let body = requests[0].json_body();
     assert_eq!(body["model"], "llama3.2");
     assert_eq!(body["stream"], false);
-    assert_eq!(body["max_tokens"], 300);
+    assert_missing(&body, "max_tokens");
     assert_eq!(body["reasoning_effort"], "high");
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 4);
@@ -147,7 +146,6 @@ async fn text_only_input_uses_plain_string_content_and_omits_optional_fields() {
         text: "Hi".to_string(),
     }];
     req.thinking = ThinkingLevel::Off;
-    req.max_tokens = None;
 
     let response = client(&mock).chat(&req).await.unwrap();
 

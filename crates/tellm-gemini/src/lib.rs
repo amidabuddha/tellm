@@ -158,9 +158,6 @@ fn request_body(request: &ChatRequest, user_step: Value) -> Result<Value, Provid
     if let Some(thinking) = thinking_level(request.thinking) {
         generation_config.insert("thinking_level".to_string(), json!(thinking));
     }
-    if let Some(max_tokens) = request.max_tokens {
-        generation_config.insert("max_output_tokens".to_string(), json!(max_tokens));
-    }
     if !generation_config.is_empty() {
         body["generation_config"] = Value::Object(generation_config);
     }

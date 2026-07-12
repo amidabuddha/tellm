@@ -52,7 +52,6 @@ fn request() -> ChatRequest {
         thinking: ThinkingLevel::High,
         web_search: true,
         image_generation: true,
-        max_tokens: Some(456),
     }
 }
 
@@ -129,7 +128,7 @@ async fn chat_maps_request_and_preserves_output_items_verbatim() {
     assert_eq!(body["model"], "gpt-5.5");
     assert_eq!(body["instructions"], "Be concise.");
     assert_eq!(body["store"], false);
-    assert_eq!(body["max_output_tokens"], 456);
+    assert_missing(&body, "max_output_tokens");
     assert_eq!(body["reasoning"], json!({ "effort": "high" }));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(
@@ -192,7 +191,6 @@ async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
     req.thinking = ThinkingLevel::Max;
     req.web_search = true;
     req.image_generation = false;
-    req.max_tokens = None;
 
     let response = client(&mock).chat(&req).await.unwrap();
 
@@ -245,7 +243,6 @@ async fn meta_model_api_uses_responses_with_xhigh_search_and_no_generation() {
     req.thinking = ThinkingLevel::Max;
     req.web_search = true;
     req.image_generation = false;
-    req.max_tokens = None;
 
     let response = client(&mock).chat(&req).await.unwrap();
 
@@ -289,7 +286,6 @@ async fn off_reasoning_and_no_options_omit_optional_fields() {
     req.thinking = ThinkingLevel::Off;
     req.web_search = false;
     req.image_generation = false;
-    req.max_tokens = None;
 
     let response = client(&mock).chat(&req).await.unwrap();
 

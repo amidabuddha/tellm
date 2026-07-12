@@ -1322,7 +1322,6 @@ fn chat_request_from_room(
         thinking: room.settings.thinking.unwrap_or(model_config.thinking),
         web_search: room.settings.web_search,
         image_generation: room.settings.image_generation,
-        max_tokens: None,
     }
 }
 

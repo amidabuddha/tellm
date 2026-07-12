@@ -199,11 +199,6 @@ fn request_body(request: &ChatRequest, user_message: Value, is_xai: bool) -> Val
         body["instructions"] = json!(system);
     }
 
-    if let Some(max_tokens) = request.max_tokens {
-        // Checked 2026-07-04 against OpenAI Responses API reference.
-        body["max_output_tokens"] = json!(max_tokens);
-    }
-
     if let Some(effort) = responses_effort(request.thinking, &request.model, is_xai) {
         // Checked 2026-07-09 against OpenAI/xAI/Meta Responses reasoning docs.
         body["reasoning"] = json!({ "effort": effort });

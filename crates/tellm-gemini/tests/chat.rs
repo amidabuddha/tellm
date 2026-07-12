@@ -51,7 +51,6 @@ fn request() -> ChatRequest {
         thinking: ThinkingLevel::High,
         web_search: true,
         image_generation: false,
-        max_tokens: Some(456),
     }
 }
 
@@ -130,10 +129,7 @@ async fn chat_maps_request_and_preserves_steps_verbatim() {
     assert_eq!(body["stream"], false);
     assert_eq!(
         body["generation_config"],
-        json!({
-            "thinking_level": "high",
-            "max_output_tokens": 456
-        })
+        json!({ "thinking_level": "high" })
     );
     assert_eq!(
         body["tools"],
@@ -199,7 +195,6 @@ async fn off_reasoning_and_no_options_omit_optional_fields() {
     req.thinking = ThinkingLevel::Off;
     req.web_search = false;
     req.image_generation = false;
-    req.max_tokens = None;
 
     let response = client(&mock).chat(&req).await.unwrap();
 

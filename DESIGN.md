@@ -61,7 +61,6 @@ The core model is deliberately minimal — only what is common across providers:
   document parts for the new user turn)
 - `thinking: off | low | medium | high | max`
 - `web_search: bool`, `image_generation: bool`
-- `max_tokens`
 
 ### Opaque provider state
 
@@ -107,8 +106,8 @@ Validity caveats (OpenAI refreshed 2026-07-10):
 - Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
   model should be configured with `thinking = "low"` or `thinking = "high"`;
   gemini-3.1-pro and 3.5-flash accept medium.
-- Anthropic default max_tokens is 16000: thinking tokens count toward
-  max_tokens, and 4096 risked mid-thought truncation at high/max effort.
+- Anthropic always sends `max_tokens: 16000`: thinking tokens count toward
+  `max_tokens`, and 4096 risked mid-thought truncation at high/max effort.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
   `/websearch on` refuse in rooms whose wire format or model id can never
   honor them (image generation: Anthropic/compat/xAI/Meta/non-image Gemini models;
@@ -152,9 +151,10 @@ Notes:
   `image_generation_call.result` base64 payloads become `GeneratedImage`; xAI
   and Meta image generation are unsupported in the Responses crate.
 - Chat-completions compat uses the broad OpenAI/Ollama dialect: `messages`,
-  `stream: false`, `max_tokens`, `reasoning_effort`, and image input via
-  `image_url` data URLs (checked 2026-07-04). Web search, image generation,
-  and documents are reported as unsupported before any provider call.
+  `stream: false`, `reasoning_effort`, and image input via `image_url` data
+  URLs, while leaving output length to the endpoint's default rather than
+  sending `max_tokens` (checked 2026-07-04). Web search, image generation, and
+  documents are reported as unsupported before any provider call.
 - Gemini Interactions uses `POST /v1beta/interactions`, `x-goog-api-key`,
   `store:false`, `stream:false`, `system_instruction`, and stateless `input`
   as an array of Interactions `Step` objects (checked 2026-07-05 against

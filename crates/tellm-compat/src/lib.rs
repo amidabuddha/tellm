@@ -156,11 +156,6 @@ fn request_body(request: &ChatRequest, user_message: Value) -> Value {
         "stream": false,
     });
 
-    if let Some(max_tokens) = request.max_tokens {
-        // Checked 2026-07-04 against Ollama OpenAI-compat docs.
-        body["max_tokens"] = json!(max_tokens);
-    }
-
     if let Some(effort) = reasoning_effort(request.thinking) {
         // Checked 2026-07-04 against Ollama OpenAI-compat docs; other
         // compatible providers either support or ignore this pass-through.

@@ -85,7 +85,6 @@ pub struct ChatRequest {
     pub thinking: ThinkingLevel,
     pub web_search: bool,
     pub image_generation: bool,
-    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

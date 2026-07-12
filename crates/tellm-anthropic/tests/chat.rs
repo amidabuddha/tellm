@@ -53,7 +53,6 @@ fn request() -> ChatRequest {
         thinking: ThinkingLevel::High,
         web_search: true,
         image_generation: false,
-        max_tokens: Some(1234),
     }
 }
 
@@ -134,7 +133,7 @@ async fn chat_maps_request_and_preserves_turn_items_verbatim() {
 
     let body = requests[0].json_body();
     assert_eq!(body["model"], "claude-opus-4-8");
-    assert_eq!(body["max_tokens"], 1234);
+    assert_eq!(body["max_tokens"], tellm_anthropic::DEFAULT_MAX_TOKENS);
     assert_eq!(
         body["system"],
         json!([
@@ -280,7 +279,6 @@ async fn off_reasoning_and_no_system_or_search_omit_optional_fields() {
     }];
     req.thinking = ThinkingLevel::Off;
     req.web_search = false;
-    req.max_tokens = None;
 
     let response = client(&mock).chat(&req).await.unwrap();
 
