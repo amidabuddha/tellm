@@ -75,6 +75,17 @@ pub enum HistoryReset {
     },
 }
 
+pub struct TurnStart {
+    pub reset: HistoryReset,
+    pub rollback: Option<FailedTurnRollback>,
+}
+
+pub struct FailedTurnRollback {
+    wire_format: Option<WireFormat>,
+    history: Vec<Value>,
+    history_turns: VecDeque<HistoryTurn>,
+}
+
 impl RoomState {
     pub fn new(settings: RoomSettings) -> Self {
         Self {
@@ -91,18 +102,29 @@ impl RoomState {
         self.generation
     }
 
-    pub fn begin_turn(&mut self, wire_format: WireFormat) -> HistoryReset {
+    pub fn begin_turn(&mut self, wire_format: WireFormat) -> TurnStart {
         if self.wire_format != Some(wire_format) {
             let previous = self.wire_format;
+            let rollback = FailedTurnRollback {
+                wire_format: previous,
+                history: std::mem::take(&mut self.history),
+                history_turns: std::mem::take(&mut self.history_turns),
+            };
             self.wire_format = Some(wire_format);
-            self.invalidate_history();
-            return HistoryReset::WireFormatChanged {
-                previous,
-                new: wire_format,
+            self.generation = self.generation.wrapping_add(1);
+            return TurnStart {
+                reset: HistoryReset::WireFormatChanged {
+                    previous,
+                    new: wire_format,
+                },
+                rollback: Some(rollback),
             };
         }
 
-        HistoryReset::None
+        TurnStart {
+            reset: HistoryReset::None,
+            rollback: None,
+        }
     }
 
     pub fn append_turn(&mut self, wire_format: WireFormat, turn_items: Vec<Value>) {
@@ -141,17 +163,25 @@ impl RoomState {
         true
     }
 
-    /// Roll back the speculative wire-format transition made by `begin_turn`
-    /// without overwriting a newer reset. The new generation remains
-    /// monotonic so other work can never mistake the restored state for the
-    /// generation that just failed.
-    pub fn restore_failed_turn(&mut self, expected_generation: u64, before: RoomState) -> bool {
+    /// Restore a speculative wire-format transition made by `begin_turn`
+    /// without overwriting a newer reset or any settings changed while the
+    /// provider call was in flight. Same-format failures have no rollback
+    /// token and leave the room, including its generation, untouched.
+    pub fn restore_failed_turn(
+        &mut self,
+        expected_generation: u64,
+        rollback: Option<FailedTurnRollback>,
+    ) -> bool {
         if self.generation != expected_generation {
             return false;
         }
-        let next_generation = self.generation.wrapping_add(1);
-        *self = before;
-        self.generation = next_generation;
+        let Some(rollback) = rollback else {
+            return true;
+        };
+        self.wire_format = rollback.wire_format;
+        self.history = rollback.history;
+        self.history_turns = rollback.history_turns;
+        self.generation = self.generation.wrapping_add(1);
         true
     }
 
@@ -253,10 +283,6 @@ impl RoomStates {
 
     pub fn remove(&mut self, chat_id: i64) -> Option<RoomState> {
         self.rooms.remove(&chat_id)
-    }
-
-    pub fn insert(&mut self, chat_id: i64, room: RoomState) {
-        self.rooms.insert(chat_id, room);
     }
 }
 
@@ -412,7 +438,7 @@ mod tests {
         let mut room = RoomState::new(RoomSettings::default());
 
         assert_eq!(
-            room.begin_turn(WireFormat::Anthropic),
+            room.begin_turn(WireFormat::Anthropic).reset,
             HistoryReset::WireFormatChanged {
                 previous: None,
                 new: WireFormat::Anthropic,
@@ -423,7 +449,10 @@ mod tests {
             vec![serde_json::json!({ "role": "user", "content": "hi" })],
         );
 
-        assert_eq!(room.begin_turn(WireFormat::Anthropic), HistoryReset::None);
+        assert_eq!(
+            room.begin_turn(WireFormat::Anthropic).reset,
+            HistoryReset::None
+        );
         assert_eq!(room.history.len(), 1);
     }
 
@@ -435,7 +464,7 @@ mod tests {
             vec![serde_json::json!({ "role": "assistant", "content": [] })],
         );
 
-        let reset = room.begin_turn(WireFormat::Responses);
+        let reset = room.begin_turn(WireFormat::Responses).reset;
 
         assert_eq!(
             reset,
@@ -456,7 +485,7 @@ mod tests {
         });
 
         assert!(matches!(
-            room.begin_turn(WireFormat::Compat),
+            room.begin_turn(WireFormat::Compat).reset,
             HistoryReset::WireFormatChanged { .. }
         ));
         room.append_turn(
@@ -468,7 +497,10 @@ mod tests {
             room.history,
             vec![serde_json::json!({ "role": "assistant", "content": "one-off" })]
         );
-        assert_eq!(room.begin_turn(WireFormat::Compat), HistoryReset::None);
+        assert_eq!(
+            room.begin_turn(WireFormat::Compat).reset,
+            HistoryReset::None
+        );
         room.append_turn(
             WireFormat::Compat,
             vec![serde_json::json!({ "role": "assistant", "content": "latest" })],
@@ -528,8 +560,8 @@ mod tests {
             WireFormat::Responses,
             vec![serde_json::json!({ "turn": "before" })],
         );
-        let before = room.clone();
-        assert_eq!(room.begin_turn(WireFormat::Responses), HistoryReset::None);
+        let start = room.begin_turn(WireFormat::Responses);
+        assert_eq!(start.reset, HistoryReset::None);
         let request_generation = room.generation();
 
         room.reset_history();
@@ -539,7 +571,7 @@ mod tests {
             WireFormat::Responses,
             vec![serde_json::json!({ "turn": "stale response" })],
         ));
-        assert!(!room.restore_failed_turn(request_generation, before));
+        assert!(!room.restore_failed_turn(request_generation, start.rollback));
         assert!(room.history.is_empty());
     }
 
@@ -550,17 +582,39 @@ mod tests {
             WireFormat::Anthropic,
             vec![serde_json::json!({ "turn": "anthropic" })],
         );
-        let before = room.clone();
+        let start = room.begin_turn(WireFormat::Responses);
         assert!(matches!(
-            room.begin_turn(WireFormat::Responses),
+            start.reset,
             HistoryReset::WireFormatChanged { .. }
         ));
         let request_generation = room.generation();
+        room.settings.web_search = true;
 
-        assert!(room.restore_failed_turn(request_generation, before));
+        assert!(room.restore_failed_turn(request_generation, start.rollback));
         assert_eq!(room.wire_format, Some(WireFormat::Anthropic));
         assert_eq!(room.history[0]["turn"], "anthropic");
+        assert!(room.settings.web_search);
         assert_ne!(room.generation(), request_generation);
+    }
+
+    #[test]
+    fn failed_same_wire_turn_leaves_midflight_settings_and_room_state_untouched() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.append_turn(
+            WireFormat::Responses,
+            vec![serde_json::json!({ "turn": "before" })],
+        );
+        let start = room.begin_turn(WireFormat::Responses);
+        assert_eq!(start.reset, HistoryReset::None);
+        assert!(start.rollback.is_none());
+        let request_generation = room.generation();
+
+        room.settings.role = Some("Changed while the provider was running".to_string());
+        room.settings.web_search = true;
+        let expected = room.clone();
+
+        assert!(room.restore_failed_turn(request_generation, start.rollback));
+        assert_eq!(room, expected);
     }
 
     #[test]

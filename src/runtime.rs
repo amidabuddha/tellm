@@ -1231,7 +1231,7 @@ async fn handle_model_message(
             let restored = {
                 let mut rooms = handles.rooms.lock().await;
                 if let Some(room) = rooms.get_mut(chat_id) {
-                    room.restore_failed_turn(prepared.generation, prepared.before_state)
+                    room.restore_failed_turn(prepared.generation, prepared.rollback)
                 } else {
                     false
                 }
@@ -1254,7 +1254,7 @@ async fn handle_model_message(
 struct PreparedChatRequest {
     model_config: ModelConfig,
     request: ChatRequest,
-    before_state: RoomState,
+    rollback: Option<rooms::FailedTurnRollback>,
     generation: u64,
     reset_notice: Option<String>,
 }
@@ -1291,16 +1291,15 @@ async fn build_chat_request(
         .get(&model_key)
         .cloned()
         .ok_or_else(|| format!("configured model \"{model_key}\" was not found"))?;
-    let before_state = room.clone();
-    let reset = room.begin_turn(model_config.wire_format);
-    let reset_notice = reset_notice(reset);
+    let start = room.begin_turn(model_config.wire_format);
+    let reset_notice = reset_notice(start.reset);
     let request = chat_request_from_room(room, &model_config, input);
     let generation = room.generation();
 
     Ok(PreparedChatRequest {
         model_config,
         request,
-        before_state,
+        rollback: start.rollback,
         generation,
         reset_notice,
     })
@@ -2515,9 +2514,9 @@ async fn room_setup_reply(
     let (model_key, pinned, available) = {
         let config = handles.config.lock().await;
         let mut rooms = handles.rooms.lock().await;
-        let room = rooms.get_or_default(chat_id).clone();
+        let room = rooms.get_or_default(chat_id);
         (
-            selected_model_key(&config, &room, chat_id),
+            selected_model_key(&config, room, chat_id),
             pinned_model_key(&config, chat_id).map(str::to_string),
             config.models.keys().cloned().collect::<Vec<_>>(),
         )
@@ -2579,7 +2578,7 @@ async fn mutate_room(
     let _persist = handles.room_persist.lock().await;
     let (before, settings) = {
         let mut rooms = handles.rooms.lock().await;
-        let before = rooms.get(chat_id).cloned();
+        let before = rooms.get(chat_id).map(|room| room.settings.clone());
         let room = rooms.get_or_default(chat_id);
         mutate(room);
         (before, rooms.settings())
@@ -2592,15 +2591,11 @@ async fn mutate_room(
                     // Only settings are durable. Roll them back, but never
                     // resurrect history invalidated by this command or by a
                     // concurrent terminal reset.
-                    current.settings = before.settings;
-                } else {
-                    rooms.insert(chat_id, before);
+                    current.settings = before;
                 }
             }
             None => {
-                if rooms.get(chat_id).is_some() {
-                    rooms.remove(chat_id);
-                }
+                rooms.remove(chat_id);
             }
         }
         return Err(format!(
@@ -3362,7 +3357,7 @@ mod tests {
         );
 
         reset_room_model_context(&mut room);
-        let reset = room.begin_turn(WireFormat::Responses);
+        let reset = room.begin_turn(WireFormat::Responses).reset;
 
         assert!(room.history.is_empty());
         assert!(room.settings.thinking.is_none());
