@@ -1074,10 +1074,17 @@ async fn handle_command(
 
             let base_reply = model_add_base_reply(already, preset);
             if secrets::get(preset.api_key_secret).is_some() {
-                let reply = model_add_key_ready_reply(&base_reply, preset);
+                let reply = model_key_ready_reply(&base_reply, preset.key);
                 send_command_reply(handles, chat_id, &reply).await
             } else {
-                prompt_for_model_secret(handles, chat_id, preset, &base_reply).await
+                prompt_for_model_secret(
+                    handles,
+                    chat_id,
+                    preset.key,
+                    preset.api_key_secret,
+                    &base_reply,
+                )
+                .await
             }
         }
         CommandAction::ShowRole { current } => {
@@ -2265,17 +2272,11 @@ async fn handle_configured_model_secret(
         Some(Some(secret_name)) => {
             let base_reply = configured_model_base_reply(&model_key);
             if secrets::get(&secret_name).is_some() {
-                let reply = configured_model_key_ready_reply(&base_reply, &model_key);
+                let reply = model_key_ready_reply(&base_reply, &model_key);
                 send_command_reply(handles, chat_id, &reply).await
             } else {
-                prompt_for_configured_model_secret(
-                    handles,
-                    chat_id,
-                    model_key,
-                    secret_name,
-                    &base_reply,
-                )
-                .await
+                prompt_for_model_secret(handles, chat_id, &model_key, &secret_name, &base_reply)
+                    .await
             }
         }
         Some(None) => {
@@ -2299,41 +2300,16 @@ async fn handle_configured_model_secret(
 async fn prompt_for_model_secret(
     handles: &RuntimeHandles,
     chat_id: i64,
-    preset: &'static crate::wizard::ProviderPreset,
+    model_key: &str,
+    secret_name: &str,
     base_reply: &str,
 ) -> Result<(), String> {
-    let prompt_notice = model_add_key_prompt_reply(base_reply, preset);
+    let prompt_notice = model_key_prompt_reply(base_reply, secret_name);
 
-    let reply = match prompt_and_store_secret(
-        handles,
-        chat_id,
-        &prompt_notice,
-        preset.api_key_secret,
-    )
-    .await
-    {
-        Ok(Some(destination)) => model_add_key_stored_reply(preset, destination),
-        Ok(None) => model_add_key_skipped_reply(preset),
-        Err(error) => model_add_key_prompt_failed_reply(preset, &error),
-    };
-    send_command_reply(handles, chat_id, &reply).await
-}
-
-async fn prompt_for_configured_model_secret(
-    handles: &RuntimeHandles,
-    chat_id: i64,
-    model_key: String,
-    secret_name: String,
-    base_reply: &str,
-) -> Result<(), String> {
-    let prompt_notice = configured_model_key_prompt_reply(base_reply, &secret_name);
-
-    let reply = match prompt_and_store_secret(handles, chat_id, &prompt_notice, secret_name.clone())
-        .await
-    {
-        Ok(Some(destination)) => configured_model_key_stored_reply(&model_key, destination),
-        Ok(None) => configured_model_key_skipped_reply(&model_key),
-        Err(error) => configured_model_key_prompt_failed_reply(&model_key, &secret_name, &error),
+    let reply = match prompt_and_store_secret(handles, chat_id, &prompt_notice, secret_name).await {
+        Ok(Some(destination)) => model_key_stored_reply(model_key, destination),
+        Ok(None) => model_key_skipped_reply(model_key),
+        Err(error) => model_key_prompt_failed_reply(model_key, secret_name, &error),
     };
     send_command_reply(handles, chat_id, &reply).await
 }
@@ -2383,61 +2359,8 @@ fn model_add_base_reply(already: bool, preset: &crate::wizard::ProviderPreset) -
     }
 }
 
-fn model_add_key_ready_reply(base_reply: &str, preset: &crate::wizard::ProviderPreset) -> String {
-    model_key_ready_reply(base_reply, preset.key)
-}
-
-fn model_add_key_prompt_reply(base_reply: &str, preset: &crate::wizard::ProviderPreset) -> String {
-    model_key_prompt_reply(base_reply, preset.api_key_secret)
-}
-
-fn model_add_key_stored_reply(
-    preset: &crate::wizard::ProviderPreset,
-    destination: secrets::SecretDestination,
-) -> String {
-    model_key_stored_reply(preset.key, destination)
-}
-
-fn model_add_key_skipped_reply(preset: &crate::wizard::ProviderPreset) -> String {
-    model_key_skipped_reply(preset.key)
-}
-
-fn model_add_key_prompt_failed_reply(
-    preset: &crate::wizard::ProviderPreset,
-    error: &str,
-) -> String {
-    model_key_prompt_failed_reply(preset.key, preset.api_key_secret, error)
-}
-
 fn configured_model_base_reply(model_key: &str) -> String {
     format!("{model_key} is already configured.")
-}
-
-fn configured_model_key_ready_reply(base_reply: &str, model_key: &str) -> String {
-    model_key_ready_reply(base_reply, model_key)
-}
-
-fn configured_model_key_prompt_reply(base_reply: &str, secret_name: &str) -> String {
-    model_key_prompt_reply(base_reply, secret_name)
-}
-
-fn configured_model_key_stored_reply(
-    model_key: &str,
-    destination: secrets::SecretDestination,
-) -> String {
-    model_key_stored_reply(model_key, destination)
-}
-
-fn configured_model_key_skipped_reply(model_key: &str) -> String {
-    model_key_skipped_reply(model_key)
-}
-
-fn configured_model_key_prompt_failed_reply(
-    model_key: &str,
-    secret_name: &str,
-    error: &str,
-) -> String {
-    model_key_prompt_failed_reply(model_key, secret_name, error)
 }
 
 fn configured_model_has_no_secret_reply(model_key: &str) -> String {
@@ -3779,10 +3702,10 @@ mod tests {
     fn model_add_missing_key_reply_prompts_terminal_not_telegram_secret_entry() {
         let preset = crate::wizard::preset_by_key("openai").unwrap();
         let base = model_add_base_reply(false, preset);
-        let prompt = model_add_key_prompt_reply(&base, preset);
-        let skipped = model_add_key_skipped_reply(preset);
+        let prompt = model_key_prompt_reply(&base, preset.api_key_secret);
+        let skipped = model_key_skipped_reply(preset.key);
         let stored =
-            model_add_key_stored_reply(preset, secrets::SecretDestination::CredentialsFile);
+            model_key_stored_reply(preset.key, secrets::SecretDestination::CredentialsFile);
 
         assert!(prompt.contains("terminal prompt"), "{prompt}");
         assert!(prompt.contains("visible locally"), "{prompt}");
@@ -3796,12 +3719,9 @@ mod tests {
     #[test]
     fn configured_model_key_reply_uses_model_secret_name() {
         let base = configured_model_base_reply("mistral");
-        let prompt = configured_model_key_prompt_reply(&base, "mistral_api_key");
-        let skipped = configured_model_key_skipped_reply("mistral");
-        let stored = configured_model_key_stored_reply(
-            "mistral",
-            secrets::SecretDestination::CredentialsFile,
-        );
+        let prompt = model_key_prompt_reply(&base, "mistral_api_key");
+        let skipped = model_key_skipped_reply("mistral");
+        let stored = model_key_stored_reply("mistral", secrets::SecretDestination::CredentialsFile);
         let no_secret = configured_model_has_no_secret_reply("ollama");
 
         assert!(base.contains("mistral is already configured"), "{base}");
