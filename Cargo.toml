@@ -44,6 +44,7 @@ tellm-anthropic = { path = "crates/tellm-anthropic" }
 tellm-openai = { path = "crates/tellm-openai" }
 tellm-compat = { path = "crates/tellm-compat" }
 tellm-gemini = { path = "crates/tellm-gemini" }
+tellm-test-support = { path = "crates/tellm-test-support" }
 
 [package]
 name = "tellm"

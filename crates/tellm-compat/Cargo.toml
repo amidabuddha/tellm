@@ -15,4 +15,5 @@ serde_json.workspace = true
 reqwest.workspace = true
 
 [dev-dependencies]
+tellm-test-support.workspace = true
 tokio.workspace = true

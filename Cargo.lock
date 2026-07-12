@@ -1619,6 +1619,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tellm-core",
+ "tellm-test-support",
  "tokio",
 ]
 
@@ -1630,6 +1631,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tellm-core",
+ "tellm-test-support",
  "tokio",
 ]
 
@@ -1669,6 +1671,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tellm-core",
+ "tellm-test-support",
  "tokio",
 ]
 
@@ -1680,6 +1683,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tellm-core",
+ "tellm-test-support",
  "tokio",
 ]
 
@@ -1692,6 +1696,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "tellm-test-support"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

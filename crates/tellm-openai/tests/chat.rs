@@ -1,11 +1,9 @@
-mod support;
-
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use support::{MockOpenAi, MockResponse};
 use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
 use tellm_openai::Responses;
+use tellm_test_support::{MockHttpServer as MockOpenAi, MockResponse};
 use tokio::time::timeout;
 
 fn request() -> ChatRequest {

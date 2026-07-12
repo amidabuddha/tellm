@@ -1,11 +1,9 @@
-mod support;
-
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use support::{MockCompat, MockResponse};
 use tellm_compat::Compat;
 use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
+use tellm_test_support::{MockHttpServer as MockCompat, MockResponse};
 use tokio::time::timeout;
 
 fn request() -> ChatRequest {

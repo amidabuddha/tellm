@@ -43,12 +43,12 @@ impl MockResponse {
     }
 }
 
-pub struct MockOpenAi {
+pub struct MockHttpServer {
     base_url: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
-impl MockOpenAi {
+impl MockHttpServer {
     pub fn start(responses: Vec<MockResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock server must bind");
         let addr = listener.local_addr().expect("mock server must have addr");

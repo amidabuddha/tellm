@@ -47,6 +47,7 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | `tellm-openai` | OpenAI Responses API (OpenAI, xAI, Meta via base_url) |
 | `tellm-compat` | OpenAI chat-completions dialect (Ollama, DeepSeek, OpenRouter, any compatible) |
 | `tellm-gemini` | Google Interactions API (Gemini) |
+| `tellm-test-support` | Dev-only shared mock HTTP support for provider integration tests |
 | root binary | Runtime loop, command router, sessions, pairing, wizard |
 
 Inside the root binary, runtime-owned concerns are split into
