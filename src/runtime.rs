@@ -606,7 +606,9 @@ impl Runtime {
                         );
                     }
                 }
-                if let Some(code) = pair_code_from_message(&message, handles).await {
+                if let Some(code) =
+                    pair_code_from_message(&message, handles.bot_username.as_deref())
+                {
                     log_update_route(chat_id, kind, UpdateRoute::Command);
                     let pairer = message.from.as_ref().map(|user| user.id);
                     if let Err(error) = handle_pair_attempt(chat_id, code, pairer, handles).await {
@@ -878,25 +880,10 @@ async fn route_command(
     if !chat_is_allowed(chat_id, handles).await {
         return Err("chat access was revoked".to_string());
     }
-    let (room, default_model, model_keys, pinned_model_key, model_thinking, capabilities) = {
-        let config = handles.config.lock().await;
-        let mut rooms = handles.rooms.lock().await;
-        let room = rooms.get_or_default(chat_id).clone();
-        let model_key = selected_model_key(&config, &room, chat_id);
-        let model_thinking = config
-            .models
-            .get(&model_key)
-            .map(|model| model.thinking)
-            .unwrap_or_default();
-        let capabilities = room_capabilities(&config, &room, chat_id);
-        (
-            room,
-            config.default_model.clone(),
-            config.models.keys().cloned().collect::<BTreeSet<_>>(),
-            pinned_model_key(&config, chat_id).map(str::to_string),
-            model_thinking,
-            capabilities,
-        )
+    let (command, args) = match commands::parse(text, handles.bot_username.as_deref()) {
+        commands::ParsedRoute::Command { command, args } => (command, args),
+        commands::ParsedRoute::UserMessage => return Ok(Route::UserMessage),
+        commands::ParsedRoute::Ignore => return Ok(Route::Ignore),
     };
     let shutdown_access = {
         let access = handles.access.lock().await;
@@ -906,17 +893,30 @@ async fn route_command(
             now_access_time(),
         )
     };
-    let context = CommandContext {
-        bot_username: handles.bot_username.as_deref(),
-        room: &room,
-        default_model: &default_model,
-        model_keys: &model_keys,
-        pinned_model_key: pinned_model_key.as_deref(),
-        model_thinking,
-        shutdown_access,
-        capabilities,
+    let action = {
+        let config = handles.config.lock().await;
+        let mut rooms = handles.rooms.lock().await;
+        let room = rooms.get_or_default(chat_id);
+        let model_key = selected_model_key(&config, room, chat_id);
+        let model_thinking = config
+            .models
+            .get(&model_key)
+            .map(|model| model.thinking)
+            .unwrap_or_default();
+        let capabilities = room_capabilities(&config, room, chat_id);
+        let model_keys = config.models.keys().cloned().collect::<BTreeSet<_>>();
+        let context = CommandContext {
+            settings: &room.settings,
+            default_model: &config.default_model,
+            model_keys: &model_keys,
+            pinned_model_key: pinned_model_key(&config, chat_id),
+            model_thinking,
+            shutdown_access,
+            capabilities,
+        };
+        commands::resolve(command, args, &context)
     };
-    Ok(commands::route(text, &context))
+    Ok(Route::Command(action))
 }
 
 async fn handle_command(
@@ -2143,32 +2143,9 @@ async fn persist_provisional_pair(
     }
 }
 
-async fn pair_code_from_message(
-    message: &IncomingMessage,
-    handles: &RuntimeHandles,
-) -> Option<String> {
+fn pair_code_from_message(message: &IncomingMessage, bot_username: Option<&str>) -> Option<String> {
     let text = message_text(message)?;
-    let config = handles.config.lock().await;
-    let room = RoomState::new(Default::default());
-    let model_keys = config.models.keys().cloned().collect::<BTreeSet<_>>();
-    let context = CommandContext {
-        bot_username: handles.bot_username.as_deref(),
-        room: &room,
-        default_model: &config.default_model,
-        model_keys: &model_keys,
-        pinned_model_key: None,
-        model_thinking: config
-            .models
-            .get(&config.default_model)
-            .map(|model| model.thinking)
-            .unwrap_or_default(),
-        shutdown_access: crate::access::ShutdownAccess::NotAdmin,
-        capabilities: commands::RoomCapabilities::permissive(),
-    };
-    match commands::route(text, &context) {
-        Route::Command(CommandAction::Pair { code }) => Some(code),
-        _ => None,
-    }
+    commands::pair_code(text, bot_username).map(str::to_string)
 }
 
 /// Compute what the room's effective model can honor. Statically

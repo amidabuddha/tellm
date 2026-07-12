@@ -6,8 +6,7 @@ use crate::{access, rooms};
 
 #[derive(Debug, Clone)]
 pub struct CommandContext<'a> {
-    pub bot_username: Option<&'a str>,
-    pub room: &'a rooms::RoomState,
+    pub settings: &'a rooms::RoomSettings,
     pub default_model: &'a str,
     pub model_keys: &'a BTreeSet<String>,
     pub pinned_model_key: Option<&'a str>,
@@ -31,9 +30,8 @@ pub struct RoomCapabilities {
 }
 
 impl RoomCapabilities {
-    /// Permissive default for contexts where no model is resolvable (e.g.
-    /// routing /pair from an unknown chat) — toggles never reach dispatch
-    /// there anyway.
+    /// Permissive fallback for contexts where no model is resolvable; provider
+    /// dispatch still rejects a missing model before using a capability.
     pub fn permissive() -> Self {
         Self {
             web_search: true,
@@ -47,6 +45,16 @@ impl RoomCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     Command(CommandAction),
+    UserMessage,
+    Ignore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedRoute<'a> {
+    Command {
+        command: KnownCommand,
+        args: &'a str,
+    },
     UserMessage,
     Ignore,
 }
@@ -180,48 +188,68 @@ pub enum CommandReject {
     },
 }
 
-pub fn route(text: &str, context: &CommandContext<'_>) -> Route {
-    let Some(parsed) = parse_command(text, context.bot_username) else {
-        return Route::UserMessage;
+pub fn parse<'a>(text: &'a str, bot_username: Option<&str>) -> ParsedRoute<'a> {
+    let Some(parsed) = parse_command(text, bot_username) else {
+        return ParsedRoute::UserMessage;
     };
     if parsed.for_other_bot {
-        return Route::Ignore;
+        return ParsedRoute::Ignore;
     }
-
     let Some(command) = parse_known_command(parsed.name) else {
-        return Route::UserMessage;
+        return ParsedRoute::UserMessage;
     };
+    ParsedRoute::Command {
+        command,
+        args: parsed.args,
+    }
+}
 
-    Route::Command(match command {
+pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) -> CommandAction {
+    match command {
         KnownCommand::New => CommandAction::ResetHistory,
         KnownCommand::Id => CommandAction::ShowChatId,
-        KnownCommand::Mode => route_mode(parsed.args, context.room),
-        KnownCommand::Model => route_model(parsed.args, context),
-        KnownCommand::Role => route_role(parsed.args, context.room),
-        KnownCommand::Reasoning => {
-            route_reasoning(parsed.args, context.room, context.model_thinking)
-        }
-        KnownCommand::WebSearch => {
-            route_web_search(parsed.args, context.room, &context.capabilities)
-        }
+        KnownCommand::Mode => route_mode(args, context.settings),
+        KnownCommand::Model => route_model(args, context),
+        KnownCommand::Role => route_role(args, context.settings),
+        KnownCommand::Reasoning => route_reasoning(args, context.settings, context.model_thinking),
+        KnownCommand::WebSearch => route_web_search(args, context.settings, &context.capabilities),
         KnownCommand::ImageGeneration => {
-            route_image_generation(parsed.args, context.room, &context.capabilities)
+            route_image_generation(args, context.settings, &context.capabilities)
         }
-        KnownCommand::Allow => route_chat_approval(command, parsed.args, context.shutdown_access),
-        KnownCommand::Deny => route_chat_approval(command, parsed.args, context.shutdown_access),
-        KnownCommand::Pair => route_pair(parsed.args),
-        KnownCommand::Ollama => route_ollama(parsed.args, context.shutdown_access),
+        KnownCommand::Allow => route_chat_approval(command, args, context.shutdown_access),
+        KnownCommand::Deny => route_chat_approval(command, args, context.shutdown_access),
+        KnownCommand::Pair => route_pair(args),
+        KnownCommand::Ollama => route_ollama(args, context.shutdown_access),
         KnownCommand::Shutdown => route_shutdown(context.shutdown_access),
         KnownCommand::Help => CommandAction::Help {
             pinned_model_key: context.pinned_model_key.map(str::to_string),
         },
-    })
+    }
 }
 
-fn route_mode(args: &str, room: &rooms::RoomState) -> CommandAction {
+#[cfg(test)]
+pub fn route(text: &str, bot_username: Option<&str>, context: &CommandContext<'_>) -> Route {
+    match parse(text, bot_username) {
+        ParsedRoute::Command { command, args } => Route::Command(resolve(command, args, context)),
+        ParsedRoute::UserMessage => Route::UserMessage,
+        ParsedRoute::Ignore => Route::Ignore,
+    }
+}
+
+pub fn pair_code<'a>(text: &'a str, bot_username: Option<&str>) -> Option<&'a str> {
+    match parse(text, bot_username) {
+        ParsedRoute::Command {
+            command: KnownCommand::Pair,
+            args,
+        } => first_arg(args),
+        _ => None,
+    }
+}
+
+fn route_mode(args: &str, settings: &rooms::RoomSettings) -> CommandAction {
     let Some(value) = first_arg(args) else {
         return CommandAction::ShowMode {
-            current: room.settings.mode,
+            current: settings.mode,
         };
     };
 
@@ -243,7 +271,7 @@ fn route_mode(args: &str, room: &rooms::RoomState) -> CommandAction {
 
 fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
     let Some(value) = first_arg(args) else {
-        let selected = context.room.settings.model_key.clone();
+        let selected = context.settings.model_key.clone();
         let pinned = context.pinned_model_key.map(str::to_string);
         return CommandAction::ShowModel {
             effective: pinned
@@ -304,11 +332,11 @@ fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
     }
 }
 
-fn route_role(args: &str, room: &rooms::RoomState) -> CommandAction {
+fn route_role(args: &str, settings: &rooms::RoomSettings) -> CommandAction {
     let args = args.trim();
     if args.is_empty() {
         return CommandAction::ShowRole {
-            current: room.settings.role.clone(),
+            current: settings.role.clone(),
         };
     }
 
@@ -322,12 +350,12 @@ fn route_role(args: &str, room: &rooms::RoomState) -> CommandAction {
 
 fn route_reasoning(
     args: &str,
-    room: &rooms::RoomState,
+    settings: &rooms::RoomSettings,
     model_default: ThinkingLevel,
 ) -> CommandAction {
     let Some(value) = first_arg(args) else {
         return CommandAction::ShowReasoning {
-            override_level: room.settings.thinking,
+            override_level: settings.thinking,
             model_default,
         };
     };
@@ -345,7 +373,7 @@ fn route_reasoning(
 
 fn route_web_search(
     args: &str,
-    room: &rooms::RoomState,
+    settings: &rooms::RoomSettings,
     capabilities: &RoomCapabilities,
 ) -> CommandAction {
     let gate = |enabled: bool| {
@@ -357,12 +385,12 @@ fn route_web_search(
     };
 
     let Some(value) = first_arg(args) else {
-        return gate(!room.settings.web_search);
+        return gate(!settings.web_search);
     };
 
     match value.to_ascii_lowercase().as_str() {
         "status" => CommandAction::ShowWebSearch {
-            enabled: room.settings.web_search,
+            enabled: settings.web_search,
         },
         _ => match parse_bool(value) {
             Some(enabled) => gate(enabled),
@@ -378,7 +406,7 @@ fn route_web_search(
 
 fn route_image_generation(
     args: &str,
-    room: &rooms::RoomState,
+    settings: &rooms::RoomSettings,
     capabilities: &RoomCapabilities,
 ) -> CommandAction {
     let gate = |enabled: bool| {
@@ -394,12 +422,12 @@ fn route_image_generation(
     };
 
     let Some(value) = first_arg(args) else {
-        return gate(!room.settings.image_generation);
+        return gate(!settings.image_generation);
     };
 
     match value.to_ascii_lowercase().as_str() {
         "status" => CommandAction::ShowImageGeneration {
-            enabled: room.settings.image_generation,
+            enabled: settings.image_generation,
         },
         _ => match parse_bool(value) {
             Some(enabled) => gate(enabled),
@@ -456,7 +484,7 @@ fn route_model_pin(args: &str, context: &CommandContext<'_>) -> CommandAction {
         .nth(1)
         .map(str::to_string)
         .or_else(|| context.pinned_model_key.map(str::to_string))
-        .or_else(|| context.room.settings.model_key.clone())
+        .or_else(|| context.settings.model_key.clone())
         .unwrap_or_else(|| context.default_model.to_string());
 
     if context.model_keys.contains(&key_arg) {
@@ -1025,6 +1053,14 @@ mod tests {
                 reason: CommandReject::MissingPairingCode,
             })
         );
+        assert_eq!(pair_code("/pair 123456", None), Some("123456"));
+        assert_eq!(
+            pair_code("/pair@TellmBot 654321", Some("tellmbot")),
+            Some("654321")
+        );
+        assert_eq!(pair_code("/pair@OtherBot 123456", Some("tellmbot")), None);
+        assert_eq!(pair_code("/pairing 123456", None), None);
+        assert_eq!(pair_code("/pair", None), None);
     }
 
     #[test]
@@ -1219,14 +1255,12 @@ mod tests {
         models: &[&str],
         pinned_model_key: Option<&str>,
     ) -> Route {
-        let room = rooms::RoomState::new(settings);
         let model_keys = models
             .iter()
             .map(|model| model.to_string())
             .collect::<BTreeSet<_>>();
         let context = CommandContext {
-            bot_username,
-            room: &room,
+            settings: &settings,
             default_model: "claude",
             model_keys: &model_keys,
             pinned_model_key,
@@ -1234,7 +1268,7 @@ mod tests {
             shutdown_access,
             capabilities: RoomCapabilities::permissive(),
         };
-        route(text, &context)
+        route(text, bot_username, &context)
     }
 
     fn route_with_capabilities(
@@ -1242,11 +1276,9 @@ mod tests {
         settings: rooms::RoomSettings,
         capabilities: RoomCapabilities,
     ) -> Route {
-        let room = rooms::RoomState::new(settings);
         let model_keys = BTreeSet::from(["claude".to_string()]);
         let context = CommandContext {
-            bot_username: None,
-            room: &room,
+            settings: &settings,
             default_model: "claude",
             model_keys: &model_keys,
             pinned_model_key: None,
@@ -1254,7 +1286,7 @@ mod tests {
             shutdown_access: access::ShutdownAccess::NotAdmin,
             capabilities,
         };
-        route(text, &context)
+        route(text, None, &context)
     }
 
     fn incapable_room() -> RoomCapabilities {
