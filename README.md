@@ -265,8 +265,12 @@ does not stop the bot—use `/shutdown` or a process signal.
 
 If tellm works in direct messages but ignores plain text in a group, disable
 privacy mode via BotFather (`/setprivacy`) and re-add the bot to the group.
-The runtime logs one stderr breadcrumb per received update with chat id, update
-kind, and route (`command`, `model`, or `ignored`), but never message content.
+Runtime diagnostics use local RFC 3339 timestamps (including milliseconds and
+UTC offset), levels, and components. Each received update has a `DEBUG`
+breadcrumb with chat id, update kind, and route (`command`, `model`, or
+`ignored`), but never message content. Repeated identical Telegram polling
+failures are rate-limited and followed by a recovery record when polling works
+again.
 
 ## License
 

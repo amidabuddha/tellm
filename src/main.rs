@@ -2,16 +2,18 @@ use std::process::ExitCode;
 
 mod access;
 mod commands;
+mod console;
 mod rooms;
 mod runtime;
 mod wizard;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    console::init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("tellm: {error}");
+            log::error!(target: "tellm", "{error}");
             ExitCode::FAILURE
         }
     }

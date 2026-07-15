@@ -272,7 +272,10 @@ impl Telegram {
         match picker {
             Ok(_) => Ok(()),
             Err(error) => {
-                eprintln!("Telegram model picker failed; sending text fallback: {error}");
+                log::warn!(
+                    target: "tellm::telegram",
+                    "model picker failed; sending text fallback error=\"{error}\""
+                );
                 self.send_message(chat_id, &model_picker_fallback_text(text, model_keys))
                     .await
             }

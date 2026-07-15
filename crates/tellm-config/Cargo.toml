@@ -17,6 +17,7 @@ thiserror.workspace = true
 dirs.workspace = true
 keyring-core = { workspace = true, optional = true }
 getrandom.workspace = true
+log.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, optional = true }

@@ -318,8 +318,9 @@ fn publish_atomic_file_with_sync(
     // the directory; treating that durability warning as a failed commit
     // would make callers roll memory back behind the already-published file.
     if let Err(error) = sync_parent(path) {
-        eprintln!(
-            "warning: atomic file was published but its parent directory could not be synced: {error}"
+        log::warn!(
+            target: "tellm::config",
+            "atomic file published but parent directory sync failed error=\"{error}\""
         );
     }
     Ok(())

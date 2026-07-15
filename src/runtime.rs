@@ -26,6 +26,8 @@ use crate::commands::{self, CommandAction, CommandContext, CommandReject, KnownC
 use crate::rooms::{self, ChatMode, HistoryReset, RoomState, RoomStates};
 
 const LONG_POLL_TIMEOUT_S: u32 = 20;
+const GET_UPDATES_RETRY_DELAY: Duration = Duration::from_secs(2);
+const GET_UPDATES_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const CHAT_QUEUE_SIZE: usize = 32;
 const CHAT_TASK_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TYPING_INTERVAL: Duration = Duration::from_secs(4);
@@ -299,8 +301,11 @@ impl Drop for ManagedOllamaChild {
             return;
         };
         match stop_ollama_child(child) {
-            Ok(message) => eprintln!("{message}"),
-            Err(error) => eprintln!("failed to stop spawned Ollama process during drop: {error}"),
+            Ok(message) => log::info!(target: "tellm::ollama", "{message}"),
+            Err(error) => log::error!(
+                target: "tellm::ollama",
+                "spawned process stop failed during drop error={error:?}"
+            ),
         }
     }
 }
@@ -330,6 +335,76 @@ enum OllamaUnloadOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
     Telegram,
+}
+
+#[derive(Debug, Default)]
+struct GetUpdatesLogState {
+    consecutive_failures: u64,
+    started_at: Option<StdInstant>,
+    last_reported_at: Option<StdInstant>,
+    last_reported_failure: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GetUpdatesFailureReport {
+    consecutive_failures: u64,
+    elapsed: Duration,
+    suppressed: u64,
+    first: bool,
+    error_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GetUpdatesRecovery {
+    failures: u64,
+    downtime: Duration,
+}
+
+impl GetUpdatesLogState {
+    fn record_failure(&mut self, error: &str, now: StdInstant) -> Option<GetUpdatesFailureReport> {
+        self.consecutive_failures += 1;
+        let started_at = *self.started_at.get_or_insert(now);
+        let first = self.consecutive_failures == 1;
+        let error_changed = !first && self.last_error.as_deref() != Some(error);
+        let report_interval_elapsed = self.last_reported_at.is_some_and(|last_reported| {
+            now.duration_since(last_reported) >= GET_UPDATES_FAILURE_LOG_INTERVAL
+        });
+        self.last_error = Some(error.to_string());
+
+        if !first && !error_changed && !report_interval_elapsed {
+            return None;
+        }
+
+        let suppressed = self
+            .consecutive_failures
+            .saturating_sub(self.last_reported_failure)
+            .saturating_sub(1);
+        self.last_reported_at = Some(now);
+        self.last_reported_failure = self.consecutive_failures;
+        Some(GetUpdatesFailureReport {
+            consecutive_failures: self.consecutive_failures,
+            elapsed: now.duration_since(started_at),
+            suppressed,
+            first,
+            error_changed,
+        })
+    }
+
+    fn record_success(&mut self, now: StdInstant) -> Option<GetUpdatesRecovery> {
+        if self.consecutive_failures == 0 {
+            return None;
+        }
+
+        let recovery = GetUpdatesRecovery {
+            failures: self.consecutive_failures,
+            downtime: self
+                .started_at
+                .map_or(Duration::ZERO, |started_at| now.duration_since(started_at)),
+        };
+        *self = Self::default();
+        Some(recovery)
+    }
 }
 
 impl Runtime {
@@ -371,14 +446,16 @@ impl Runtime {
         let bot = self.telegram.get_me().await?;
         let bot_username = bot.username;
         if let Some(username) = &bot_username {
-            eprintln!(
-                "tellm {} running as @{username}. Terminal commands: reset, exit, quit.",
-                env!("CARGO_PKG_VERSION")
+            log::info!(
+                target: "tellm",
+                "version={} bot=@{username} status=running terminal_commands=reset,exit,quit",
+                env!("CARGO_PKG_VERSION"),
             );
         } else {
-            eprintln!(
-                "tellm {} running. Terminal commands: reset, exit, quit.",
-                env!("CARGO_PKG_VERSION")
+            log::info!(
+                target: "tellm",
+                "version={} status=running terminal_commands=reset,exit,quit",
+                env!("CARGO_PKG_VERSION"),
             );
         }
 
@@ -399,6 +476,7 @@ impl Runtime {
         };
         let mut dispatchers = BTreeMap::new();
         let mut offset = 0_i64;
+        let mut get_updates_log = GetUpdatesLogState::default();
         let mut terminal_controls_open = true;
         let shutdown_signal = shutdown_signal();
         tokio::pin!(shutdown_signal);
@@ -406,35 +484,43 @@ impl Runtime {
         loop {
             tokio::select! {
                 signal = &mut shutdown_signal => {
-                    eprintln!("Shutdown requested from {signal}.");
+                    log::info!(target: "tellm", "shutdown requested source={signal}");
                     break;
                 }
                 command = self.terminal_rx.recv(), if terminal_controls_open => {
                     match command {
                         Some(TerminalCommand::Reset) => {
                             self.rooms.lock().await.reset_all_history();
-                            eprintln!("All in-memory chat histories cleared; room settings kept.");
+                            log::info!(target: "tellm::terminal", "all in-memory chat histories cleared; room settings kept");
                         }
                         Some(TerminalCommand::Shutdown) => {
-                            eprintln!("Shutdown requested from terminal.");
+                            log::info!(target: "tellm", "shutdown requested source=terminal");
                             break;
                         }
                         None => {
                             terminal_controls_open = false;
-                            eprintln!("Terminal input closed; terminal controls disabled.");
+                            log::warn!(target: "tellm::terminal", "input closed; terminal controls disabled");
                         }
                     }
                 }
                 reason = self.shutdown_rx.recv() => {
                     match reason {
-                        Some(ShutdownReason::Telegram) => eprintln!("Shutdown requested from Telegram."),
-                        None => eprintln!("Shutdown requested."),
+                        Some(ShutdownReason::Telegram) => log::info!(target: "tellm", "shutdown requested source=telegram"),
+                        None => log::info!(target: "tellm", "shutdown requested source=internal"),
                     }
                     break;
                 }
                 updates = self.telegram.get_updates(offset, LONG_POLL_TIMEOUT_S) => {
                     match updates {
                         Ok(updates) => {
+                            if let Some(recovery) = get_updates_log.record_success(StdInstant::now()) {
+                                log::info!(
+                                    target: "tellm::telegram",
+                                    "getUpdates recovered failures={} downtime={}",
+                                    recovery.failures,
+                                    format_log_duration(recovery.downtime),
+                                );
+                            }
                             for mut update in updates {
                                 offset = offset.max(update.update_id + 1);
                                 if let Some(membership) = update.my_chat_member.take() {
@@ -454,8 +540,31 @@ impl Runtime {
                             }
                         }
                         Err(error) => {
-                            eprintln!("Telegram getUpdates failed: {error}");
-                            sleep(Duration::from_secs(2)).await;
+                            let error = error.to_string();
+                            if let Some(report) = get_updates_log.record_failure(&error, StdInstant::now()) {
+                                if report.first {
+                                    log::warn!(
+                                        target: "tellm::telegram",
+                                        "getUpdates failed consecutive_failures=1 error={error:?} retry_in={}s",
+                                        GET_UPDATES_RETRY_DELAY.as_secs(),
+                                    );
+                                } else {
+                                    let status = if report.error_changed {
+                                        "failure changed"
+                                    } else {
+                                        "still failing"
+                                    };
+                                    log::warn!(
+                                        target: "tellm::telegram",
+                                        "getUpdates {status} consecutive_failures={} elapsed={} suppressed={} error={error:?} retry_in={}s",
+                                        report.consecutive_failures,
+                                        format_log_duration(report.elapsed),
+                                        report.suppressed,
+                                        GET_UPDATES_RETRY_DELAY.as_secs(),
+                                    );
+                                }
+                            }
+                            sleep(GET_UPDATES_RETRY_DELAY).await;
                         }
                     }
                 }
@@ -472,12 +581,16 @@ impl Runtime {
 
         stop_chat_workers(dispatchers, &workers).await;
         if let Err(error) = handles.persistence.shutdown().await {
-            eprintln!("failed to flush persistence writer during shutdown: {error}");
+            log::error!(target: "tellm::persistence", "shutdown flush failed error={error:?}");
         }
         match spawn_blocking(move || persistence_thread.join()).await {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => eprintln!("persistence writer panicked during shutdown"),
-            Err(error) => eprintln!("failed to join persistence writer: {error}"),
+            Ok(Err(_)) => {
+                log::error!(target: "tellm::persistence", "writer panicked during shutdown")
+            }
+            Err(error) => {
+                log::error!(target: "tellm::persistence", "writer join failed error={error:?}")
+            }
         }
         stop_started_ollama().await;
         Ok(())
@@ -518,7 +631,10 @@ impl Runtime {
                     let changed = match persisted {
                         Ok(changed) => changed,
                         Err(error) => {
-                            eprintln!("failed to persist auto-approved chat {chat_id}: {error}");
+                            log::error!(
+                                target: "tellm::persistence",
+                                "auto-approved chat save failed chat_id={chat_id} error={error:?}"
+                            );
                             return;
                         }
                     };
@@ -526,12 +642,12 @@ impl Runtime {
                         let mut access = self.access.lock().await;
                         access.allow_chat(chat_id);
                     }
-                    eprintln!(
-                        "Auto-approved chat {label}: added by owner user {user_id}{}.",
-                        if changed { "" } else { " (already allowed)" }
+                    log::info!(
+                        target: "tellm::access",
+                        "chat auto-approved chat={label:?} owner_user_id={user_id} changed={changed}"
                     );
                     if chat_id < 0 {
-                        eprintln!("{}", group_privacy_hint(chat_id));
+                        log::warn!(target: "tellm::telegram", "{}", group_privacy_hint(chat_id));
                     }
                     let setup = room_setup_reply(chat_id, false, handles).await;
                     let handles = handles.clone();
@@ -547,22 +663,26 @@ impl Runtime {
                 };
                 match pairing {
                     Some(pairing) => {
-                        eprintln!(
-                            "Added to chat {label}. Pairing code: {} — send /pair {} in that \
-                             chat to approve it (or an owner sends /allow {chat_id}).",
-                            pairing.code, pairing.code
+                        log::info!(
+                            target: "tellm::access",
+                            "added to chat chat={label:?} pairing_code={} action=\"send /pair {} in that chat, or /allow {chat_id} from an owner\"",
+                            pairing.code,
+                            pairing.code,
                         );
                         if chat_id < 0 {
-                            eprintln!("{}", group_privacy_hint(chat_id));
+                            log::warn!(target: "tellm::telegram", "{}", group_privacy_hint(chat_id));
                         }
                     }
-                    None => eprintln!("Added to already-allowed chat {label}."),
+                    None => log::info!(
+                        target: "tellm::access",
+                        "added to already-allowed chat chat={label:?}"
+                    ),
                 }
             }
             "left" | "kicked" => {
-                eprintln!(
-                    "Removed from chat {label}. An owner can use /deny {chat_id} to also \
-                     clear its access and room state."
+                log::info!(
+                    target: "tellm::access",
+                    "removed from chat chat={label:?} action=\"an owner can use /deny {chat_id} to clear access and room state\""
                 );
             }
             _ => {}
@@ -593,9 +713,11 @@ impl Runtime {
                     if let Some(pairing) = access.arm_room(chat_id, now_access_time())
                         && pairing.newly_issued
                     {
-                        eprintln!(
-                            "Pairing code for chat {chat_id}: {} — send /pair {} in that chat to approve it.",
-                            pairing.code, pairing.code
+                        log::info!(
+                            target: "tellm::access",
+                            "pairing code issued chat_id={chat_id} pairing_code={} action=\"send /pair {} in that chat\"",
+                            pairing.code,
+                            pairing.code,
                         );
                     }
                 }
@@ -605,7 +727,10 @@ impl Runtime {
                     log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Command);
                     let pairer = message.from.as_ref().map(|user| user.id);
                     if let Err(error) = handle_pair_attempt(chat_id, code, pairer, handles).await {
-                        eprintln!("pairing attempt for chat {chat_id} failed: {error}");
+                        log::warn!(
+                            target: "tellm::access",
+                            "pairing attempt failed chat_id={chat_id} error={error:?}"
+                        );
                     }
                 } else if send_hint {
                     log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
@@ -643,7 +768,10 @@ fn send_to_chat_worker(
     let message = match dispatcher.sender.try_send(message) {
         Ok(()) => return,
         Err(TrySendError::Full(_)) => {
-            eprintln!("chat {chat_id} queue is full; dropping message");
+            log::warn!(
+                target: "tellm::dispatcher",
+                "chat queue full; dropping message chat_id={chat_id}"
+            );
             let should_send_notice =
                 reserve_queue_full_notice(&handles.queue_full_notices, chat_id);
             if should_send_notice {
@@ -668,7 +796,10 @@ fn send_to_chat_worker(
 
     let dispatcher = spawn_chat_worker(chat_id, handles.clone());
     if dispatcher.sender.try_send(message).is_err() {
-        eprintln!("chat {chat_id} dispatch failed: fresh worker rejected the message");
+        log::error!(
+            target: "tellm::dispatcher",
+            "fresh worker rejected message chat_id={chat_id}"
+        );
     }
     dispatchers.insert(chat_id, dispatcher);
 }
@@ -711,7 +842,10 @@ fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
                     if let Err(error) =
                         handle_allowed_message(chat_id, message, &handles, &worker_cancelled).await
                     {
-                        eprintln!("chat {chat_id} dispatch failed: {error}");
+                        log::warn!(
+                            target: "tellm::dispatcher",
+                            "chat dispatch failed chat_id={chat_id} error={error:?}"
+                        );
                         if worker_can_reply(chat_id, &handles, &worker_cancelled).await {
                             let _ = handles
                                 .telegram
@@ -722,7 +856,10 @@ fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    eprintln!("chat {chat_id} idle; reaping dispatcher task.");
+                    log::debug!(
+                        target: "tellm::dispatcher",
+                        "idle task reaped chat_id={chat_id}"
+                    );
                     break;
                 }
             }
@@ -797,7 +934,10 @@ async fn stop_chat_workers(dispatchers: BTreeMap<i64, ChatDispatcher>, workers: 
         if let Err(error) = handle.await
             && !error.is_cancelled()
         {
-            eprintln!("chat {chat_id} worker join failed during shutdown: {error}");
+            log::error!(
+                target: "tellm::dispatcher",
+                "worker join failed during shutdown chat_id={chat_id} error={error:?}"
+            );
         }
     }
 }
@@ -1223,7 +1363,10 @@ async fn handle_model_message(
             // This reply IS the error handling — returning Err here would
             // make the chat worker send a second "tellm error" message for
             // the same failure.
-            eprintln!("chat {chat_id} model call failed: {error}");
+            log::warn!(
+                target: "tellm::model",
+                "call failed chat_id={chat_id} error={error:?}"
+            );
             if restored && worker_can_reply(chat_id, handles, cancelled).await {
                 let _ = handles
                     .telegram
@@ -1368,14 +1511,17 @@ async fn ensure_local_ollama_ready(base_url: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    eprintln!("local Ollama endpoint {base_url} is not reachable; starting `ollama serve`");
+    log::info!(
+        target: "tellm::ollama",
+        "local endpoint unreachable; starting `ollama serve` base_url={base_url:?}"
+    );
     start_ollama_serve().await?;
 
     let deadline = TokioInstant::now() + OLLAMA_START_WAIT;
     loop {
         sleep(OLLAMA_READY_POLL).await;
         if tcp_connects(addr.clone()).await? {
-            eprintln!("local Ollama endpoint {base_url} is ready");
+            log::info!(target: "tellm::ollama", "local endpoint ready base_url={base_url:?}");
             return Ok(());
         }
         if TokioInstant::now() >= deadline {
@@ -1434,7 +1580,7 @@ async fn start_ollama_serve() -> Result<(), String> {
     *ollama_child()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
-    eprintln!("started `ollama serve` with pid {pid}");
+    log::info!(target: "tellm::ollama", "started `ollama serve` pid={pid}");
     Ok(())
 }
 
@@ -1444,9 +1590,13 @@ async fn stop_started_ollama() {
     };
     unload_started_ollama_models().await;
     match spawn_blocking(move || child.stop()).await {
-        Ok(Ok(message)) => eprintln!("{message}"),
-        Ok(Err(error)) => eprintln!("failed to stop spawned Ollama process: {error}"),
-        Err(error) => eprintln!("failed to join Ollama shutdown task: {error}"),
+        Ok(Ok(message)) => log::info!(target: "tellm::ollama", "{message}"),
+        Ok(Err(error)) => {
+            log::error!(target: "tellm::ollama", "spawned process stop failed error={error:?}")
+        }
+        Err(error) => {
+            log::error!(target: "tellm::ollama", "shutdown task join failed error={error:?}")
+        }
     }
 }
 
@@ -1456,8 +1606,10 @@ fn stop_started_ollama_blocking() {
     };
     unload_started_ollama_models_blocking();
     match child.stop() {
-        Ok(message) => eprintln!("{message}"),
-        Err(error) => eprintln!("failed to stop spawned Ollama process: {error}"),
+        Ok(message) => log::info!(target: "tellm::ollama", "{message}"),
+        Err(error) => {
+            log::error!(target: "tellm::ollama", "spawned process stop failed error={error:?}")
+        }
     }
 }
 
@@ -1494,13 +1646,16 @@ fn unload_started_ollama_models_blocking() {
 
 fn log_ollama_unload_summary(summary: OllamaUnloadSummary) {
     for model in summary.unloaded {
-        eprintln!("unloaded Ollama model {model}");
+        log::info!(target: "tellm::ollama", "model unloaded model={model:?}");
     }
     for model in summary.not_loaded {
-        eprintln!("Ollama model {model} was already not loaded");
+        log::info!(target: "tellm::ollama", "model already not loaded model={model:?}");
     }
     for (model, error) in summary.failed {
-        eprintln!("failed to unload Ollama model {model}: {error}");
+        log::warn!(
+            target: "tellm::ollama",
+            "model unload failed model={model:?} error={error:?}"
+        );
     }
 }
 
@@ -1945,7 +2100,11 @@ async fn handle_allow_chat(
     }
 
     if target_chat_id < 0 {
-        eprintln!("{}", group_privacy_hint(target_chat_id));
+        log::warn!(
+            target: "tellm::telegram",
+            "{}",
+            group_privacy_hint(target_chat_id)
+        );
     }
 
     // The approved room gets the setup prompt too — approval via /allow must
@@ -2071,7 +2230,7 @@ async fn handle_pair_attempt(
                 access.add_owner(user_id);
             }
             if chat_id < 0 {
-                eprintln!("{}", group_privacy_hint(chat_id));
+                log::warn!(target: "tellm::telegram", "{}", group_privacy_hint(chat_id));
             }
             let setup = room_setup_reply(chat_id, became_owner, handles).await;
             send_room_setup(chat_id, setup, handles).await
@@ -2085,7 +2244,10 @@ async fn handle_pair_attempt(
                 access.room_code(chat_id).map(str::to_string)
             };
             if let Some(code) = current_code {
-                eprintln!("Current pairing code for chat {chat_id}: {code}");
+                log::info!(
+                    target: "tellm::access",
+                    "current pairing code chat_id={chat_id} pairing_code={code}"
+                );
             }
             send_command_reply(
                 handles,
@@ -2302,8 +2464,9 @@ async fn prompt_and_store_secret(
         reserve_terminal_secret_prompt(&handles.terminal_prompts, secret_name.clone())?;
 
     send_command_reply(handles, chat_id, prompt_notice).await?;
-    eprintln!(
-        "Telegram requested secret {secret_name}. Enter it in this terminal (visible, like first-run setup); press Enter to skip."
+    log::info!(
+        target: "tellm::secrets",
+        "secret requested from Telegram key={secret_name} action=\"enter it in this terminal; press Enter to skip\""
     );
     print_terminal_secret_prompt(&secret_name);
 
@@ -2321,7 +2484,7 @@ async fn prompt_and_store_secret(
             PromptedSecret::Stored(destination) => return Ok(Some(destination)),
             PromptedSecret::Skipped => return Ok(None),
             PromptedSecret::Retry(message) => {
-                eprintln!("{message}");
+                log::warn!(target: "tellm::secrets", "{message}");
                 print_terminal_secret_prompt(&secret_name);
             }
         }
@@ -2510,7 +2673,10 @@ fn spawn_typing_indicator(telegram: Telegram, chat_id: i64) -> JoinHandle<()> {
         loop {
             let result: Result<(), TelegramError> = telegram.send_chat_action(chat_id).await;
             if let Err(error) = result {
-                eprintln!("sendChatAction failed for chat {chat_id}: {error}");
+                log::warn!(
+                    target: "tellm::telegram",
+                    "sendChatAction failed chat_id={chat_id} error={error:?}"
+                );
             }
             sleep(TYPING_INTERVAL).await;
         }
@@ -2527,7 +2693,10 @@ fn spawn_terminal_controls(
             let line = match line {
                 Ok(line) => line,
                 Err(error) => {
-                    eprintln!("terminal input read failed; ignoring line: {error}");
+                    log::warn!(
+                        target: "tellm::terminal",
+                        "input read failed; ignoring line error={error:?}"
+                    );
                     continue;
                 }
             };
@@ -2546,7 +2715,10 @@ fn spawn_terminal_controls(
                     break;
                 }
                 "" => {}
-                _ => eprintln!("terminal commands: reset, exit, quit"),
+                _ => log::info!(
+                    target: "tellm::terminal",
+                    "available commands: reset, exit, quit"
+                ),
             }
         }
         let _ = take_terminal_secret_prompt(&secret_prompts);
@@ -2627,7 +2799,10 @@ enum PromptedSecret {
 fn store_prompted_secret(secret_name: &str, value: &str) -> Result<PromptedSecret, String> {
     let value = value.trim();
     if value.is_empty() {
-        eprintln!("No value entered for {secret_name}; secret not changed.");
+        log::info!(
+            target: "tellm::secrets",
+            "no value entered; secret unchanged key={secret_name}"
+        );
         return Ok(PromptedSecret::Skipped);
     }
     if is_terminal_command_word(value) {
@@ -2656,31 +2831,44 @@ fn print_terminal_secret_prompt(secret_name: &str) {
 fn print_startup_notice(notice: crate::access::StartupNotice) {
     match notice {
         crate::access::StartupNotice::PairingMode => {
-            eprintln!(
-                "No chats are allowed yet. A pairing code is printed here the moment a chat \
-                 messages the bot or the bot is added to a group; approve with /pair CODE in \
-                 that chat."
+            log::info!(
+                target: "tellm::access",
+                "allowed_chats=0 mode=pairing action=\"approve the console pairing code with /pair CODE in that chat\""
             );
         }
         crate::access::StartupNotice::Restricted { allowed_chat_count } => {
-            eprintln!(
-                "{allowed_chat_count} chat(s) are allowed (allowlist + model room pins). New \
-                 chats get a pairing code printed here on first contact, or an owner \
-                 can send /allow."
+            log::info!(
+                target: "tellm::access",
+                "allowed_chats={allowed_chat_count} source=\"allowlist + model room pins\" new_chat_access=\"pairing code or owner /allow\""
             );
         }
     }
 }
 
 fn print_group_privacy_hints(chat_ids: &BTreeSet<i64>) {
-    for chat_id in chat_ids {
-        eprintln!("{}", group_privacy_hint(*chat_id));
+    if chat_ids.is_empty() {
+        return;
     }
+
+    log::warn!(
+        target: "tellm::telegram",
+        "group chats detected count={} action=\"if plain text is ignored, disable privacy mode with BotFather /setprivacy and re-add the bot\"",
+        chat_ids.len(),
+    );
+    log::debug!(
+        target: "tellm::telegram",
+        "group_chat_ids=[{}]",
+        chat_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
 }
 
 fn group_privacy_hint(chat_id: i64) -> String {
     format!(
-        "group chat detected (chat_id={chat_id}) - if the bot ignores plain text, disable privacy mode via BotFather (/setprivacy) and re-add the bot to the group"
+        "group chat detected chat_id={chat_id} action=\"if plain text is ignored, disable privacy mode with BotFather /setprivacy and re-add the bot\""
     )
 }
 
@@ -2701,15 +2889,30 @@ fn allowed_group_chat_ids(config: &AccessConfig) -> BTreeSet<i64> {
 }
 
 fn log_update_route(chat_id: i64, kind: UpdateKind, route: UpdateRoute) {
-    eprintln!("{}", update_log_line(chat_id, kind, route));
+    log::debug!(
+        target: "tellm::telegram",
+        "{}",
+        update_log_line(chat_id, kind, route)
+    );
 }
 
 fn update_log_line(chat_id: i64, kind: UpdateKind, route: UpdateRoute) -> String {
     format!(
-        "telegram update: chat_id={chat_id} kind={} route={}",
+        "update chat_id={chat_id} kind={} route={}",
         kind.as_str(),
         route.as_str()
     )
+}
+
+fn format_log_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{millis}ms");
+    }
+    if millis.is_multiple_of(1_000) {
+        return format!("{}s", millis / 1_000);
+    }
+    format!("{}.{:03}s", millis / 1_000, millis % 1_000)
 }
 
 fn now_access_time() -> AccessTime {
@@ -2796,19 +2999,18 @@ fn warm_configured_provider_secrets(config: &Config) {
         return;
     }
 
-    eprintln!(
-        "Checking configured provider secrets on startup: {}",
-        secret_names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(", ")
+    log::info!(
+        target: "tellm::secrets",
+        "checking configured provider secrets count={} keys=[{}]",
+        secret_names.len(),
+        secret_names.join(","),
     );
 
     for secret_name in secret_names {
         if secrets::get(&secret_name).is_none() {
-            eprintln!(
-                "Provider secret \"{secret_name}\" is not available yet; model calls that require it will fail until it is stored."
+            log::warn!(
+                target: "tellm::secrets",
+                "provider secret unavailable key={secret_name} impact=\"dependent model calls will fail until it is stored\""
             );
         }
     }
@@ -3838,12 +4040,68 @@ mod tests {
     fn update_log_line_contains_only_metadata() {
         assert_eq!(
             update_log_line(-100, UpdateKind::Message, UpdateRoute::Model),
-            "telegram update: chat_id=-100 kind=message route=model"
+            "update chat_id=-100 kind=message route=model"
         );
         assert_eq!(
             update_log_line(42, UpdateKind::EditedMessage, UpdateRoute::Ignored),
-            "telegram update: chat_id=42 kind=edited_message route=ignored"
+            "update chat_id=42 kind=edited_message route=ignored"
         );
+    }
+
+    #[test]
+    fn get_updates_failures_are_rate_limited_and_recovery_resets_state() {
+        let start = StdInstant::now();
+        let mut state = GetUpdatesLogState::default();
+
+        assert_eq!(
+            state.record_failure("502 Bad Gateway", start),
+            Some(GetUpdatesFailureReport {
+                consecutive_failures: 1,
+                elapsed: Duration::ZERO,
+                suppressed: 0,
+                first: true,
+                error_changed: false,
+            })
+        );
+        assert_eq!(
+            state.record_failure("502 Bad Gateway", start + Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            state.record_failure("request send failed", start + Duration::from_secs(4)),
+            Some(GetUpdatesFailureReport {
+                consecutive_failures: 3,
+                elapsed: Duration::from_secs(4),
+                suppressed: 1,
+                first: false,
+                error_changed: true,
+            })
+        );
+        assert_eq!(
+            state.record_failure("request send failed", start + Duration::from_secs(34)),
+            Some(GetUpdatesFailureReport {
+                consecutive_failures: 4,
+                elapsed: Duration::from_secs(34),
+                suppressed: 0,
+                first: false,
+                error_changed: false,
+            })
+        );
+        assert_eq!(
+            state.record_success(start + Duration::from_secs(36)),
+            Some(GetUpdatesRecovery {
+                failures: 4,
+                downtime: Duration::from_secs(36),
+            })
+        );
+        assert_eq!(state.record_success(start + Duration::from_secs(37)), None);
+    }
+
+    #[test]
+    fn log_duration_uses_milliseconds_until_a_full_second() {
+        assert_eq!(format_log_duration(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_log_duration(Duration::from_secs(2)), "2s");
+        assert_eq!(format_log_duration(Duration::from_millis(2_125)), "2.125s");
     }
 
     #[test]
