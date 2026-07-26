@@ -83,9 +83,9 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         key: "gemini",
-        label: "Google Gemini 3.5 Flash",
+        label: "Google Gemini 3.6 Flash",
         wire_format: WireFormat::Gemini,
-        model_name: "gemini-3.5-flash",
+        model_name: "gemini-3.6-flash",
         base_url: None,
         api_key_secret: secrets::GEMINI_API_KEY,
     },

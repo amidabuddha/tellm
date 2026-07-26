@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 fn request() -> ChatRequest {
     ChatRequest {
-        model: "gemini-3.5-flash".to_string(),
+        model: "gemini-3.6-flash".to_string(),
         system: Some("Be concise.".to_string()),
         history: vec![
             json!({
@@ -100,7 +100,7 @@ async fn chat_maps_request_and_preserves_steps_verbatim() {
         200,
         json!({
             "id": "interaction-1",
-            "model": "gemini-3.5-flash",
+            "model": "gemini-3.6-flash",
             "status": "completed",
             "steps": steps
         }),
@@ -121,7 +121,7 @@ async fn chat_maps_request_and_preserves_steps_verbatim() {
     assert_eq!(requests[0].header("x-goog-api-key"), Some("test-key"));
 
     let body = requests[0].json_body();
-    assert_eq!(body["model"], "gemini-3.5-flash");
+    assert_eq!(body["model"], "gemini-3.6-flash");
     assert_eq!(body["system_instruction"], "Be concise.");
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], false);

@@ -1,8 +1,9 @@
 //! Google Gemini Interactions API client (`POST /v1beta/interactions`).
 //!
-//! Mapping notes (checked 2026-07-05 against ai.google.dev Interactions API,
-//! API key, thinking, Google Search, and image generation docs — re-check
-//! live provider docs before changing these mappings):
+//! Mapping notes (checked 2026-07-26 against ai.google.dev Interactions API,
+//! Gemini 3.6 Flash migration, API key, thinking, Google Search, and image
+//! generation docs — re-check live provider docs before changing these
+//! mappings):
 //! - State: `store: false`; stateless history is carried as raw Interactions
 //!   `Step` objects in `ChatRequest::history` and replayed via `input`.
 //! - Turn items: return the new `user_input` step plus EVERY response step
@@ -11,6 +12,8 @@
 //!   signatures back unchanged on future turns.
 //! - Thinking: `generation_config.thinking_level` for low/medium/high; omit
 //!   for `Off`; map `Max` to `high` because Interactions has no `max`.
+//!   Gemini 3.6 Flash supports all three mapped levels. Requests do not send
+//!   its deprecated sampling parameters and always end in a `user_input` step.
 //! - Web search: `tools: [{type: "google_search", search_types:
 //!   ["web_search"]}]`.
 //! - Images/documents: native `image` and `document` content blocks with

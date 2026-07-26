@@ -85,6 +85,7 @@ state, so:
   request/response pair is never split.
 
 Thinking-level translation (verified against live provider docs 2026-07-05;
+Gemini 3.6 Flash refreshed 2026-07-26;
 OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10; Anthropic Claude
 Opus 5 refreshed 2026-07-26):
 
@@ -109,7 +110,7 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   the user can lower the room's level.
 - Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
   model should be configured with `thinking = "low"` or `thinking = "high"`;
-  gemini-3.1-pro and 3.5-flash accept medium.
+  gemini-3.1-pro and 3.6-flash accept medium.
 - Anthropic always sends `max_tokens: 16000`: thinking tokens count toward
   `max_tokens`, and 4096 risked mid-thought truncation at high/max effort.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
@@ -161,8 +162,10 @@ Notes:
   documents are reported as unsupported before any provider call.
 - Gemini Interactions uses `POST /v1beta/interactions`, `x-goog-api-key`,
   `store:false`, `stream:false`, `system_instruction`, and stateless `input`
-  as an array of Interactions `Step` objects (checked 2026-07-05 against
-  ai.google.dev). Raw response `steps` are replayed through `turn_items`
+  as an array of Interactions `Step` objects (checked 2026-07-26 against
+  ai.google.dev for Gemini 3.6 Flash). Requests omit deprecated sampling
+  parameters and end in a `user_input` step, never a prefilled model turn.
+  Raw response `steps` are replayed through `turn_items`
   verbatim, including `thought` and Google Search call/result signatures.
   Web search is `tools: [{type:"google_search",
   search_types:["web_search"]}]`; image generation is allowed only for Gemini
@@ -397,7 +400,7 @@ restart and local room-setting changes.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
   from the built-in list (checked 2026-07-26: Claude Opus 5, GPT-5.6 Sol,
-  Grok 4.5, Muse Spark 1.1, Gemini 3.5 Flash), stores Telegram/provider
+  Grok 4.5, Muse Spark 1.1, Gemini 3.6 Flash), stores Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather
   than repeatedly prompting on a closed input stream.

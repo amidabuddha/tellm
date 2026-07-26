@@ -147,7 +147,7 @@ thinking = "max"
 
 [models.gemini]
 wire_format = "gemini"
-model_name = "gemini-3.5-flash"
+model_name = "gemini-3.6-flash"
 api_key_secret = "gemini_api_key"
 telegram_chat_ids = []
 thinking = "high"
