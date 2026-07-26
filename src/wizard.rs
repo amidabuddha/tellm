@@ -38,8 +38,11 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
     }
 }
 
-// Checked 2026-07-04 against platform.claude.com model docs,
-// developers.openai.com API model docs, and docs.x.ai model docs.
+// Checked 2026-07-26 against platform.claude.com model docs: Claude Opus 5
+// uses ID claude-opus-5 and is Anthropic's recommended starting model for
+// complex agentic coding and enterprise work.
+// Checked 2026-07-04 against developers.openai.com API model docs and
+// docs.x.ai model docs.
 // Checked 2026-07-09 against dev.meta.ai Model API docs for Muse Spark.
 // Checked 2026-07-09 against docs.x.ai model docs for Grok 4.5.
 // Checked 2026-07-10 against developers.openai.com API model docs: GPT-5.6
@@ -48,9 +51,9 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
-        label: "Anthropic Claude Fable 5",
+        label: "Anthropic Claude Opus 5",
         wire_format: WireFormat::Anthropic,
-        model_name: "claude-fable-5",
+        model_name: "claude-opus-5",
         base_url: None,
         api_key_secret: secrets::ANTHROPIC_API_KEY,
     },
@@ -263,6 +266,15 @@ mod tests {
         assert_eq!(model.base_url.as_deref(), Some(tellm_openai::XAI_BASE_URL));
         assert_eq!(model.api_key_secret.as_deref(), Some(secrets::XAI_API_KEY));
         assert!(model.telegram_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn anthropic_preset_uses_claude_opus_5() {
+        let preset = preset_by_key("anthropic").unwrap();
+
+        assert_eq!(preset.label, "Anthropic Claude Opus 5");
+        assert_eq!(preset.model_name, "claude-opus-5");
+        assert_eq!(preset.wire_format, WireFormat::Anthropic);
     }
 
     #[test]

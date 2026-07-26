@@ -117,7 +117,7 @@ owner_user_ids = []
 
 [models.claude]
 wire_format = "anthropic"
-model_name = "claude-fable-5"
+model_name = "claude-opus-5"
 api_key_secret = "anthropic_api_key"
 telegram_chat_ids = []
 thinking = "max"

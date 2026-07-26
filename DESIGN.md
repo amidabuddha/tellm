@@ -85,7 +85,8 @@ state, so:
   request/response pair is never split.
 
 Thinking-level translation (verified against live provider docs 2026-07-05;
-OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10):
+OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10; Anthropic Claude
+Opus 5 refreshed 2026-07-26):
 
 | Level | Anthropic Messages | OpenAI Responses | xAI Responses | Chat completions | Gemini |
 |---|---|---|---|---|---|
@@ -93,10 +94,12 @@ OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10):
 | low/medium/high | adaptive + `output_config.effort` | `reasoning: {effort}` | same | `reasoning_effort` | `thinking_level` |
 | max | `effort: "max"` (valid on ALL adaptive models) | `effort: "max"` on GPT-5.6, otherwise `"xhigh"` | clamps to `"high"` (grok-4.5 has no xhigh) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
 
-Validity caveats (OpenAI refreshed 2026-07-10):
-- **"off" means provider default everywhere, not "no thinking"**: Sonnet 5 /
-  Fable 5 think anyway, gpt-5.6-sol reasons at its own default, grok-4.5 defaults to high,
-  Gemini thinks dynamically. User-facing text must say "default", not "off".
+Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
+2026-07-26):
+- **"off" means provider default everywhere, not "no thinking"**: Opus 5,
+  Sonnet 5, and Fable 5 think anyway; gpt-5.6-sol reasons at its own default;
+  grok-4.5 defaults to high; Gemini thinks dynamically. User-facing text must
+  say "default", not "off".
 - OpenAI effort is model-dependent: the built-in GPT-5.6 Sol preset supports
   `max`, while older OpenAI families top out at `xhigh`. `/reasoning max`
   therefore sends `max` to GPT-5.6 and `xhigh` to older OpenAI models and Meta
@@ -393,7 +396,7 @@ restart and local room-setting changes.
   No encrypted-file theater.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
-  from the built-in list (checked 2026-07-10: Claude Fable 5, GPT-5.6 Sol,
+  from the built-in list (checked 2026-07-26: Claude Opus 5, GPT-5.6 Sol,
   Grok 4.5, Muse Spark 1.1, Gemini 3.5 Flash), stores Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather
