@@ -51,10 +51,12 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | root binary | Runtime loop, command router, sessions, pairing, wizard, local Ollama lifecycle |
 
 Inside the root binary, runtime-owned concerns are split into
-`src/{runtime,wizard,rooms,access,commands,ollama}.rs`. The private `ollama`
-module owns recognition and lifecycle management for the narrowly supported
-local endpoint; `tellm-config` deliberately keeps only nonsecret config,
-secret storage, and validation.
+`src/{runtime,persistence,wizard,rooms,access,commands,ollama}.rs`. The private
+`persistence` module owns the ordered blocking writer plus serialized room
+setting snapshots and their rollback semantics. The private `ollama` module
+owns recognition and lifecycle management for the narrowly supported local
+endpoint; `tellm-config` deliberately keeps only nonsecret config, secret
+storage, and validation.
 
 ## Unified parameter set
 
@@ -373,12 +375,14 @@ restart and local room-setting changes.
   same-directory temp files, file sync, and rename, so a crash or concurrent
   writer cannot expose a partial file. Unix parent-directory sync is attempted
   after commit; failure is a durability warning, not a false failed-commit
-  signal. One ordered persistence thread owns runtime config/room writes, so an
-  aborted worker cannot detach an older write that lands after `/deny`. Failed
-  mutations roll settings back without resurrecting invalidated history. The
-  files remain separate transactions: a reported I/O failure between config
-  and room persistence can leave stale room settings on disk, but never restores
-  access or conversation history.
+  signal. The root binary's `persistence` module owns one ordered thread for
+  runtime config/room writes, so an aborted worker cannot detach an older write
+  that lands after `/deny`. It also serializes room setting snapshots: failed
+  ordinary mutations roll settings back without resurrecting invalidated
+  history, while failed denied-room cleanup never restores the in-memory room.
+  The files remain separate transactions: a reported I/O failure between
+  config and room persistence can leave stale room settings on disk, but never
+  restores access or conversation history.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists; model keys are command-safe; model names and secret names are
   nonempty and secret names cannot use tellm's internal marker prefix;

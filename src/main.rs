@@ -4,6 +4,7 @@ mod access;
 mod commands;
 mod console;
 mod ollama;
+mod persistence;
 mod rooms;
 mod runtime;
 mod wizard;
