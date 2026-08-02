@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Golden test vector generator for tellm-telegram pure functions.
 
-The two functions below are VERBATIM copies of the reference implementation
+The functions and predicates below are VERBATIM copies or direct extractions
+from the reference implementation
 in console-chat-gpt (console_gpt/telegram_bot.py, commit a9e560d):
-`_chunk_text` and `_telegram_markdown_to_html`. Do not "improve" them here —
-their exact behavior, quirks included, is the specification.
+`_chunk_text`, `_telegram_markdown_to_html`, and the rich/HTML delivery fallback
+classifiers. Do not "improve" them here — their exact behavior, quirks included,
+is the specification.
 
 Run from this directory:  python3 generate_vectors.py
-Outputs: chunk_text.json, markdown_to_html.json
+Outputs: chunk_text.json, markdown_to_html.json, fallback_classification.json
 
 Note for the Rust implementer: Python string indices are Unicode code
 points, not bytes. The emoji/cyrillic cases exist to fail byte-indexed
@@ -79,6 +81,29 @@ def _telegram_markdown_to_html(text: str) -> str:
     return transformed
 
 
+def _should_fallback_from_rich_message_error(error: RuntimeError) -> bool:
+    error_text = str(error).lower()
+    return any(
+        marker in error_text
+        for marker in (
+            "api error 404",
+            "method not found",
+            "can't parse",
+            "cannot parse",
+            "failed to parse",
+            "can't find end",
+            "unsupported start tag",
+            "unsupported tag",
+        )
+    )
+
+
+def _should_fallback_from_html_message_error(error: RuntimeError) -> bool:
+    # Direct extraction of the predicate in `_send_legacy_message_part`.
+    error_text = str(error).lower()
+    return "parse entities" in error_text or "can't parse entities" in error_text
+
+
 # --- test cases -------------------------------------------------------------
 
 CHUNK_CASES = [
@@ -147,6 +172,30 @@ MD_CASES = [
     ),
 ]
 
+FALLBACK_CASES = [
+    ("rich_api_404", "rich", "Telegram API error 404: not found"),
+    ("rich_method_not_found", "rich", "Bad Request: method not found"),
+    ("rich_cant_parse", "rich", "Bad Request: can't parse rich message"),
+    ("rich_cannot_parse", "rich", "Bad Request: cannot parse payload"),
+    ("rich_failed_to_parse", "rich", "Bad Request: failed to parse block"),
+    ("rich_cant_find_end", "rich", "Bad Request: can't find end of entity"),
+    ("rich_unsupported_start_tag", "rich", "Unsupported start tag \"foo\""),
+    ("rich_unsupported_tag", "rich", "Unsupported tag \"foo\""),
+    ("rich_case_insensitive", "rich", "METHOD NOT FOUND"),
+    ("rich_marker_inside_context", "rich", "remote said: API ERROR 404; retry"),
+    ("rich_html_entity_overlap", "rich", "Bad Request: can't parse entities"),
+    ("rich_chat_not_found", "rich", "Bad Request: chat not found"),
+    ("rich_api_400", "rich", "Telegram API error 400: bad request"),
+    ("rich_unsupported_end_tag", "rich", "Unsupported end tag \"foo\""),
+    ("rich_empty", "rich", ""),
+    ("html_parse_entities", "html", "Bad Request: parse entities failed"),
+    ("html_cant_parse_entities", "html", "Bad Request: can't parse entities"),
+    ("html_case_insensitive", "html", "PARSE ENTITIES"),
+    ("html_generic_parse_failure", "html", "Bad Request: failed to parse block"),
+    ("html_chat_not_found", "html", "Bad Request: chat not found"),
+    ("html_empty", "html", ""),
+]
+
 
 def main() -> None:
     chunk_vectors = [
@@ -162,6 +211,23 @@ def main() -> None:
         {"name": name, "input": text, "expected": _telegram_markdown_to_html(text)}
         for name, text in MD_CASES
     ]
+    fallback_vectors = []
+    for name, classifier, text in FALLBACK_CASES:
+        error = RuntimeError(text)
+        if classifier == "rich":
+            expected = _should_fallback_from_rich_message_error(error)
+        elif classifier == "html":
+            expected = _should_fallback_from_html_message_error(error)
+        else:
+            raise ValueError(f"unknown fallback classifier: {classifier}")
+        fallback_vectors.append(
+            {
+                "name": name,
+                "classifier": classifier,
+                "input": text,
+                "expected": expected,
+            }
+        )
 
     with open("chunk_text.json", "w", encoding="utf-8") as f:
         json.dump(chunk_vectors, f, indent=2, ensure_ascii=False)
@@ -169,8 +235,15 @@ def main() -> None:
     with open("markdown_to_html.json", "w", encoding="utf-8") as f:
         json.dump(md_vectors, f, indent=2, ensure_ascii=False)
         f.write("\n")
+    with open("fallback_classification.json", "w", encoding="utf-8") as f:
+        json.dump(fallback_vectors, f, indent=2, ensure_ascii=False)
+        f.write("\n")
 
-    print(f"wrote {len(chunk_vectors)} chunk_text vectors, {len(md_vectors)} markdown_to_html vectors")
+    print(
+        f"wrote {len(chunk_vectors)} chunk_text vectors, "
+        f"{len(md_vectors)} markdown_to_html vectors, and "
+        f"{len(fallback_vectors)} fallback classification vectors"
+    )
 
 
 if __name__ == "__main__":

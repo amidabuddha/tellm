@@ -7,7 +7,7 @@ pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const LOCKOUT_WINDOW: Duration = Duration::from_secs(5 * 60);
 pub const LOCKOUT_DURATION: Duration = Duration::from_secs(5 * 60);
 pub const MAX_PAIRING_ATTEMPTS: u8 = 5;
-pub const SHUTDOWN_STALE_AFTER: Duration = Duration::from_secs(60);
+pub const PRIVILEGED_COMMAND_STALE_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AccessTime {
@@ -94,9 +94,9 @@ pub enum PairingAttempt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShutdownAccess {
+pub enum PrivilegedAccess {
     Allowed,
-    NotAdmin,
+    NotOwner,
     Stale,
 }
 
@@ -236,16 +236,16 @@ impl AccessControl {
         sender_user_id: Option<i64>,
         message_unix_seconds: u64,
         now: AccessTime,
-    ) -> ShutdownAccess {
+    ) -> PrivilegedAccess {
         if !sender_user_id.is_some_and(|user_id| self.owner_user_ids.contains(&user_id)) {
-            return ShutdownAccess::NotAdmin;
+            return PrivilegedAccess::NotOwner;
         }
         if now.as_unix_seconds().saturating_sub(message_unix_seconds)
-            > SHUTDOWN_STALE_AFTER.as_secs()
+            > PRIVILEGED_COMMAND_STALE_AFTER.as_secs()
         {
-            return ShutdownAccess::Stale;
+            return PrivilegedAccess::Stale;
         }
-        ShutdownAccess::Allowed
+        PrivilegedAccess::Allowed
     }
 
     /// The currently armed code for a room, if any (does not rotate).
@@ -587,20 +587,20 @@ mod tests {
 
         assert_eq!(
             access.check_privileged(Some(2), 100, time(100)),
-            ShutdownAccess::NotAdmin
+            PrivilegedAccess::NotOwner
         );
         assert_eq!(
             access.check_privileged(None, 100, time(100)),
-            ShutdownAccess::NotAdmin,
+            PrivilegedAccess::NotOwner,
             "anonymous senders (no from) are never privileged"
         );
         assert_eq!(
             access.check_privileged(Some(1), 39, time(100)),
-            ShutdownAccess::Stale
+            PrivilegedAccess::Stale
         );
         assert_eq!(
             access.check_privileged(Some(1), 40, time(100)),
-            ShutdownAccess::Allowed
+            PrivilegedAccess::Allowed
         );
     }
 
@@ -611,13 +611,13 @@ mod tests {
         // P1 lesson: promotion must take effect without a restart.
         assert_eq!(
             access.check_privileged(Some(7), 100, time(100)),
-            ShutdownAccess::NotAdmin
+            PrivilegedAccess::NotOwner
         );
         access.add_owner(7);
         assert!(access.is_owner(7));
         assert_eq!(
             access.check_privileged(Some(7), 100, time(100)),
-            ShutdownAccess::Allowed
+            PrivilegedAccess::Allowed
         );
 
         // Owners are people, not chats: denying a chat does not revoke
@@ -625,7 +625,7 @@ mod tests {
         access.deny_chat(7);
         assert_eq!(
             access.check_privileged(Some(7), 100, time(100)),
-            ShutdownAccess::Allowed
+            PrivilegedAccess::Allowed
         );
     }
 

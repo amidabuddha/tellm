@@ -11,7 +11,7 @@ pub struct CommandContext<'a> {
     pub model_keys: &'a BTreeSet<String>,
     pub pinned_model_key: Option<&'a str>,
     pub model_thinking: ThinkingLevel,
-    pub shutdown_access: access::ShutdownAccess,
+    pub privileged_access: access::PrivilegedAccess,
     pub capabilities: RoomCapabilities,
 }
 
@@ -176,9 +176,9 @@ pub enum CommandReject {
     PinnedModel {
         model_key: String,
     },
-    AdminNotAllowed,
-    AdminStale,
-    ShutdownNotAdmin,
+    OwnerNotAllowed,
+    OwnerStale,
+    ShutdownNotOwner,
     ShutdownStale,
     CapabilityUnsupported {
         feature: String,
@@ -215,11 +215,11 @@ pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) 
         KnownCommand::ImageGeneration => {
             route_image_generation(args, context.settings, &context.capabilities)
         }
-        KnownCommand::Allow => route_chat_approval(command, args, context.shutdown_access),
-        KnownCommand::Deny => route_chat_approval(command, args, context.shutdown_access),
+        KnownCommand::Allow => route_chat_approval(command, args, context.privileged_access),
+        KnownCommand::Deny => route_chat_approval(command, args, context.privileged_access),
         KnownCommand::Pair => route_pair(args),
-        KnownCommand::Ollama => route_ollama(args, context.shutdown_access),
-        KnownCommand::Shutdown => route_shutdown(context.shutdown_access),
+        KnownCommand::Ollama => route_ollama(args, context.privileged_access),
+        KnownCommand::Shutdown => route_shutdown(context.privileged_access),
         KnownCommand::Help => CommandAction::Help {
             pinned_model_key: context.pinned_model_key.map(str::to_string),
         },
@@ -282,18 +282,18 @@ fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
         };
     };
 
-    // pin/unpin are admin operations and must work in pinned rooms too, so
+    // pin/unpin are owner-only operations and must work in pinned rooms too, so
     // they are routed before the pinned-room rejection.
     match value.to_ascii_lowercase().as_str() {
         "pin" => return route_model_pin(args, context),
         "unpin" => {
-            return match admin_gate(context.shutdown_access) {
+            return match owner_gate(context.privileged_access) {
                 Some(reject) => reject,
                 None => CommandAction::UnpinModel,
             };
         }
         "add" => {
-            return match admin_gate(context.shutdown_access) {
+            return match owner_gate(context.privileged_access) {
                 Some(reject) => reject,
                 None => match args.split_whitespace().nth(1) {
                     Some(preset_key) => CommandAction::AddModel {
@@ -440,24 +440,24 @@ fn capability_reject(feature: &str, capabilities: &RoomCapabilities) -> CommandA
     }
 }
 
-/// Admin gate shared by /allow, /deny, and /model pin|unpin. Returns the
-/// rejection when the caller isn't an allowed, fresh admin message.
-fn admin_gate(access: access::ShutdownAccess) -> Option<CommandAction> {
+/// Owner gate shared by /allow, /deny, and /model pin|unpin. Returns the
+/// rejection when the caller isn't a registered owner using a fresh message.
+fn owner_gate(access: access::PrivilegedAccess) -> Option<CommandAction> {
     match access {
-        access::ShutdownAccess::NotAdmin => Some(CommandAction::Reject {
-            reason: CommandReject::AdminNotAllowed,
+        access::PrivilegedAccess::NotOwner => Some(CommandAction::Reject {
+            reason: CommandReject::OwnerNotAllowed,
         }),
-        access::ShutdownAccess::Stale => Some(CommandAction::Reject {
-            reason: CommandReject::AdminStale,
+        access::PrivilegedAccess::Stale => Some(CommandAction::Reject {
+            reason: CommandReject::OwnerStale,
         }),
-        access::ShutdownAccess::Allowed => None,
+        access::PrivilegedAccess::Allowed => None,
     }
 }
 
 /// `/model pin [KEY]` — pin this room to KEY (or its current effective
 /// model when KEY is omitted).
 fn route_model_pin(args: &str, context: &CommandContext<'_>) -> CommandAction {
-    if let Some(reject) = admin_gate(context.shutdown_access) {
+    if let Some(reject) = owner_gate(context.privileged_access) {
         return reject;
     }
 
@@ -484,9 +484,9 @@ fn route_model_pin(args: &str, context: &CommandContext<'_>) -> CommandAction {
 fn route_chat_approval(
     command: KnownCommand,
     args: &str,
-    access: access::ShutdownAccess,
+    access: access::PrivilegedAccess,
 ) -> CommandAction {
-    if let Some(reject) = admin_gate(access) {
+    if let Some(reject) = owner_gate(access) {
         return reject;
     }
 
@@ -521,8 +521,8 @@ fn route_pair(args: &str) -> CommandAction {
     }
 }
 
-fn route_ollama(args: &str, access: access::ShutdownAccess) -> CommandAction {
-    if let Some(reject) = admin_gate(access) {
+fn route_ollama(args: &str, access: access::PrivilegedAccess) -> CommandAction {
+    if let Some(reject) = owner_gate(access) {
         return reject;
     }
 
@@ -536,13 +536,13 @@ fn route_ollama(args: &str, access: access::ShutdownAccess) -> CommandAction {
     }
 }
 
-fn route_shutdown(access: access::ShutdownAccess) -> CommandAction {
+fn route_shutdown(access: access::PrivilegedAccess) -> CommandAction {
     match access {
-        access::ShutdownAccess::Allowed => CommandAction::Shutdown,
-        access::ShutdownAccess::NotAdmin => CommandAction::Reject {
-            reason: CommandReject::ShutdownNotAdmin,
+        access::PrivilegedAccess::Allowed => CommandAction::Shutdown,
+        access::PrivilegedAccess::NotOwner => CommandAction::Reject {
+            reason: CommandReject::ShutdownNotOwner,
         },
-        access::ShutdownAccess::Stale => CommandAction::Reject {
+        access::PrivilegedAccess::Stale => CommandAction::Reject {
             reason: CommandReject::ShutdownStale,
         },
     }
@@ -655,7 +655,7 @@ mod tests {
                 "/help@TellmBot",
                 rooms::RoomSettings::default(),
                 Some("tellmbot"),
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::Help {
@@ -667,7 +667,7 @@ mod tests {
                 "/help@OtherBot",
                 rooms::RoomSettings::default(),
                 Some("tellmbot"),
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Ignore
@@ -734,7 +734,7 @@ mod tests {
                 "/model",
                 settings.clone(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude", "gpt"],
             ),
             Route::Command(CommandAction::ShowModel {
@@ -749,7 +749,7 @@ mod tests {
                 "/model claude",
                 settings.clone(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude", "gpt"],
             ),
             Route::Command(CommandAction::SetModel {
@@ -761,7 +761,7 @@ mod tests {
                 "/model missing",
                 settings,
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude", "gpt"],
             ),
             Route::Command(CommandAction::Reject {
@@ -785,7 +785,7 @@ mod tests {
                 "/model",
                 settings.clone(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude", "gpt"],
                 Some("gpt"),
             ),
@@ -801,7 +801,7 @@ mod tests {
                 "/model claude",
                 settings.clone(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude", "gpt"],
                 Some("gpt"),
             ),
@@ -816,7 +816,7 @@ mod tests {
                 "/help",
                 settings,
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude", "gpt"],
                 Some("gpt"),
             ),
@@ -833,7 +833,7 @@ mod tests {
                 "/model add Mistral",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["Mistral"],
             ),
             Route::Command(CommandAction::AddModel {
@@ -849,7 +849,7 @@ mod tests {
                 "/model add claude2",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude2"],
             ),
             Route::Command(CommandAction::AddModel {
@@ -861,7 +861,7 @@ mod tests {
                 "/model claude2",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude2"],
             ),
             Route::Command(CommandAction::SetModel {
@@ -1020,13 +1020,13 @@ mod tests {
     }
 
     #[test]
-    fn allow_and_deny_commands_require_admin_and_chat_id() {
+    fn allow_and_deny_commands_require_owner_and_chat_id() {
         assert_eq!(
             route_command_with(
                 "/allow -100",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::AllowChat { chat_id: -100 })
@@ -1036,7 +1036,7 @@ mod tests {
                 "/deny 42",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::DenyChat { chat_id: 42 })
@@ -1046,7 +1046,7 @@ mod tests {
                 "/allow",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
@@ -1060,7 +1060,7 @@ mod tests {
                 "/deny nope",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
@@ -1074,11 +1074,11 @@ mod tests {
                 "/allow 42",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::NotAdmin,
+                access::PrivilegedAccess::NotOwner,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                reason: CommandReject::AdminNotAllowed,
+                reason: CommandReject::OwnerNotAllowed,
             })
         );
         assert_eq!(
@@ -1086,11 +1086,11 @@ mod tests {
                 "/deny 42",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Stale,
+                access::PrivilegedAccess::Stale,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                reason: CommandReject::AdminStale,
+                reason: CommandReject::OwnerStale,
             })
         );
     }
@@ -1102,7 +1102,7 @@ mod tests {
                 "/shutdown",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::Shutdown)
@@ -1112,11 +1112,11 @@ mod tests {
                 "/shutdown",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::NotAdmin,
+                access::PrivilegedAccess::NotOwner,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                reason: CommandReject::ShutdownNotAdmin,
+                reason: CommandReject::ShutdownNotOwner,
             })
         );
         assert_eq!(
@@ -1124,7 +1124,7 @@ mod tests {
                 "/shutdown",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Stale,
+                access::PrivilegedAccess::Stale,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
@@ -1134,13 +1134,13 @@ mod tests {
     }
 
     #[test]
-    fn ollama_unload_command_uses_admin_gate() {
+    fn ollama_unload_command_uses_owner_gate() {
         assert_eq!(
             route_command_with(
                 "/ollama unload",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::UnloadOllama)
@@ -1150,7 +1150,7 @@ mod tests {
                 "/ollama",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::Allowed,
+                access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
@@ -1162,11 +1162,11 @@ mod tests {
                 "/ollama unload",
                 rooms::RoomSettings::default(),
                 None,
-                access::ShutdownAccess::NotAdmin,
+                access::PrivilegedAccess::NotOwner,
                 &["claude"],
             ),
             Route::Command(CommandAction::Reject {
-                reason: CommandReject::AdminNotAllowed,
+                reason: CommandReject::OwnerNotAllowed,
             })
         );
     }
@@ -1180,7 +1180,7 @@ mod tests {
             text,
             settings,
             None,
-            access::ShutdownAccess::Allowed,
+            access::PrivilegedAccess::Allowed,
             &["claude"],
         )
     }
@@ -1189,17 +1189,24 @@ mod tests {
         text: &str,
         settings: rooms::RoomSettings,
         bot_username: Option<&str>,
-        shutdown_access: access::ShutdownAccess,
+        privileged_access: access::PrivilegedAccess,
         models: &[&str],
     ) -> Route {
-        route_command_with_pinned(text, settings, bot_username, shutdown_access, models, None)
+        route_command_with_pinned(
+            text,
+            settings,
+            bot_username,
+            privileged_access,
+            models,
+            None,
+        )
     }
 
     fn route_command_with_pinned(
         text: &str,
         settings: rooms::RoomSettings,
         bot_username: Option<&str>,
-        shutdown_access: access::ShutdownAccess,
+        privileged_access: access::PrivilegedAccess,
         models: &[&str],
         pinned_model_key: Option<&str>,
     ) -> Route {
@@ -1213,7 +1220,7 @@ mod tests {
             model_keys: &model_keys,
             pinned_model_key,
             model_thinking: ThinkingLevel::Medium,
-            shutdown_access,
+            privileged_access,
             capabilities: RoomCapabilities::permissive(),
         };
         route(text, bot_username, &context)
@@ -1231,7 +1238,7 @@ mod tests {
             model_keys: &model_keys,
             pinned_model_key: None,
             model_thinking: ThinkingLevel::Medium,
-            shutdown_access: access::ShutdownAccess::NotAdmin,
+            privileged_access: access::PrivilegedAccess::NotOwner,
             capabilities,
         };
         route(text, None, &context)

@@ -1,10 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -19,10 +17,11 @@ use tellm_telegram::{Document, IncomingMessage, PhotoSize, Telegram, TelegramErr
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
-use tokio::time::{Instant as TokioInstant, sleep, timeout};
+use tokio::time::{sleep, timeout};
 
 use crate::access::{AccessConfig, AccessControl, AccessTime, ChatAccess, PairingAttempt};
 use crate::commands::{self, CommandAction, CommandContext, CommandReject, KnownCommand, Route};
+use crate::ollama;
 use crate::rooms::{self, ChatMode, HistoryReset, RoomState, RoomStates};
 
 const LONG_POLL_TIMEOUT_S: u32 = 20;
@@ -31,17 +30,8 @@ const GET_UPDATES_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const CHAT_QUEUE_SIZE: usize = 32;
 const CHAT_TASK_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TYPING_INTERVAL: Duration = Duration::from_secs(4);
-const OLLAMA_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
-const OLLAMA_START_WAIT: Duration = Duration::from_secs(15);
-const OLLAMA_READY_POLL: Duration = Duration::from_millis(250);
-const OLLAMA_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
-const OLLAMA_TERMINATE_WAIT: Duration = Duration::from_secs(2);
-const OLLAMA_TERMINATE_POLL: Duration = Duration::from_millis(100);
 const TERMINAL_SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
-static OLLAMA_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static OLLAMA_CHILD: OnceLock<StdMutex<Option<ManagedOllamaChild>>> = OnceLock::new();
-static OLLAMA_LOADED_MODELS: OnceLock<StdMutex<BTreeSet<OllamaLoadedModel>>> = OnceLock::new();
 static NEXT_CHAT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Runtime {
@@ -267,71 +257,6 @@ struct TerminalSecretPrompt {
     line_tx: mpsc::UnboundedSender<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct OllamaLoadedModel {
-    base_url: String,
-    model: String,
-}
-
-struct ManagedOllamaChild {
-    child: Option<Child>,
-}
-
-impl ManagedOllamaChild {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn id(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
-    }
-
-    fn stop(mut self) -> Result<String, String> {
-        let child = self
-            .child
-            .take()
-            .ok_or_else(|| "Ollama child was already stopped".to_string())?;
-        stop_ollama_child(child)
-    }
-}
-
-impl Drop for ManagedOllamaChild {
-    fn drop(&mut self) {
-        let Some(child) = self.child.take() else {
-            return;
-        };
-        match stop_ollama_child(child) {
-            Ok(message) => log::info!(target: "tellm::ollama", "{message}"),
-            Err(error) => log::error!(
-                target: "tellm::ollama",
-                "spawned process stop failed during drop error={error:?}"
-            ),
-        }
-    }
-}
-
-struct RuntimeOllamaCleanup;
-
-impl Drop for RuntimeOllamaCleanup {
-    fn drop(&mut self) {
-        stop_started_ollama_blocking();
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct OllamaUnloadSummary {
-    attempted: usize,
-    unloaded: Vec<String>,
-    not_loaded: Vec<String>,
-    failed: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OllamaUnloadOutcome {
-    Unloaded,
-    NotLoaded,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
     Telegram,
@@ -442,7 +367,7 @@ impl Runtime {
     }
 
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let _ollama_cleanup = RuntimeOllamaCleanup;
+        let _ollama_cleanup = ollama::CleanupGuard;
         let bot = self.telegram.get_me().await?;
         let bot_username = bot.username;
         if let Some(username) = &bot_username {
@@ -592,7 +517,7 @@ impl Runtime {
                 log::error!(target: "tellm::persistence", "writer join failed error={error:?}")
             }
         }
-        stop_started_ollama().await;
+        ollama::stop_started().await;
         Ok(())
     }
 
@@ -1002,7 +927,7 @@ async fn route_command(
         commands::ParsedRoute::UserMessage => return Ok(Route::UserMessage),
         commands::ParsedRoute::Ignore => return Ok(Route::Ignore),
     };
-    let shutdown_access = {
+    let privileged_access = {
         let access = handles.access.lock().await;
         access.check_privileged(
             sender_user_id,
@@ -1028,7 +953,7 @@ async fn route_command(
             model_keys: &model_keys,
             pinned_model_key: pinned_model_key(&config, chat_id),
             model_thinking,
-            shutdown_access,
+            privileged_access,
             capabilities,
         };
         commands::resolve(command, args, &context)
@@ -1277,8 +1202,8 @@ async fn handle_command(
         } => handle_deny_chat(chat_id, target_chat_id, handles).await,
         CommandAction::Pair { code } => handle_pair_attempt(chat_id, code, None, handles).await,
         CommandAction::UnloadOllama => {
-            let summary = unload_tracked_ollama_models().await;
-            send_command_reply(handles, chat_id, &ollama_unload_reply(&summary)).await
+            let summary = ollama::unload_models().await;
+            send_command_reply(handles, chat_id, &ollama::unload_reply(&summary)).await
         }
         CommandAction::Shutdown => {
             send_command_reply(handles, chat_id, "Shutting down.").await?;
@@ -1475,12 +1400,12 @@ async fn dispatch_provider(
                 .base_url
                 .clone()
                 .ok_or_else(|| "compat model is missing base_url".to_string())?;
-            ensure_local_ollama_ready(&base_url).await?;
+            ollama::ensure_ready(&base_url).await?;
             let requested_model = request.model.clone();
             let api_key = compat_api_key(model).await?;
             // Register before the request: an aborted task can still leave
             // Ollama loading the model after the HTTP future is dropped.
-            remember_local_ollama_model(&base_url, &requested_model);
+            ollama::remember_model(&base_url, &requested_model);
             let response = Compat::new(api_key, base_url.clone())
                 .chat(request)
                 .await
@@ -1495,346 +1420,6 @@ async fn dispatch_provider(
                 .map_err(|error| error.to_string())
         }
     }
-}
-
-async fn ensure_local_ollama_ready(base_url: &str) -> Result<(), String> {
-    let Some(addr) = local_ollama_addr(base_url) else {
-        return Ok(());
-    };
-
-    if tcp_connects(addr.clone()).await? {
-        return Ok(());
-    }
-
-    let _start_guard = ollama_start_lock().lock().await;
-    if tcp_connects(addr.clone()).await? {
-        return Ok(());
-    }
-
-    log::info!(
-        target: "tellm::ollama",
-        "local endpoint unreachable; starting `ollama serve` base_url={base_url:?}"
-    );
-    start_ollama_serve().await?;
-
-    let deadline = TokioInstant::now() + OLLAMA_START_WAIT;
-    loop {
-        sleep(OLLAMA_READY_POLL).await;
-        if tcp_connects(addr.clone()).await? {
-            log::info!(target: "tellm::ollama", "local endpoint ready base_url={base_url:?}");
-            return Ok(());
-        }
-        if TokioInstant::now() >= deadline {
-            return Err(format!(
-                "local Ollama endpoint {base_url} did not become reachable after {}s",
-                OLLAMA_START_WAIT.as_secs()
-            ));
-        }
-    }
-}
-
-fn ollama_start_lock() -> &'static Mutex<()> {
-    OLLAMA_START_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn ollama_child() -> &'static StdMutex<Option<ManagedOllamaChild>> {
-    OLLAMA_CHILD.get_or_init(|| StdMutex::new(None))
-}
-
-fn ollama_loaded_models() -> &'static StdMutex<BTreeSet<OllamaLoadedModel>> {
-    OLLAMA_LOADED_MODELS.get_or_init(|| StdMutex::new(BTreeSet::new()))
-}
-
-async fn tcp_connects(addr: String) -> Result<bool, String> {
-    spawn_blocking(move || {
-        let addrs = addr
-            .to_socket_addrs()
-            .map_err(|error| format!("invalid Ollama listen address {addr}: {error}"))?;
-        for socket_addr in addrs {
-            if TcpStream::connect_timeout(&socket_addr, OLLAMA_CONNECT_TIMEOUT).is_ok() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    })
-    .await
-    .map_err(|error| format!("Ollama readiness check task failed: {error}"))?
-}
-
-async fn start_ollama_serve() -> Result<(), String> {
-    let child = spawn_blocking(|| {
-        ProcessCommand::new("ollama")
-            .arg("serve")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-    })
-    .await
-    .map_err(|error| format!("failed to start `ollama serve`: {error}"))?
-    .map_err(|error| {
-        format!("local Ollama is not running and `ollama serve` could not be started: {error}")
-    })?;
-    let child = ManagedOllamaChild::new(child);
-    let pid = child.id().expect("newly spawned child has a pid");
-    *ollama_child()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
-    log::info!(target: "tellm::ollama", "started `ollama serve` pid={pid}");
-    Ok(())
-}
-
-async fn stop_started_ollama() {
-    let Some(child) = take_started_ollama_child() else {
-        return;
-    };
-    unload_started_ollama_models().await;
-    match spawn_blocking(move || child.stop()).await {
-        Ok(Ok(message)) => log::info!(target: "tellm::ollama", "{message}"),
-        Ok(Err(error)) => {
-            log::error!(target: "tellm::ollama", "spawned process stop failed error={error:?}")
-        }
-        Err(error) => {
-            log::error!(target: "tellm::ollama", "shutdown task join failed error={error:?}")
-        }
-    }
-}
-
-fn stop_started_ollama_blocking() {
-    let Some(child) = take_started_ollama_child() else {
-        return;
-    };
-    unload_started_ollama_models_blocking();
-    match child.stop() {
-        Ok(message) => log::info!(target: "tellm::ollama", "{message}"),
-        Err(error) => {
-            log::error!(target: "tellm::ollama", "spawned process stop failed error={error:?}")
-        }
-    }
-}
-
-fn take_started_ollama_child() -> Option<ManagedOllamaChild> {
-    ollama_child()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-}
-
-fn remember_local_ollama_model(base_url: &str, model: &str) {
-    if local_ollama_addr(base_url).is_none() {
-        return;
-    }
-
-    ollama_loaded_models()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(OllamaLoadedModel {
-            base_url: base_url.to_string(),
-            model: model.to_string(),
-        });
-}
-
-async fn unload_started_ollama_models() {
-    let summary = unload_tracked_ollama_models().await;
-    log_ollama_unload_summary(summary);
-}
-
-fn unload_started_ollama_models_blocking() {
-    let summary = unload_tracked_ollama_models_blocking();
-    log_ollama_unload_summary(summary);
-}
-
-fn log_ollama_unload_summary(summary: OllamaUnloadSummary) {
-    for model in summary.unloaded {
-        log::info!(target: "tellm::ollama", "model unloaded model={model:?}");
-    }
-    for model in summary.not_loaded {
-        log::info!(target: "tellm::ollama", "model already not loaded model={model:?}");
-    }
-    for (model, error) in summary.failed {
-        log::warn!(
-            target: "tellm::ollama",
-            "model unload failed model={model:?} error={error:?}"
-        );
-    }
-}
-
-async fn unload_tracked_ollama_models() -> OllamaUnloadSummary {
-    spawn_blocking(unload_tracked_ollama_models_blocking)
-        .await
-        .unwrap_or_else(|error| OllamaUnloadSummary {
-            attempted: 1,
-            failed: vec![(
-                "tracked Ollama models".to_string(),
-                format!("Ollama unload task failed: {error}"),
-            )],
-            ..OllamaUnloadSummary::default()
-        })
-}
-
-fn unload_tracked_ollama_models_blocking() -> OllamaUnloadSummary {
-    let models = {
-        let models = ollama_loaded_models()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        models.iter().cloned().collect::<Vec<_>>()
-    };
-    let mut summary = OllamaUnloadSummary {
-        attempted: models.len(),
-        ..OllamaUnloadSummary::default()
-    };
-
-    for model in models {
-        match unload_ollama_model(&model) {
-            Ok(OllamaUnloadOutcome::Unloaded) => {
-                ollama_loaded_models()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&model);
-                summary.unloaded.push(model.model);
-            }
-            Ok(OllamaUnloadOutcome::NotLoaded) => {
-                ollama_loaded_models()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&model);
-                summary.not_loaded.push(model.model);
-            }
-            Err(error) => summary.failed.push((model.model, error)),
-        }
-    }
-
-    summary
-}
-
-fn unload_ollama_model(model: &OllamaLoadedModel) -> Result<OllamaUnloadOutcome, String> {
-    let addr = local_ollama_addr(&model.base_url)
-        .ok_or_else(|| format!("not a local Ollama endpoint: {}", model.base_url))?;
-    unload_ollama_model_blocking(&addr, &model.model)
-}
-
-fn unload_ollama_model_blocking(addr: &str, model: &str) -> Result<OllamaUnloadOutcome, String> {
-    let mut stream = connect_ollama_tcp(addr)?;
-    stream
-        .set_read_timeout(Some(OLLAMA_UNLOAD_TIMEOUT))
-        .map_err(|error| format!("could not set Ollama unload read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(OLLAMA_UNLOAD_TIMEOUT))
-        .map_err(|error| format!("could not set Ollama unload write timeout: {error}"))?;
-
-    let request = ollama_unload_request(addr, model);
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("could not send Ollama unload request: {error}"))?;
-
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("could not read Ollama unload response: {error}"))?;
-    ollama_unload_response_outcome(&response)
-}
-
-fn connect_ollama_tcp(addr: &str) -> Result<TcpStream, String> {
-    let addrs = addr
-        .to_socket_addrs()
-        .map_err(|error| format!("invalid Ollama listen address {addr}: {error}"))?;
-    for socket_addr in addrs {
-        if let Ok(stream) = TcpStream::connect_timeout(&socket_addr, OLLAMA_CONNECT_TIMEOUT) {
-            return Ok(stream);
-        }
-    }
-    Err(format!("could not connect to local Ollama endpoint {addr}"))
-}
-
-fn ollama_unload_request(addr: &str, model: &str) -> String {
-    // Checked 2026-07-05 against docs.ollama.com/api/generate:
-    // keep_alive accepts 0 to unload a model immediately.
-    let body = serde_json::json!({
-        "model": model,
-        "prompt": "",
-        "stream": false,
-        "keep_alive": 0,
-    })
-    .to_string();
-    format!(
-        "POST /api/generate HTTP/1.1\r\n\
-         Host: {addr}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len()
-    )
-}
-
-fn http_response_is_success(response: &str) -> bool {
-    matches!(http_response_status_code(response), Some(code) if (200..300).contains(&code))
-}
-
-fn http_response_status_code(response: &str) -> Option<u16> {
-    response
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-}
-
-fn ollama_unload_response_outcome(response: &str) -> Result<OllamaUnloadOutcome, String> {
-    if http_response_is_success(response) {
-        return Ok(OllamaUnloadOutcome::Unloaded);
-    }
-
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("");
-    if http_response_status_code(response) == Some(404)
-        || body.to_ascii_lowercase().contains("not found")
-    {
-        return Ok(OllamaUnloadOutcome::NotLoaded);
-    }
-
-    Err(format!(
-        "Ollama unload returned {}",
-        response.lines().next().unwrap_or("an empty HTTP response")
-    ))
-}
-
-fn ollama_unload_reply(summary: &OllamaUnloadSummary) -> String {
-    if summary.attempted == 0 {
-        return "No local Ollama models have been used by this tellm session.".to_string();
-    }
-
-    let mut parts = Vec::new();
-    if !summary.unloaded.is_empty() {
-        parts.push(format!(
-            "Unloaded local Ollama model{}: {}.",
-            plural(summary.unloaded.len()),
-            summary.unloaded.join(", ")
-        ));
-    }
-    if !summary.not_loaded.is_empty() {
-        parts.push(format!(
-            "Already not loaded local Ollama model{}: {}.",
-            plural(summary.not_loaded.len()),
-            summary.not_loaded.join(", ")
-        ));
-    }
-    if !summary.failed.is_empty() {
-        let failures = summary
-            .failed
-            .iter()
-            .map(|(model, error)| format!("{model} ({error})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!(
-            "Failed to unload local Ollama model{}: {failures}.",
-            plural(summary.failed.len())
-        ));
-    }
-
-    parts.join(" ")
 }
 
 #[cfg(unix)]
@@ -1853,114 +1438,6 @@ async fn shutdown_signal() -> &'static str {
 async fn shutdown_signal() -> &'static str {
     let _ = tokio::signal::ctrl_c().await;
     "Ctrl-C"
-}
-
-fn plural(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
-}
-
-fn stop_ollama_child(mut child: Child) -> Result<String, String> {
-    let pid = child.id();
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|error| format!("could not inspect pid {pid}: {error}"))?
-    {
-        return Ok(format!(
-            "`ollama serve` pid {pid} already exited with {status}"
-        ));
-    }
-
-    let fallback_reason = match terminate_ollama_child(&mut child) {
-        Ok(method) => {
-            if let Some(status) = wait_for_ollama_exit(&mut child)? {
-                return Ok(format!(
-                    "stopped tellm-started `ollama serve` pid {pid} after {method} with {status}"
-                ));
-            }
-            format!("{method} timeout")
-        }
-        Err(error) => format!("failed graceful stop: {error}"),
-    };
-
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|error| format!("could not inspect pid {pid}: {error}"))?
-    {
-        return Ok(format!(
-            "stopped tellm-started `ollama serve` pid {pid} after {fallback_reason} with {status}"
-        ));
-    }
-
-    child
-        .kill()
-        .map_err(|error| format!("could not kill pid {pid} after {fallback_reason}: {error}"))?;
-    let status = child
-        .wait()
-        .map_err(|error| format!("could not wait for pid {pid}: {error}"))?;
-    Ok(format!(
-        "stopped tellm-started `ollama serve` pid {pid} with SIGKILL after {fallback_reason}: {status}"
-    ))
-}
-
-#[cfg(unix)]
-fn terminate_ollama_child(child: &mut Child) -> Result<&'static str, String> {
-    let pid = child.id();
-    let raw_pid = i32::try_from(pid).map_err(|_| format!("pid {pid} does not fit in pid_t"))?;
-    let result = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
-    if result == 0 {
-        Ok("SIGTERM")
-    } else {
-        Err(format!(
-            "could not send SIGTERM to pid {pid}: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_ollama_child(_child: &mut Child) -> Result<&'static str, String> {
-    Err("graceful process termination is unsupported on this platform".to_string())
-}
-
-fn wait_for_ollama_exit(child: &mut Child) -> Result<Option<std::process::ExitStatus>, String> {
-    let pid = child.id();
-    let deadline = StdInstant::now() + OLLAMA_TERMINATE_WAIT;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("could not inspect pid {pid}: {error}"))?
-        {
-            return Ok(Some(status));
-        }
-        if StdInstant::now() >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(OLLAMA_TERMINATE_POLL);
-    }
-}
-
-fn local_ollama_addr(base_url: &str) -> Option<String> {
-    let rest = base_url.strip_prefix("http://")?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = split_host_port(authority)?;
-    if port != "11434" {
-        return None;
-    }
-    let normalized = host.trim_start_matches('[').trim_end_matches(']');
-    match normalized {
-        "localhost" | "127.0.0.1" | "::1" => Some(format!("{host}:{port}")),
-        _ => None,
-    }
-}
-
-fn split_host_port(authority: &str) -> Option<(&str, &str)> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let closing = rest.find(']')?;
-        let host = &authority[..closing + 2];
-        let port = rest[closing + 1..].strip_prefix(':')?;
-        return Some((host, port));
-    }
-    authority.rsplit_once(':')
 }
 
 async fn content_parts_from_message(
@@ -2077,7 +1554,7 @@ async fn send_model_response(
 }
 
 async fn handle_allow_chat(
-    admin_chat_id: i64,
+    requester_chat_id: i64,
     target_chat_id: i64,
     handles: &RuntimeHandles,
 ) -> Result<(), String> {
@@ -2110,7 +1587,7 @@ async fn handle_allow_chat(
     // The approved room gets the setup prompt too — approval via /allow must
     // feel the same as approval via /pair (best-effort: the bot may not be a
     // member of the target chat yet).
-    if changed && target_chat_id != admin_chat_id {
+    if changed && target_chat_id != requester_chat_id {
         let setup = room_setup_reply(target_chat_id, false, handles).await;
         let _ = send_room_setup(target_chat_id, setup, handles).await;
     }
@@ -2120,11 +1597,11 @@ async fn handle_allow_chat(
     } else {
         format!("Chat {target_chat_id} is already allowed.")
     };
-    send_command_reply(handles, admin_chat_id, &reply).await
+    send_command_reply(handles, requester_chat_id, &reply).await
 }
 
 async fn handle_deny_chat(
-    admin_chat_id: i64,
+    requester_chat_id: i64,
     target_chat_id: i64,
     handles: &RuntimeHandles,
 ) -> Result<(), String> {
@@ -2149,7 +1626,7 @@ async fn handle_deny_chat(
         cancel_chat_worker(
             &handles.workers,
             target_chat_id,
-            target_chat_id != admin_chat_id,
+            target_chat_id != requester_chat_id,
         );
 
         if result.changed()
@@ -2162,7 +1639,7 @@ async fn handle_deny_chat(
             // Only a self-deny leaves the task alive. Restore its flag so
             // the normal worker error reply can report the failed save;
             // an aborted target worker and its queued work stay dropped.
-            if target_chat_id == admin_chat_id {
+            if target_chat_id == requester_chat_id {
                 reactivate_chat_worker(&handles.workers, target_chat_id);
             }
             return Err(format!(
@@ -2189,7 +1666,7 @@ async fn handle_deny_chat(
 
     send_command_reply(
         handles,
-        admin_chat_id,
+        requester_chat_id,
         &format_deny_chat_reply(target_chat_id, &config_result),
     )
     .await
@@ -2354,8 +1831,7 @@ async fn persist_paired_chat(
         changed = true;
     }
     // Code pairing proves console access: record the pairing USER as an
-    // owner. Owners are the privilege concept — there is no
-    // chat-scoped admin anymore.
+    // owner. Owners are the sole privilege concept; chats never confer it.
     let mut became_owner = false;
     if let Some(user_id) = pairer_user_id
         && !config.telegram.owner_user_ids.contains(&user_id)
@@ -2875,7 +2351,8 @@ fn group_privacy_hint(chat_id: i64) -> String {
 fn unknown_chat_hint(chat_id: i64) -> String {
     format!(
         "This bot is private. Chat id: {chat_id}. If you own it, send /pair CODE here with the \
-         code printed in the tellm terminal, or send /allow {chat_id} from the admin chat."
+         code printed in the tellm terminal, or ask a registered owner to send /allow {chat_id} \
+         from any chat they are in."
     )
 }
 
@@ -3205,9 +2682,9 @@ fn format_reject(reason: CommandReject) -> String {
         CommandReject::PinnedModel { model_key } => {
             format!("This room is pinned to {model_key}; /model changes are disabled.")
         }
-        CommandReject::AdminNotAllowed => "Only the bot owner can use this command.".to_string(),
-        CommandReject::AdminStale => "Ignoring stale owner command.".to_string(),
-        CommandReject::ShutdownNotAdmin => "Only the bot owner can use /shutdown.".to_string(),
+        CommandReject::OwnerNotAllowed => "Only the bot owner can use this command.".to_string(),
+        CommandReject::OwnerStale => "Ignoring stale owner command.".to_string(),
+        CommandReject::ShutdownNotOwner => "Only the bot owner can use /shutdown.".to_string(),
         CommandReject::ShutdownStale => "Ignoring stale /shutdown command.".to_string(),
         CommandReject::CapabilityUnsupported {
             feature,
@@ -3646,153 +3123,6 @@ mod tests {
     }
 
     #[test]
-    fn local_ollama_addr_only_matches_local_default_ollama_port() {
-        assert_eq!(
-            local_ollama_addr("http://localhost:11434/v1").as_deref(),
-            Some("localhost:11434")
-        );
-        assert_eq!(
-            local_ollama_addr("http://127.0.0.1:11434/v1/").as_deref(),
-            Some("127.0.0.1:11434")
-        );
-        assert_eq!(
-            local_ollama_addr("http://[::1]:11434/v1").as_deref(),
-            Some("[::1]:11434")
-        );
-        assert_eq!(local_ollama_addr("https://api.mistral.ai/v1"), None);
-        assert_eq!(local_ollama_addr("http://localhost:8080/v1"), None);
-        assert_eq!(local_ollama_addr("http://192.168.1.10:11434/v1"), None);
-    }
-
-    #[test]
-    fn ollama_unload_request_uses_keep_alive_zero() {
-        let request = ollama_unload_request("localhost:11434", "gemma4:31b-mlx");
-        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
-        assert!(headers.starts_with("POST /api/generate HTTP/1.1"));
-        assert!(headers.contains("Host: localhost:11434"));
-        assert!(headers.contains(&format!("Content-Length: {}", body.len())));
-
-        let body: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(body["model"], "gemma4:31b-mlx");
-        assert_eq!(body["prompt"], "");
-        assert_eq!(body["stream"], false);
-        assert_eq!(body["keep_alive"], 0);
-    }
-
-    #[test]
-    fn ollama_unload_reply_reports_empty_success_and_failures() {
-        assert_eq!(
-            ollama_unload_reply(&OllamaUnloadSummary::default()),
-            "No local Ollama models have been used by this tellm session."
-        );
-        assert_eq!(
-            ollama_unload_reply(&OllamaUnloadSummary {
-                attempted: 2,
-                unloaded: vec!["llama3.3:70b".to_string(), "qwen3:32b".to_string()],
-                not_loaded: Vec::new(),
-                failed: Vec::new(),
-            }),
-            "Unloaded local Ollama models: llama3.3:70b, qwen3:32b."
-        );
-        let partial = ollama_unload_reply(&OllamaUnloadSummary {
-            attempted: 3,
-            unloaded: vec!["llama3.3:70b".to_string()],
-            not_loaded: vec!["gemma4:31b-mlx".to_string()],
-            failed: vec![("qwen3:32b".to_string(), "connection refused".to_string())],
-        });
-        assert!(
-            partial.contains("Unloaded local Ollama model: llama3.3:70b."),
-            "{partial}"
-        );
-        assert!(
-            partial.contains("Already not loaded local Ollama model: gemma4:31b-mlx."),
-            "{partial}"
-        );
-        assert!(
-            partial.contains("Failed to unload local Ollama model: qwen3:32b"),
-            "{partial}"
-        );
-    }
-
-    #[test]
-    fn http_response_success_only_accepts_2xx() {
-        assert!(http_response_is_success("HTTP/1.1 200 OK\r\n\r\n{}"));
-        assert!(http_response_is_success("HTTP/1.1 204 No Content\r\n\r\n"));
-        assert!(!http_response_is_success("HTTP/1.1 404 Not Found\r\n\r\n"));
-        assert!(!http_response_is_success(""));
-    }
-
-    #[test]
-    fn ollama_unload_response_treats_missing_model_as_terminal() {
-        assert_eq!(
-            ollama_unload_response_outcome("HTTP/1.1 200 OK\r\n\r\n{}"),
-            Ok(OllamaUnloadOutcome::Unloaded)
-        );
-        assert_eq!(
-            ollama_unload_response_outcome("HTTP/1.1 404 Not Found\r\n\r\n{}"),
-            Ok(OllamaUnloadOutcome::NotLoaded)
-        );
-        assert_eq!(
-            ollama_unload_response_outcome(
-                "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"model \\\"bad\\\" not found\"}"
-            ),
-            Ok(OllamaUnloadOutcome::NotLoaded)
-        );
-
-        let error = ollama_unload_response_outcome("HTTP/1.1 500 Server Error\r\n\r\n{}")
-            .expect_err("500 remains a real unload failure");
-        assert!(error.contains("HTTP/1.1 500 Server Error"), "{error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_ollama_child_uses_sigterm_before_sigkill() {
-        let child = ProcessCommand::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep test process");
-
-        let message = stop_ollama_child(child).expect("stop child");
-        assert!(message.contains("SIGTERM"), "{message}");
-        assert!(!message.contains("SIGKILL"), "{message}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn runtime_ollama_cleanup_drop_stops_tracked_child() {
-        drop(take_started_ollama_child());
-        let child = ProcessCommand::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep test process");
-        let pid = child.id();
-        *ollama_child()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(ManagedOllamaChild::new(child));
-
-        {
-            let _guard = RuntimeOllamaCleanup;
-        }
-
-        assert!(take_started_ollama_child().is_none());
-        assert!(!process_exists(pid), "pid {pid} should have exited");
-    }
-
-    #[cfg(unix)]
-    fn process_exists(pid: u32) -> bool {
-        let raw_pid = i32::try_from(pid).expect("test pid fits in pid_t");
-        let result = unsafe { libc::kill(raw_pid, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-
-    #[test]
     fn allow_and_deny_chat_update_persisted_config_shape() {
         let mut models = BTreeMap::new();
         models.insert(
@@ -4138,6 +3468,8 @@ mod tests {
         assert!(hint.contains("Chat id: -100"));
         assert!(hint.contains("/pair CODE"));
         assert!(hint.contains("/allow -100"));
+        assert!(hint.contains("registered owner"));
+        assert!(!hint.contains("admin chat"));
     }
 
     #[test]

@@ -1,0 +1,128 @@
+[
+  {
+    "name": "rich_api_404",
+    "classifier": "rich",
+    "input": "Telegram API error 404: not found",
+    "expected": true
+  },
+  {
+    "name": "rich_method_not_found",
+    "classifier": "rich",
+    "input": "Bad Request: method not found",
+    "expected": true
+  },
+  {
+    "name": "rich_cant_parse",
+    "classifier": "rich",
+    "input": "Bad Request: can't parse rich message",
+    "expected": true
+  },
+  {
+    "name": "rich_cannot_parse",
+    "classifier": "rich",
+    "input": "Bad Request: cannot parse payload",
+    "expected": true
+  },
+  {
+    "name": "rich_failed_to_parse",
+    "classifier": "rich",
+    "input": "Bad Request: failed to parse block",
+    "expected": true
+  },
+  {
+    "name": "rich_cant_find_end",
+    "classifier": "rich",
+    "input": "Bad Request: can't find end of entity",
+    "expected": true
+  },
+  {
+    "name": "rich_unsupported_start_tag",
+    "classifier": "rich",
+    "input": "Unsupported start tag \"foo\"",
+    "expected": true
+  },
+  {
+    "name": "rich_unsupported_tag",
+    "classifier": "rich",
+    "input": "Unsupported tag \"foo\"",
+    "expected": true
+  },
+  {
+    "name": "rich_case_insensitive",
+    "classifier": "rich",
+    "input": "METHOD NOT FOUND",
+    "expected": true
+  },
+  {
+    "name": "rich_marker_inside_context",
+    "classifier": "rich",
+    "input": "remote said: API ERROR 404; retry",
+    "expected": true
+  },
+  {
+    "name": "rich_html_entity_overlap",
+    "classifier": "rich",
+    "input": "Bad Request: can't parse entities",
+    "expected": true
+  },
+  {
+    "name": "rich_chat_not_found",
+    "classifier": "rich",
+    "input": "Bad Request: chat not found",
+    "expected": false
+  },
+  {
+    "name": "rich_api_400",
+    "classifier": "rich",
+    "input": "Telegram API error 400: bad request",
+    "expected": false
+  },
+  {
+    "name": "rich_unsupported_end_tag",
+    "classifier": "rich",
+    "input": "Unsupported end tag \"foo\"",
+    "expected": false
+  },
+  {
+    "name": "rich_empty",
+    "classifier": "rich",
+    "input": "",
+    "expected": false
+  },
+  {
+    "name": "html_parse_entities",
+    "classifier": "html",
+    "input": "Bad Request: parse entities failed",
+    "expected": true
+  },
+  {
+    "name": "html_cant_parse_entities",
+    "classifier": "html",
+    "input": "Bad Request: can't parse entities",
+    "expected": true
+  },
+  {
+    "name": "html_case_insensitive",
+    "classifier": "html",
+    "input": "PARSE ENTITIES",
+    "expected": true
+  },
+  {
+    "name": "html_generic_parse_failure",
+    "classifier": "html",
+    "input": "Bad Request: failed to parse block",
+    "expected": false
+  },
+  {
+    "name": "html_chat_not_found",
+    "classifier": "html",
+    "input": "Bad Request: chat not found",
+    "expected": false
+  },
+  {
+    "name": "html_empty",
+    "classifier": "html",
+    "input": "",
+    "expected": false
+  }
+]

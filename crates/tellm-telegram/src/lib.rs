@@ -578,7 +578,11 @@ fn trim_trailing_slash(mut value: String) -> String {
 }
 
 fn should_fallback_from_rich_message_error(error: &TelegramError) -> bool {
-    let error_text = error.to_string().to_lowercase();
+    should_fallback_from_rich_message_error_text(&error.to_string())
+}
+
+fn should_fallback_from_rich_message_error_text(error_text: &str) -> bool {
+    let error_text = error_text.to_lowercase();
     [
         "api error 404",
         "method not found",
@@ -594,7 +598,11 @@ fn should_fallback_from_rich_message_error(error: &TelegramError) -> bool {
 }
 
 fn should_fallback_from_html_message_error(error: &TelegramError) -> bool {
-    let error_text = error.to_string().to_lowercase();
+    should_fallback_from_html_message_error_text(&error.to_string())
+}
+
+fn should_fallback_from_html_message_error_text(error_text: &str) -> bool {
+    let error_text = error_text.to_lowercase();
     error_text.contains("parse entities") || error_text.contains("can't parse entities")
 }
 
@@ -843,4 +851,45 @@ fn replace_delimited(input: &str, delimiter: &str, tag: &str) -> String {
 
     output.push_str(&input[search_start..]);
     output
+}
+
+#[cfg(test)]
+mod fallback_golden_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct FallbackCase {
+        name: String,
+        classifier: String,
+        input: String,
+        expected: bool,
+    }
+
+    #[test]
+    fn fallback_classification_matches_python_reference() {
+        let cases: Vec<FallbackCase> =
+            serde_json::from_str(include_str!("../tests/golden/fallback_classification.json"))
+                .expect("fallback golden vectors must parse");
+        assert!(cases.len() >= 20, "fallback vectors missing");
+
+        let mut failures = Vec::new();
+        for case in cases {
+            let actual = match case.classifier.as_str() {
+                "rich" => should_fallback_from_rich_message_error_text(&case.input),
+                "html" => should_fallback_from_html_message_error_text(&case.input),
+                classifier => panic!(
+                    "case {} uses unknown fallback classifier {classifier}",
+                    case.name
+                ),
+            };
+            if actual != case.expected {
+                failures.push(format!(
+                    "case {}: expected {}, got {}",
+                    case.name, case.expected, actual
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
 }

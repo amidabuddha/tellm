@@ -99,7 +99,7 @@ pub struct GeneratedImage {
 pub struct ChatResponse {
     /// Display text, extracted for Telegram delivery.
     pub text: String,
-    /// Generated images (OpenAI Responses `image_generation` only, for now).
+    /// Generated images extracted from a provider-native response.
     pub images: Vec<GeneratedImage>,
     /// This full exchange (user turn + assistant turn) in the provider's own
     /// history shape, to be appended to the room history verbatim. Carries

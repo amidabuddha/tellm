@@ -48,11 +48,13 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | `tellm-compat` | OpenAI chat-completions dialect (Ollama, DeepSeek, OpenRouter, any compatible) |
 | `tellm-gemini` | Google Interactions API (Gemini) |
 | `tellm-test-support` | Dev-only shared mock HTTP support for provider integration tests |
-| root binary | Runtime loop, command router, sessions, pairing, wizard |
+| root binary | Runtime loop, command router, sessions, pairing, wizard, local Ollama lifecycle |
 
 Inside the root binary, runtime-owned concerns are split into
-`src/{runtime,wizard,rooms,access,commands}.rs`; `tellm-config` deliberately
-keeps only nonsecret config, secret storage, and validation.
+`src/{runtime,wizard,rooms,access,commands,ollama}.rs`. The private `ollama`
+module owns recognition and lifecycle management for the narrowly supported
+local endpoint; `tellm-config` deliberately keeps only nonsecret config,
+secret storage, and validation.
 
 ## Unified parameter set
 
@@ -282,13 +284,14 @@ restart and local room-setting changes.
   against `message.from` on every privileged command (`/allow`, `/deny`,
   `/shutdown`, `/ollama unload`, `/model pin|unpin|add`), valid from any chat
   the owner is in. This closes the group-admin hole (group members inheriting
-  chat-based privilege) and makes admin-stranding via `/deny` structurally
+  chat-based privilege) and makes owner-stranding via `/deny` structurally
   impossible. Caveat: Telegram anonymous-admin mode hides `from` — owners must
   post non-anonymously (or use a private chat) for privileged commands.
 - After approval the room replies with its current model and the /model /
   /model pin next steps plus a one-time model reply keyboard; on group approval
   the console prints the privacy-mode hint.
-- Admin chats can approve or revoke rooms at runtime: `/allow CHAT_ID` adds the
+- Registered owners can approve or revoke rooms from any chat they are in:
+  `/allow CHAT_ID` adds the
   chat to `allowed_chat_ids`, persists config, and takes effect immediately;
   `/deny CHAT_ID` removes `allowed_chat_ids` and model pins for the chat,
   cancels and drops that room's queued/in-flight work, clears its room state,
@@ -319,7 +322,7 @@ restart and local room-setting changes.
 
 - **API keys never travel through Telegram chat** (they would transit
   Telegram's servers and persist in history on both ends). Console-side
-  entry: `tellm secret set NAME` or `/model add KEY` from an owner chat, which
+  entry: `tellm secret set NAME` or `/model add KEY` from a registered owner, which
   asks for the preset's secret in the tellm terminal using the same visible
   prompt style as first-run setup. If `KEY` is an already-configured custom
   model, `/model add KEY` instead prompts for that model's `api_key_secret`.

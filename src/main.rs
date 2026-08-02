@@ -3,6 +3,7 @@ use std::process::ExitCode;
 mod access;
 mod commands;
 mod console;
+mod ollama;
 mod rooms;
 mod runtime;
 mod wizard;
