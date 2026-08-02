@@ -26,6 +26,15 @@ These rules apply to every contributor — human, Claude, Codex, or otherwise.
   regenerate them from the Python reference if you believe they are wrong,
   and say so in the commit body).
 
+## Git workflow
+
+- For routine commit-and-push requests, use `git` directly for staging,
+  committing, and pushing. Do not invoke `gh` or a GitHub publishing workflow
+  unless a GitHub-specific operation is actually required.
+- Do not create pull requests for this repository unless the maintainer
+  explicitly requests one. A request to commit and push means exactly those
+  operations and stops after the push succeeds.
+
 ## API surface rule
 
 - **Never write provider API version strings, parameter names, or defaults
