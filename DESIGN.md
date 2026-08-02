@@ -51,12 +51,15 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | root binary | Runtime loop, command router, sessions, pairing, wizard, local Ollama lifecycle |
 
 Inside the root binary, runtime-owned concerns are split into
-`src/{runtime,persistence,wizard,rooms,access,commands,ollama}.rs`. The private
-`persistence` module owns the ordered blocking writer plus serialized room
-setting snapshots and their rollback semantics. The private `ollama` module
-owns recognition and lifecycle management for the narrowly supported local
-endpoint; `tellm-config` deliberately keeps only nonsecret config, secret
-storage, and validation.
+`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama}.rs`.
+The private `model_turn` module owns Telegram input/attachment normalization,
+provider-neutral request construction, provider dispatch and secret lookup,
+and model-response delivery. `runtime` retains access checks, cancellation,
+and generation-guarded commit/rollback orchestration. The private `persistence`
+module owns the ordered blocking writer plus serialized room setting snapshots
+and their rollback semantics. The private `ollama` module owns recognition and
+lifecycle management for the narrowly supported local endpoint; `tellm-config`
+deliberately keeps only nonsecret config, secret storage, and validation.
 
 ## Unified parameter set
 
@@ -218,9 +221,10 @@ Notes:
   does not change. Terminal `reset` clears all in-memory histories while keeping
   room settings. Monotonic room generations prevent an older in-flight result
   or rollback from repopulating reset or revoked state.
-- Telegram downloads accept images, PDFs, and text documents up to 20 MiB.
-  Declared oversize files are rejected before download; unknown-length bodies
-  are read incrementally and stopped at the same limit.
+- The `model_turn` boundary converts Telegram text, photos, and documents into
+  core content parts. Downloads accept images, PDFs, and text documents up to
+  20 MiB. Declared oversize files are rejected before download; unknown-length
+  bodies are read incrementally and stopped at the same limit.
 - Edited-message updates are deliberately ignored so correcting a Telegram
   message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
