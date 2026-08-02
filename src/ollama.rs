@@ -18,6 +18,7 @@ use tokio::time::{Instant as TokioInstant, sleep};
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const START_WAIT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(250);
+const MODEL_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINATE_WAIT: Duration = Duration::from_secs(2);
 const TERMINATE_POLL: Duration = Duration::from_millis(100);
@@ -25,6 +26,7 @@ const TERMINATE_POLL: Duration = Duration::from_millis(100);
 static START_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 static CHILD: OnceLock<Mutex<Option<ManagedChild>>> = OnceLock::new();
 static LOADED_MODELS: OnceLock<Mutex<BTreeSet<LoadedModel>>> = OnceLock::new();
+static MODEL_INFO_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LoadedModel {
@@ -127,6 +129,84 @@ pub(crate) async fn ensure_ready(base_url: &str) -> Result<(), String> {
             ));
         }
     }
+}
+
+/// Reject image-bearing requests before inference when the narrowly
+/// recognized local Ollama model does not advertise vision support. Other
+/// chat-completions-compatible endpoints do not expose Ollama's model metadata
+/// API and are left to their provider request path.
+pub(crate) async fn require_vision_capability(base_url: &str, model: &str) -> Result<(), String> {
+    let Some(addr) = local_addr(base_url) else {
+        return Ok(());
+    };
+
+    require_vision_at(&format!("http://{addr}/api/show"), model).await
+}
+
+async fn require_vision_at(show_url: &str, model: &str) -> Result<(), String> {
+    // Checked 2026-08-02 against docs.ollama.com/api-reference/show-model-details:
+    // POST /api/show accepts `model` and returns a `capabilities` string array;
+    // vision-capable models include the literal `vision`.
+    let response = model_info_http()
+        .post(show_url)
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .map_err(|error| format!("could not inspect local Ollama model {model:?}: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.map_err(|error| {
+        format!("local Ollama returned invalid model metadata for {model:?}: {error}")
+    })?;
+
+    if !status.is_success() {
+        let detail = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown Ollama model metadata error");
+        return Err(format!(
+            "could not inspect local Ollama model {model:?}: API error {}: {detail}",
+            status.as_u16()
+        ));
+    }
+
+    let capabilities = body
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "could not verify image support for local Ollama model {model:?}: \
+                 /api/show did not return capabilities"
+            )
+        })?;
+    let capabilities = capabilities
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+
+    if capabilities.contains(&"vision") {
+        return Ok(());
+    }
+
+    let reported = if capabilities.is_empty() {
+        "none".to_string()
+    } else {
+        capabilities.join(", ")
+    };
+    Err(format!(
+        "local Ollama model {model:?} does not support image input \
+         (reported capabilities: {reported}); choose a model whose `ollama show` output includes \
+         `vision`"
+    ))
+}
+
+fn model_info_http() -> &'static reqwest::Client {
+    MODEL_INFO_HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(MODEL_INFO_TIMEOUT)
+            .build()
+            .expect("valid local Ollama model metadata HTTP client")
+    })
 }
 
 pub(crate) fn remember_model(base_url: &str, model: &str) {
@@ -544,6 +624,7 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tellm_test_support::{MockHttpServer, MockResponse};
 
     #[test]
     fn local_addr_only_matches_local_default_ollama_port() {
@@ -562,6 +643,60 @@ mod tests {
         assert_eq!(local_addr("https://api.mistral.ai/v1"), None);
         assert_eq!(local_addr("http://localhost:8080/v1"), None);
         assert_eq!(local_addr("http://192.168.1.10:11434/v1"), None);
+    }
+
+    #[tokio::test]
+    async fn model_metadata_requires_reported_vision_capability() {
+        let mock = MockHttpServer::start(vec![
+            MockResponse::json(
+                200,
+                serde_json::json!({
+                    "capabilities": ["completion", "vision"]
+                }),
+            ),
+            MockResponse::json(
+                200,
+                serde_json::json!({
+                    "capabilities": ["completion", "tools", "thinking"]
+                }),
+            ),
+            MockResponse::json(200, serde_json::json!({ "details": {} })),
+            MockResponse::json(404, serde_json::json!({ "error": "model not found" })),
+        ]);
+        let show_url = format!("{}/api/show", mock.base_url());
+
+        require_vision_at(&show_url, "vision-model")
+            .await
+            .expect("vision capability must pass");
+
+        let unsupported = require_vision_at(&show_url, "text-model")
+            .await
+            .expect_err("missing vision capability must fail");
+        assert!(unsupported.contains("does not support image input"));
+        assert!(unsupported.contains("completion, tools, thinking"));
+
+        let missing = require_vision_at(&show_url, "unknown-capabilities")
+            .await
+            .expect_err("missing capabilities field must fail closed");
+        assert!(missing.contains("did not return capabilities"));
+
+        let not_found = require_vision_at(&show_url, "missing-model")
+            .await
+            .expect_err("metadata API errors must fail closed");
+        assert!(not_found.contains("API error 404: model not found"));
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 4);
+        for (request, model) in requests.iter().zip([
+            "vision-model",
+            "text-model",
+            "unknown-capabilities",
+            "missing-model",
+        ]) {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/api/show");
+            assert_eq!(request.json_body(), serde_json::json!({ "model": model }));
+        }
     }
 
     #[test]

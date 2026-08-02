@@ -74,6 +74,10 @@ toml.workspace = true
 getrandom.workspace = true
 libc.workspace = true
 log.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tellm-test-support.workspace = true
 
 # The profile that 'dist' will build with
 [profile.dist]

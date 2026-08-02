@@ -115,6 +115,13 @@ pub(crate) async fn dispatch_provider(
                 .ok_or_else(|| "compat model is missing base_url".to_string())?;
             ollama::ensure_ready(&base_url).await?;
             let requested_model = request.model.clone();
+            if request
+                .input
+                .iter()
+                .any(|part| matches!(part, ContentPart::Image { .. }))
+            {
+                ollama::require_vision_capability(&base_url, &requested_model).await?;
+            }
             let api_key = compat_api_key(model).await?;
             // Register before the request: an aborted task can still leave
             // Ollama loading the model after the HTTP future is dropped.

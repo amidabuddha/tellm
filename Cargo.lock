@@ -1598,6 +1598,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "log",
+ "reqwest",
  "rpassword",
  "serde",
  "serde_json",
@@ -1608,6 +1609,7 @@ dependencies = [
  "tellm-gemini",
  "tellm-openai",
  "tellm-telegram",
+ "tellm-test-support",
  "tokio",
  "toml",
 ]

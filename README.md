@@ -242,6 +242,11 @@ are left alone. Owners can also send
 `/ollama unload` to unload local Ollama models used by the current tellm
 session without stopping tellm or `ollama serve`.
 
+When a message includes an image, tellm checks the selected local model's
+Ollama metadata before inference. The turn is rejected unless `ollama show
+MODEL` reports the `vision` capability. The room's `image_generation` setting
+controls generated image output and does not disable user-supplied image input.
+
 That lifecycle management is intentionally narrow: it is inferred only for the
 default local HTTP endpoint above. Non-default ports, `https://` proxies,
 `0.0.0.0`/LAN hosts, and remote compat servers are treated as ordinary compat

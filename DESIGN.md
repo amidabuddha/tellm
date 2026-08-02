@@ -360,11 +360,17 @@ restart and local room-setting changes.
   default local HTTP Ollama endpoint (`http://localhost:11434`,
   `http://127.0.0.1:11434`, or `http://[::1]:11434`, with or without `/v1`),
   the runtime checks the TCP port before dispatch. If it is down, tellm starts
-  `ollama serve` once and waits briefly for readiness. A tellm-started Ollama
-  child is stopped during tellm shutdown, including terminal `exit`/`quit`,
-  Telegram `/shutdown`, SIGINT, SIGTERM, and ordinary panic unwinds, after
-  tellm asks Ollama to unload every local model whose request began in the
-  current tellm process via `keep_alive: 0` (checked 2026-07-05 against
+  `ollama serve` once and waits briefly for readiness. Before dispatching a new
+  image input, tellm calls `POST /api/show` and requires the model's reported
+  `capabilities` to contain `vision`; a missing capability, malformed metadata,
+  or metadata API failure rejects the turn before inference (checked 2026-08-02
+  against docs.ollama.com/api-reference/show-model-details). This dynamic check
+  applies only to the recognized local Ollama endpoint; other compat endpoints
+  retain their provider-defined image behavior. A tellm-started Ollama child is
+  stopped during tellm shutdown, including terminal `exit`/`quit`, Telegram
+  `/shutdown`, SIGINT, SIGTERM, and ordinary panic unwinds, after tellm asks
+  Ollama to unload every local model whose request began in the current tellm
+  process via `keep_alive: 0` (checked 2026-07-05 against
   docs.ollama.com/api/generate). The child shutdown path sends SIGTERM, waits
   briefly, then falls back to SIGKILL. A 404 / not-found unload response means
   the model is already gone and is removed from tellm's in-memory tracking.
