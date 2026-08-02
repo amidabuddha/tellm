@@ -1692,6 +1692,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tellm-test-support",
  "thiserror",
  "tokio",
 ]

@@ -1,23 +1,44 @@
-mod support;
-
 use std::time::Duration;
 
-use serde_json::json;
-use support::{MockResponse, MockTelegram, body_contains};
+use serde_json::{Value, json};
 use tellm_telegram::{TEXT_CHUNK_SIZE, Telegram, TelegramError};
+use tellm_test_support::{MockHttpServer, MockResponse, body_contains};
 use tokio::time::timeout;
 
 const TOKEN: &str = "123:ABC";
+type MockTelegram = MockHttpServer;
+
+trait TelegramMockResponse {
+    fn json_ok(result: Value) -> Self;
+    fn json_error(error_code: i64, description: &str) -> Self;
+}
+
+impl TelegramMockResponse for MockResponse {
+    fn json_ok(result: Value) -> Self {
+        Self::json(200, json!({ "ok": true, "result": result }))
+    }
+
+    fn json_error(error_code: i64, description: &str) -> Self {
+        Self::json(
+            200,
+            json!({
+                "ok": false,
+                "error_code": error_code,
+                "description": description,
+            }),
+        )
+    }
+}
 
 fn client(mock: &MockTelegram) -> Telegram {
-    Telegram::with_base_urls(TOKEN, mock.api_base_url(), mock.file_base_url())
+    Telegram::with_base_urls(TOKEN, mock.base_url(), format!("{}/file", mock.base_url()))
 }
 
 fn short_timeout_client(mock: &MockTelegram) -> Telegram {
     Telegram::with_base_urls_and_timeout(
         TOKEN,
-        mock.api_base_url(),
-        mock.file_base_url(),
+        mock.base_url(),
+        format!("{}/file", mock.base_url()),
         Duration::from_millis(50),
     )
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tellm-test-support"
-description = "Shared integration-test support for tellm provider crates"
+description = "Shared mock HTTP support for tellm integration tests"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

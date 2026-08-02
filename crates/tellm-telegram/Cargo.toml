@@ -16,4 +16,5 @@ reqwest = { workspace = true, features = ["multipart"] }
 log.workspace = true
 
 [dev-dependencies]
+tellm-test-support.workspace = true
 tokio.workspace = true
