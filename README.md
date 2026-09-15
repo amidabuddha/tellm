@@ -59,16 +59,90 @@ tellm
 
 ### Build From Source
 
+#### Clean installation
+
+Prerequisites: Git, Rust 1.88 or newer with Cargo (the minimum declared in
+`Cargo.toml`), and your platform's native compiler/linker tools. Development
+checks also require the Rust `rustfmt` and `clippy` components. Have a Telegram
+bot token and a provider API key ready for the first-run wizard.
+
+Start from a fresh checkout:
+
 ```sh
 git clone https://github.com/amidabuddha/tellm.git
 cd tellm
-cargo build --release
+cargo build --locked --release
 ./target/release/tellm
 ```
+
+Cargo automatically downloads any missing crates and builds using the existing
+`Cargo.lock`; there is no separate dependency-install step. Keep the lockfile:
+`--locked` fails if resolving dependencies would require changing it. With the
+default Cargo output location, the executable is `target/release/tellm`
+(`.\target\release\tellm.exe` on Windows). Run this local executable directly.
 
 The first run wizard asks for a Telegram bot token and one provider API key,
 then prints a pairing code. Message your bot `/pair 123456` on Telegram. Done
 — under two minutes, zero file editing.
+
+Existing `TELLM_<SECRET_NAME>` environment overrides continue to apply; see the
+[`config.toml` example](#configtoml-example) below. Keep real secrets out of
+source files and `config.toml`.
+
+#### Normal development
+
+Run these commands from the repository root:
+
+```sh
+cargo build --locked
+cargo run --locked
+```
+
+These use the debug profile and reuse existing build artifacts. `cargo run`
+also rebuilds changed code before starting the bot, so the separate build is
+optional. Stop the running bot before restarting it; this repository has no
+watch script. Ordinary source edits do not require deleting dependencies or
+cleaning all build output. Use `cargo build --locked --release` when you need
+an updated optimized executable.
+
+Run the workspace checks used by CI before committing (on stable Rust):
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+`--workspace` includes every library crate; plain `cargo test` from the root
+only tests the binary crate.
+
+#### Clean rebuild of an existing checkout
+
+The repository's generated Cargo output belongs in `target/`, which is ignored
+by Git. From the repository root, after stopping the bot, use:
+
+```sh
+cargo clean --target-dir target
+cargo build --locked --release --target-dir target
+```
+
+The explicit `--target-dir target` scopes both commands to this checkout's
+`target/`, even if your Cargo configuration normally uses a shared output
+directory. Confirm `target/` is a project-owned build directory, not a symlink
+to shared storage, before cleaning. Cargo removes its build artifacts there
+and rebuilds from scratch, downloading any missing locked crates automatically.
+Run the resulting executable using the path in the clean installation section.
+
+Preserve `Cargo.lock`, source, configuration, any `.env` files, and user data.
+tellm's `config.toml`, `rooms.toml`, and `credentials.toml` live under the OS
+configuration directory's `tellm/` folder and are not build output. Leave that
+folder, keychain entries, global Cargo caches, rustup toolchains, installed
+targets, and installed executables in place.
+
+Release packaging is separate: `dist-workspace.toml` and
+`.github/workflows/release.yml` configure `cargo-dist` for GitHub Releases.
+It is not required for local builds; none of the workflows above publish a
+package or release.
 
 ## Supported APIs (direct, no middleware)
 
