@@ -268,9 +268,12 @@ pub(crate) fn message_has_input(message: &IncomingMessage) -> bool {
 }
 
 fn largest_photo(photos: Option<&[PhotoSize]>) -> Option<&PhotoSize> {
+    // Widen to i128 before multiplying: `width * height` in i64 can overflow
+    // for extreme dimensions and panic in debug builds. Any product of two
+    // i64 values fits in i128, so this is exact for all inputs.
     photos?
         .iter()
-        .max_by_key(|photo| photo.width * photo.height)
+        .max_by_key(|photo| photo.width as i128 * photo.height as i128)
 }
 
 fn is_text_document(document: &Document, media_type: &str) -> bool {
@@ -414,6 +417,29 @@ mod tests {
         ];
 
         assert_eq!(largest_photo(Some(&photos)).unwrap().file_id, "wide");
+    }
+
+    #[test]
+    fn largest_photo_compares_overflowing_pixel_areas() {
+        let overflowing = PhotoSize {
+            file_id: "overflowing".to_string(),
+            width: i64::MAX,
+            height: i64::MAX,
+            file_size: None,
+        };
+        let plain = PhotoSize {
+            file_id: "plain".to_string(),
+            width: 1_000,
+            height: 1_000,
+            file_size: None,
+        };
+
+        // `i64::MAX * i64::MAX` overflows i64, yet its mathematical area is
+        // far larger than 1_000 * 1_000; selection must not panic or wrap.
+        let photos = vec![plain.clone(), overflowing.clone()];
+        assert_eq!(largest_photo(Some(&photos)).unwrap().file_id, "overflowing");
+        let photos = vec![overflowing, plain];
+        assert_eq!(largest_photo(Some(&photos)).unwrap().file_id, "overflowing");
     }
 
     #[test]
