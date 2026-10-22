@@ -34,6 +34,33 @@ These rules apply to every contributor — human, Claude, Codex, or otherwise.
 - Do not create pull requests for this repository unless the maintainer
   explicitly requests one. A request to commit and push means exactly those
   operations and stops after the push succeeds.
+- Commit locally as work progresses. Push only when the maintainer asks;
+  when a milestone is done, ask once whether to push now or not yet.
+- `.github/workflows/release.yml` publishes a release when a version tag is
+  pushed. Bump the version and tag only for an explicitly requested release;
+  installing the local binary needs neither.
+
+## Closure: install the binary and clean up
+
+When a change is complete, close it out in this order:
+
+1. Run the Verification gate below and commit locally.
+2. Build the release binary and replace the installed one atomically:
+
+   ```sh
+   cargo build --release
+   install -m 755 target/release/tellm ~/.local/bin/.tellm.new
+   mv -f ~/.local/bin/.tellm.new ~/.local/bin/tellm
+   ```
+
+   `~/.local/bin` comes first on the maintainer's `PATH`. Never overwrite the
+   installed file in place (for example `cp` onto it): macOS caches code
+   signatures and can kill the rewritten binary.
+3. Verify: `cmp target/release/tellm ~/.local/bin/tellm` succeeds and
+   `command -v tellm` prints `~/.local/bin/tellm`.
+4. Remove the build output with `cargo clean`. Keep `Cargo.lock`, source,
+   `TICKETS.md` and configuration; secrets live in the keychain or the
+   user's config directory, never in this repository.
 
 ## API surface rule
 
