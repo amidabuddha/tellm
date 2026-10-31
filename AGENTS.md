@@ -26,6 +26,10 @@ These rules apply to every contributor — human, Claude, Codex, or otherwise.
   regenerate them from the Python reference if you believe they are wrong,
   and say so in the commit body).
 
+## Documentation
+
+- Docs describe the current state only. Do not add dated implementation logs, acceptance or validation evidence, release reports or completed-task lists; put evidence in commit messages.
+
 ## Git workflow
 
 - For routine commit-and-push requests, use `git` directly for staging,
