@@ -15,9 +15,7 @@ These rules apply to every contributor — human, Claude, Codex, or otherwise.
 
 ## Work packaging
 
-- The maintainer's backlog (TICKETS.md) is deliberately local and untracked —
-  a fresh clone does not have it. Contributors propose and pick up work
-  through GitHub issues instead. One ticket/issue per commit series; keep
+- Propose and pick up work through GitHub issues. One issue per commit series; keep
   commits scoped to one behavioral change with an imperative subject line and
   a body that explains why.
 - Golden tests precede ports: `chunk_text` and `markdown_to_html` must be
@@ -62,8 +60,8 @@ When a change is complete, close it out in this order:
    signatures and can kill the rewritten binary.
 3. Verify: `cmp target/release/tellm ~/.local/bin/tellm` succeeds and
    `command -v tellm` prints `~/.local/bin/tellm`.
-4. Remove the build output with `cargo clean`. Keep `Cargo.lock`, source,
-   `TICKETS.md` and configuration; secrets live in the keychain or the
+4. Remove the build output with `cargo clean`. Keep `Cargo.lock`, source
+   and configuration; secrets live in the keychain or the
    user's config directory, never in this repository.
 
 ## API surface rule
