@@ -101,7 +101,8 @@ state, so:
 Thinking-level translation (verified against live provider docs 2026-07-05;
 Gemini 3.6 Flash refreshed 2026-07-26;
 OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10; Anthropic Claude
-Opus 5 refreshed 2026-07-26; xAI and Meta top tiers refreshed 2026-11-16):
+Opus 5 refreshed 2026-07-26; xAI and Meta top tiers and the preset models
+refreshed 2026-11-16):
 
 | Level | Anthropic Messages | OpenAI Responses | xAI Responses | Chat completions | Gemini |
 |---|---|---|---|---|---|
@@ -110,11 +111,13 @@ Opus 5 refreshed 2026-07-26; xAI and Meta top tiers refreshed 2026-11-16):
 | max | `max_effort`, else `"max"` (valid on ALL adaptive models) | `max_effort`, else `"xhigh"` | same | `max_effort`, else `"high"` ("max" not in the dialect) | `max_effort`, else `"high"` |
 
 Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
-2026-07-26; xAI and Meta refreshed 2026-11-16):
-- **"off" means provider default everywhere, not "no thinking"**: Opus 5,
-  Sonnet 5, and Fable 5 think anyway; gpt-5.6-sol reasons at its own default;
-  grok-4.5 defaults to high; Gemini thinks dynamically. User-facing text must
-  say "default", not "off".
+2026-07-26; xAI, Meta, and the preset models' defaults refreshed 2026-11-16):
+- **"off" means provider default everywhere, not "no thinking"**, and none of
+  the preset models can turn thinking off: Claude Fable 5.2 defaults to
+  `high`; gpt-6-astra reasons at its own default and rejects `none`; grok-4.7
+  defaults to `high`; muse-wonder-1.0 defaults to `max`, so "off" is its most
+  expensive setting; Gemini 4 Argon defaults to `medium`. User-facing text
+  must say "default", not "off".
 - The tier above `high` differs from model to model, so it is configuration
   and not code: `/reasoning max` sends the model's optional `max_effort` value
   from `config.toml`, and the wire format's default when that is unset. The
@@ -129,9 +132,10 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   that the value is one token; an unsupported value errors explicitly at the
   provider and the user can lower the room's level. No Grok model can disable
   reasoning, so `Off` omits the field.
-- Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
-  model should be configured with `thinking = "low"` or `thinking = "high"`;
-  gemini-3.1-pro and 3.6-flash accept medium.
+- Gemini thinking levels are model-dependent: gemini-4-argon,
+  gemini-3.8-flash, and gemini-3.6-flash accept low/medium/high. Gemini 4
+  Argon and 3.8 Flash reject `minimal`, which tellm never sends (checked
+  2026-11-16).
 - Anthropic always sends `max_tokens: 16000`: thinking tokens count toward
   `max_tokens`, and 4096 risked mid-thought truncation at high/max effort.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
@@ -201,8 +205,13 @@ Notes:
 - Gemini Interactions uses `POST /v1beta/interactions`, `x-goog-api-key`,
   `store:false`, `stream:false`, `system_instruction`, and stateless `input`
   as an array of Interactions `Step` objects (checked 2026-07-26 against
-  ai.google.dev for Gemini 3.6 Flash). Requests omit deprecated sampling
+  ai.google.dev for Gemini 3.6 Flash; rechecked 2026-11-16 for Gemini 4
+  Argon). Requests omit deprecated sampling
   parameters and end in a `user_input` step, never a prefilled model turn.
+  Gemini 4 Argon's long decode past 64K output tokens needs background
+  execution or a continuation token; tellm uses neither, so a reply that
+  stops early comes back with a non-completed status and is reported as
+  unsupported follow-up handling.
   Raw response `steps` are replayed through `turn_items`
   verbatim, including `thought` and Google Search call/result signatures.
   Web search is `tools: [{type:"google_search",
@@ -453,8 +462,10 @@ restart and local room-setting changes.
   No encrypted-file theater.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
-  from the built-in list (checked 2026-07-26: Claude Opus 5, GPT-5.6 Sol,
-  Grok 4.5, Muse Spark 1.1, Gemini 3.6 Flash), stores Telegram/provider
+  from the built-in list, which is each lab's most capable model that an
+  ordinary API key can call (checked 2026-11-16: Claude Fable 5.2, GPT-6
+  Astra, Grok 4.7, Muse Wonder 1.0 in preview, Gemini 4 Argon), stores
+  Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather
   than repeatedly prompting on a closed input stream.

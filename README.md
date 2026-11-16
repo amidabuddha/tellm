@@ -191,14 +191,14 @@ owner_user_ids = []
 
 [models.claude]
 wire_format = "anthropic"
-model_name = "claude-opus-5"
+model_name = "claude-fable-5-2"
 api_key_secret = "anthropic_api_key"
 telegram_chat_ids = []
 thinking = "max"
 
 [models.gpt]
 wire_format = "responses"
-model_name = "gpt-5.6-sol"
+model_name = "gpt-6-astra"
 api_key_secret = "openai_api_key"
 telegram_chat_ids = []
 thinking = "high"
@@ -207,7 +207,7 @@ max_effort = "max"
 
 [models.grok]
 wire_format = "responses"
-model_name = "grok-4.5"
+model_name = "grok-4.7"
 base_url = "https://api.x.ai/v1"
 api_key_secret = "xai_api_key"
 telegram_chat_ids = []
@@ -215,15 +215,16 @@ thinking = "high"
 
 [models.meta]
 wire_format = "responses"
-model_name = "muse-spark-1.1"
+model_name = "muse-wonder-1.0"
 base_url = "https://api.meta.ai/v1"
 api_key_secret = "meta_model_api_key"
 telegram_chat_ids = []
 thinking = "max"
+max_effort = "max"
 
 [models.gemini]
 wire_format = "gemini"
-model_name = "gemini-3.6-flash"
+model_name = "gemini-4-argon"
 api_key_secret = "gemini_api_key"
 telegram_chat_ids = []
 thinking = "high"

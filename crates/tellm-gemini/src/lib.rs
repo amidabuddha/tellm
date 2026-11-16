@@ -11,9 +11,12 @@
 //!   `google_search_result` signatures. Stateless mode requires those
 //!   signatures back unchanged on future turns.
 //! - Thinking: `generation_config.thinking_level` for low/medium/high; omit
-//!   for `Off`; map `Max` to `high` because Interactions has no `max`.
-//!   Gemini 3.6 Flash supports all three mapped levels. Requests do not send
-//!   its deprecated sampling parameters and always end in a `user_input` step.
+//!   for `Off`; `Max` sends the model's `max_effort`, or `high` when unset
+//!   because Interactions has no level above it.
+//!   Gemini 4 Argon, 3.8 Flash and 3.6 Flash support all three mapped levels;
+//!   Gemini 4 Argon and 3.8 Flash reject `minimal`, which is never sent
+//!   (checked 2026-11-16). Requests do not send the deprecated sampling
+//!   parameters and always end in a `user_input` step.
 //! - Web search: `tools: [{type: "google_search", search_types:
 //!   ["web_search"]}]`.
 //! - Images/documents: native `image` and `document` content blocks with
