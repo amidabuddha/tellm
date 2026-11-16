@@ -298,6 +298,43 @@ async fn off_reasoning_and_no_options_omit_optional_fields() {
 }
 
 #[tokio::test]
+async fn xai_and_meta_request_encrypted_reasoning_even_when_reasoning_is_off() {
+    for model in ["grok-4.5", "muse-spark-1.1"] {
+        let mock = MockOpenAi::start(vec![MockResponse::json(
+            200,
+            json!({
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "ok" }]
+                    }
+                ]
+            }),
+        )]);
+        let mut req = request();
+        req.model = model.to_string();
+        req.history = Vec::new();
+        req.input = vec![ContentPart::Text {
+            text: "Hi".to_string(),
+        }];
+        req.thinking = ThinkingLevel::Off;
+        req.web_search = false;
+        req.image_generation = false;
+
+        client(&mock).chat(&req).await.unwrap();
+
+        let body = mock.requests()[0].json_body();
+        assert_missing(&body, "reasoning");
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "{model} reasons at every level and returns encrypted reasoning only on request"
+        );
+    }
+}
+
+#[tokio::test]
 async fn refusal_content_returns_refusal_error() {
     let mock = MockOpenAi::start(vec![MockResponse::json(
         200,

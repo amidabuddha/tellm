@@ -168,7 +168,12 @@ Notes:
   provider-native input/output items are replayed in `input`, and every
   response `output` item is returned in `turn_items` verbatim. When reasoning
   is requested, `include: ["reasoning.encrypted_content"]` is set so encrypted
-  reasoning can be replayed on later stateless turns. OpenAI system prompts use
+  reasoning can be replayed on later stateless turns. xAI and Meta get the
+  flag at every level, `off` included: their models reason anyway, both return
+  encrypted reasoning only on request (grok-4.7 always does), and Meta answers
+  a replayed reasoning item without it with HTTP 400 (checked 2026-11-16
+  against docs.x.ai and dev.meta.ai). OpenAI returns it by default and still
+  accepts the flag. OpenAI system prompts use
   top-level `instructions`; xAI currently rejects `instructions`, so xAI
   system prompts are sent as compatible input message items instead (checked
   2026-07-04; still shown as input messages in 2026-07-09 Grok 4.5 docs).

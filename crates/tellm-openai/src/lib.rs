@@ -6,7 +6,10 @@
 //! dev.meta.ai - re-check live provider docs before changing these mappings):
 //! - Reasoning: `reasoning: {"effort": ...}`; omit for ThinkingLevel::Off.
 //!   Include `reasoning.encrypted_content` when reasoning is requested so
-//!   stateless history can replay reasoning items later.
+//!   stateless history can replay reasoning items later. xAI and Meta get
+//!   the flag at every level, `Off` included: their models reason anyway and
+//!   return encrypted reasoning only on request (checked 2026-11-16 against
+//!   docs.x.ai and dev.meta.ai).
 //! - State: `store: false`; history is carried by raw input/output items in
 //!   `ChatRequest::history` / `ChatResponse::turn_items`.
 //! - System prompts: OpenAI uses top-level `instructions`; xAI currently
@@ -97,7 +100,7 @@ impl Provider for Responses {
         }
 
         let user_message = user_message(&request.input);
-        let body = request_body(request, user_message.clone(), is_xai);
+        let body = request_body(request, user_message.clone(), is_xai, is_meta);
         let response_body = self.send_request(body).await?;
         let output = response_body
             .get("output")
@@ -174,7 +177,7 @@ pub fn is_meta_model_api_endpoint(base_url: Option<&str>, model_name: &str) -> b
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("muse-spark"))
 }
 
-fn request_body(request: &ChatRequest, user_message: Value, is_xai: bool) -> Value {
+fn request_body(request: &ChatRequest, user_message: Value, is_xai: bool, is_meta: bool) -> Value {
     let mut input = Vec::new();
     if is_xai && let Some(system) = &request.system {
         // Checked 2026-07-04 against xAI Responses docs: `instructions` is
@@ -199,9 +202,19 @@ fn request_body(request: &ChatRequest, user_message: Value, is_xai: bool) -> Val
         body["instructions"] = json!(system);
     }
 
-    if let Some(effort) = responses_effort(request.thinking, &request.model, is_xai) {
+    let effort = responses_effort(request.thinking, &request.model, is_xai);
+    if let Some(effort) = effort {
         // Checked 2026-07-09 against OpenAI/xAI/Meta Responses reasoning docs.
         body["reasoning"] = json!({ "effort": effort });
+    }
+    if effort.is_some() || is_xai || is_meta {
+        // Checked 2026-11-16 against docs.x.ai (reasoning, best practices)
+        // and dev.meta.ai (Responses API). Grok and Muse models reason even
+        // when no effort is sent, and both APIs return `encrypted_content`
+        // only when asked (grok-4.7 always does). Under `store: false` Meta
+        // answers a replayed reasoning item that lacks it with HTTP 400, so
+        // `Off` must still ask. OpenAI returns it by default and keeps
+        // accepting the flag.
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
 
