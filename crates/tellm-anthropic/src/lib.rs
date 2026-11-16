@@ -15,6 +15,15 @@
 //!   including `web_search_tool_result` blocks with `encrypted_content`
 //!   (missing/modified => 400). That is what `ChatResponse::turn_items`
 //!   exists for — return the raw user + assistant message objects.
+//! - Thinking blocks are bound to everything sent before them: `system`,
+//!   `tools`, and every earlier message (checked 2026-11-16 against
+//!   platform.claude.com, preserved thinking / prefix checks). Replaying one
+//!   after any of that changed is a 400 on Claude Fable 5.2 ("The block is
+//!   bound to a different conversation") and can be one on the other models
+//!   with preserved thinking. Verbatim, append-only history keeps them valid;
+//!   once the runtime prunes earlier turns or the tool list changes, every
+//!   kept turn must go through [`without_thinking_blocks`] before it is sent
+//!   again.
 //! - Documents/images: native `document` / `image` content blocks (base64) —
 //!   PDFs pass through without client-side extraction.
 //! - Handle `stop_reason: "refusal"` before reading content
@@ -190,6 +199,55 @@ impl Anthropic {
 
         Ok(response_body)
     }
+}
+
+/// Rewrites one stored turn (the `turn_items` of an earlier
+/// [`ChatResponse`]) so it can still be replayed after the runtime changed
+/// what precedes it: earlier turns were pruned, or the tool list changed.
+///
+/// Checked 2026-11-16 against platform.claude.com (preserved thinking:
+/// prefix checks, change tools or instructions). Such a change invalidates
+/// the thinking in every kept turn, and thinking may only be left out as a
+/// leading run, a trailing run, or completely — never from the middle — so
+/// all of it goes: `thinking` and `redacted_thinking`, empty-text blocks
+/// included. Text and tool blocks stay valid without it, and
+/// `encrypted_content` is left untouched.
+///
+/// An assistant message that held nothing but thinking has nothing left to
+/// replay and is removed. If that leaves the turn without any assistant
+/// message, the result is empty so the caller drops the turn whole instead
+/// of keeping a question without its answer.
+pub fn without_thinking_blocks(turn_items: Vec<Value>) -> Vec<Value> {
+    let mut had_assistant = false;
+    let mut kept_assistant = false;
+    let mut kept = Vec::with_capacity(turn_items.len());
+
+    for mut item in turn_items {
+        if item.get("role").and_then(Value::as_str) == Some("assistant") {
+            had_assistant = true;
+            if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+                let blocks_before = content.len();
+                content.retain(|block| !is_thinking_block(block));
+                if content.is_empty() && blocks_before > 0 {
+                    continue;
+                }
+            }
+            kept_assistant = true;
+        }
+        kept.push(item);
+    }
+
+    if had_assistant && !kept_assistant {
+        return Vec::new();
+    }
+    kept
+}
+
+fn is_thinking_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
 }
 
 fn request_body(request: &ChatRequest, messages: Vec<Value>) -> Value {

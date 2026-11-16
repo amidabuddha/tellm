@@ -78,7 +78,9 @@ pub struct ChatRequest {
     pub system: Option<String>,
     /// Provider-native history: the concatenation of `turn_items` from prior
     /// [`ChatResponse`]s of the **same wire format** (and normally the same
-    /// model). Opaque to the runtime; interpreted only by the provider crate.
+    /// model). Opaque to the runtime; interpreted only by the provider crate,
+    /// which is also the only one to rewrite a kept turn after the runtime
+    /// pruned earlier turns or changed the tool list.
     pub history: Vec<serde_json::Value>,
     /// The new user turn, unified.
     pub input: Vec<ContentPart>,

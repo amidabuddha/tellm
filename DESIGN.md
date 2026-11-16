@@ -90,6 +90,13 @@ state, so:
 - History stays memory-bounded: retain at most 32 complete provider-native
   turns and approximately 4 MiB per room, pruning oldest whole turns so a
   request/response pair is never split.
+- Verbatim replay holds only while history is append-only. When the runtime
+  itself changes what precedes the kept turns — pruning for the bound above,
+  or a `/websearch` toggle, which changes the tool list — it hands each kept
+  turn back to the wire-format crate that produced it and stores what that
+  crate says is still replayable; a turn returned empty is dropped whole. The
+  runtime still never inspects the items. Anthropic removes thinking blocks
+  (see Notes); the other wire formats keep their turns unchanged.
 
 Thinking-level translation (verified against live provider docs 2026-07-05;
 Gemini 3.6 Flash refreshed 2026-07-26;
@@ -145,6 +152,18 @@ Notes:
   continuing the request with the paused assistant message appended; return all
   assistant messages from the loop in `turn_items` so opaque history remains
   replayable.
+- Anthropic thinking blocks are bound to everything sent before them:
+  `system`, `tools`, and every earlier message (checked 2026-11-16 against
+  platform.claude.com, preserved thinking / prefix checks). Replaying one
+  after any of that changed is a 400 on Claude Fable 5.2 and can be one on the
+  other models with preserved thinking. `system` cannot change under a kept
+  history (`/role` resets it), so the edits tellm makes are pruning and the
+  web-search tool toggle. After either, `tellm-anthropic` removes every
+  `thinking` and `redacted_thinking` block from the kept turns — all of them,
+  because a block may not be left out from between two that stay — and the
+  model continues without that earlier reasoning. An assistant message that
+  held only thinking is removed, and a turn left with no assistant message is
+  dropped whole.
 - OpenAI/Meta/xAI Responses are used statelessly (`store: false`): prior
   provider-native input/output items are replayed in `input`, and every
   response `output` item is returned in `turn_items` verbatim. When reasoning
@@ -218,9 +237,11 @@ Notes:
   model turns. `/model` and `/role` reset that room's in-memory history so
   provider-native opaque state is not replayed under a different model or
   system prompt; `/model unpin` does the same even if the effective wire format
-  does not change. Terminal `reset` clears all in-memory histories while keeping
-  room settings. Monotonic room generations prevent an older in-flight result
-  or rollback from repopulating reset or revoked state.
+  does not change. `/websearch` keeps the conversation: it changes the tool
+  list, not the instructions, so it only triggers the opaque-state repair
+  described in § Opaque provider state. Terminal `reset` clears all in-memory
+  histories while keeping room settings. Monotonic room generations prevent an
+  older in-flight result or rollback from repopulating reset or revoked state.
 - The `model_turn` boundary converts Telegram text, photos, and documents into
   core content parts. Downloads accept images, PDFs, and text documents up to
   20 MiB. Declared oversize files are rejected before download; unknown-length
