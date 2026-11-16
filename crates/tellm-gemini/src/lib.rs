@@ -21,7 +21,8 @@
 //!   ["web_search"]}]`.
 //! - Images/documents: native `image` and `document` content blocks with
 //!   inline base64 `data`.
-//! - Image generation: only Gemini image model ids (`*-image*`) are eligible;
+//! - Image generation: only Gemini image model ids are eligible, recognized
+//!   by name (`*-image*` or `*nano-banana*`, see [`is_image_generation_model`]);
 //!   request `response_format: {"type": "image"}`.
 
 use std::sync::OnceLock;
@@ -98,8 +99,21 @@ fn default_http_client() -> reqwest::Client {
         .clone()
 }
 
+/// Name fragments that mark a Gemini image generation model. `-image` covers
+/// gemini-3.1-flash-image and gemini-3-pro-image; `nano-banana` covers
+/// gemini-nano-banana-2.1, the current image model, whose id no longer
+/// carries `-image` (checked 2026-11-16 against ai.google.dev models and
+/// image generation docs).
+const IMAGE_MODEL_MARKERS: [&str; 2] = ["-image", "nano-banana"];
+
+/// Whether a Gemini model id names an image generation model. This is a
+/// fail-closed naming rule, not a capability lookup: an id that matches no
+/// marker is refused image generation before any request is sent.
 pub fn is_image_generation_model(model_name: &str) -> bool {
-    model_name.to_ascii_lowercase().contains("-image")
+    let model_name = model_name.to_ascii_lowercase();
+    IMAGE_MODEL_MARKERS
+        .iter()
+        .any(|marker| model_name.contains(marker))
 }
 
 impl Provider for Gemini {
@@ -198,7 +212,7 @@ fn request_body(
     if request.image_generation {
         if !is_image_generation_model(&request.model) {
             return Err(ProviderError::Unsupported(format!(
-                "Gemini image generation requires an image-capable model such as gemini-3.1-flash-image, not {}",
+                "Gemini image generation requires an image-capable model such as gemini-nano-banana-2.1, not {}",
                 request.model
             )));
         }

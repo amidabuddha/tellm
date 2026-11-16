@@ -2905,10 +2905,12 @@ mod tests {
         assert!(capabilities.web_search);
         assert!(!capabilities.image_generation);
 
-        config.models.get_mut("gemini").unwrap().model_name = "gemini-3.1-flash-image".to_string();
-        let capabilities = room_capabilities(&config, &room, 42);
-        assert!(capabilities.web_search);
-        assert!(capabilities.image_generation);
+        for image_model in ["gemini-3.1-flash-image", "gemini-nano-banana-2.1"] {
+            config.models.get_mut("gemini").unwrap().model_name = image_model.to_string();
+            let capabilities = room_capabilities(&config, &room, 42);
+            assert!(capabilities.web_search, "{image_model}");
+            assert!(capabilities.image_generation, "{image_model}");
+        }
     }
 
     #[test]

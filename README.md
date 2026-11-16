@@ -230,7 +230,7 @@ telegram_chat_ids = []
 thinking = "high"
 
 # Gemini image generation requires a Gemini image model id, for example:
-# model_name = "gemini-3.1-flash-image"
+# model_name = "gemini-nano-banana-2.1"
 
 # Any OpenAI chat-completions-compatible paid endpoint, such as Mistral,
 # DeepSeek, OpenRouter, or a proxy. base_url is required for compat models.

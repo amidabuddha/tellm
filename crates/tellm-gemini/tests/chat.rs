@@ -238,6 +238,52 @@ async fn image_generation_extracts_image_content() {
     );
 }
 
+#[test]
+fn image_model_rule_covers_current_google_image_ids() {
+    for model in [
+        "gemini-nano-banana-2.1",
+        "Gemini-Nano-Banana-2.1",
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-lite-image",
+        "gemini-3-pro-image",
+    ] {
+        assert!(tellm_gemini::is_image_generation_model(model), "{model}");
+    }
+    for model in ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash"] {
+        assert!(!tellm_gemini::is_image_generation_model(model), "{model}");
+    }
+}
+
+#[tokio::test]
+async fn nano_banana_model_is_accepted_for_image_generation() {
+    let mock = MockGemini::start(vec![MockResponse::json(
+        200,
+        json!({
+            "status": "completed",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [
+                        { "type": "image", "mime_type": "image/jpeg", "data": "BASE64JPEG" }
+                    ]
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.image_generation = true;
+    req.web_search = false;
+    req.model = "gemini-nano-banana-2.1".to_string();
+
+    let response = client(&mock).chat(&req).await.unwrap();
+
+    assert_eq!(response.images.len(), 1);
+    assert_eq!(response.images[0].media_type, "image/jpeg");
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["model"], "gemini-nano-banana-2.1");
+    assert_eq!(body["response_format"], json!({ "type": "image" }));
+}
+
 #[tokio::test]
 async fn image_generation_requires_image_model_before_network() {
     let mut req = request();

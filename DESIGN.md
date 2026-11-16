@@ -216,10 +216,13 @@ Notes:
   verbatim, including `thought` and Google Search call/result signatures.
   Web search is `tools: [{type:"google_search",
   search_types:["web_search"]}]`; image generation is allowed only for Gemini
-  image model ids (`*-image*`) and sends `response_format: {"type":"image"}`;
+  image model ids and sends `response_format: {"type":"image"}`;
   generated image content becomes `GeneratedImage`. The image-model gate is a
-  fail-closed naming heuristic, not a capability-discovery API; update it if
-  Google's public model ids stop using `-image`.
+  fail-closed naming heuristic, not a capability-discovery API: an id counts
+  when it contains `-image` (gemini-3.1-flash-image, gemini-3-pro-image) or
+  `nano-banana` (gemini-nano-banana-2.1, the current image model; checked
+  2026-11-16). Update it when Google's public image model ids change shape
+  again.
 - **File upload requires no extraction.** PDFs/images pass through natively:
   Anthropic `document`/`image` blocks, OpenAI `input_file`/`input_image`,
   Gemini `document`/`image` content blocks.
