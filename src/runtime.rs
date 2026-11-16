@@ -1094,7 +1094,7 @@ async fn handle_command(
             handles
                 .persistence
                 .mutate_room(&handles.rooms, chat_id, |room| {
-                    room.settings.web_search = enabled;
+                    room.set_web_search(enabled);
                 })
                 .await?;
             let state = if enabled { "on" } else { "off" };

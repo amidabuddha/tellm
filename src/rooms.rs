@@ -148,6 +148,19 @@ impl RoomState {
         self.invalidate_history();
     }
 
+    /// Apply a `/websearch` change. The tool list precedes the whole
+    /// conversation on the wire, so flipping it is a history edit for
+    /// provider state that is bound to what came before it; the conversation
+    /// itself is kept. Commands and model turns share the per-chat queue, so
+    /// no request built from the old history is in flight here.
+    pub fn set_web_search(&mut self, enabled: bool) {
+        if self.settings.web_search == enabled {
+            return;
+        }
+        self.settings.web_search = enabled;
+        self.history_prefix_changed();
+    }
+
     /// Commit a provider turn only if no reset or model transition happened
     /// while the request was in flight.
     pub fn append_turn_if_generation(
@@ -196,6 +209,24 @@ impl RoomState {
     }
 
     fn push_turn(&mut self, turn_items: Vec<Value>) {
+        self.store_turn(turn_items);
+
+        let mut pruned = false;
+        while self.history_turns.len() > MAX_HISTORY_TURNS
+            || self.history_bytes() > MAX_HISTORY_BYTES
+        {
+            let Some(oldest) = self.history_turns.pop_front() else {
+                break;
+            };
+            self.history.drain(..oldest.item_count);
+            pruned = true;
+        }
+        if pruned {
+            self.history_prefix_changed();
+        }
+    }
+
+    fn store_turn(&mut self, turn_items: Vec<Value>) {
         let turn = HistoryTurn {
             item_count: turn_items.len(),
             approx_bytes: turn_items.iter().fold(0_usize, |total, value| {
@@ -204,14 +235,24 @@ impl RoomState {
         };
         self.history.extend(turn_items);
         self.history_turns.push_back(turn);
+    }
 
-        while self.history_turns.len() > MAX_HISTORY_TURNS
-            || self.history_bytes() > MAX_HISTORY_BYTES
-        {
-            let Some(oldest) = self.history_turns.pop_front() else {
-                break;
-            };
-            self.history.drain(..oldest.item_count);
+    /// tellm changed what precedes the kept turns: it pruned earlier turns or
+    /// changed the tool list. Opaque items are interpreted only by the
+    /// wire-format crate that produced them, so that crate decides what is
+    /// still replayable. A turn it returns empty is dropped whole.
+    fn history_prefix_changed(&mut self) {
+        let replayable: fn(Vec<Value>) -> Vec<Value> = match self.wire_format {
+            Some(WireFormat::Anthropic) => tellm_anthropic::without_thinking_blocks,
+            Some(WireFormat::Responses | WireFormat::Compat | WireFormat::Gemini) | None => return,
+        };
+
+        let mut items = std::mem::take(&mut self.history).into_iter();
+        for turn in std::mem::take(&mut self.history_turns) {
+            let turn_items = replayable(items.by_ref().take(turn.item_count).collect());
+            if !turn_items.is_empty() {
+                self.store_turn(turn_items);
+            }
         }
     }
 
@@ -554,6 +595,123 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_thinking_is_replayed_verbatim_until_a_turn_is_pruned() {
+        let mut room = RoomState::new(RoomSettings::default());
+        for turn in 0..MAX_HISTORY_TURNS {
+            room.append_turn(WireFormat::Anthropic, anthropic_turn(turn));
+        }
+
+        assert_eq!(thinking_blocks(&room.history), MAX_HISTORY_TURNS);
+        assert_eq!(room.history[..2], anthropic_turn(0)[..]);
+
+        room.append_turn(WireFormat::Anthropic, anthropic_turn(MAX_HISTORY_TURNS));
+
+        // The kept turns now follow a different history than the one their
+        // thinking was produced after, so none of it may be replayed.
+        assert_eq!(room.history.len(), MAX_HISTORY_TURNS * 2);
+        assert_eq!(room.history[0]["content"][0]["text"], "question 1");
+        assert_eq!(thinking_blocks(&room.history), 0);
+        assert_eq!(
+            room.history.last().unwrap()["content"],
+            serde_json::json!([
+                { "type": "text", "text": format!("answer {MAX_HISTORY_TURNS}") }
+            ])
+        );
+        assert_eq!(
+            room.history_bytes(),
+            room.history.iter().map(approx_json_bytes).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn web_search_toggle_drops_anthropic_thinking_and_keeps_the_conversation() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.append_turn(WireFormat::Anthropic, anthropic_turn(0));
+        room.append_turn(WireFormat::Anthropic, anthropic_turn(1));
+        let generation = room.generation();
+        let bytes_with_thinking = room.history_bytes();
+
+        room.set_web_search(true);
+
+        assert!(room.settings.web_search);
+        assert_eq!(room.history.len(), 4);
+        assert_eq!(thinking_blocks(&room.history), 0);
+        assert_eq!(room.history[0]["content"][0]["text"], "question 0");
+        assert_eq!(room.history[3]["content"][0]["text"], "answer 1");
+        assert!(room.history_bytes() < bytes_with_thinking);
+        assert_eq!(room.generation(), generation);
+    }
+
+    #[test]
+    fn unchanged_web_search_setting_keeps_anthropic_history_verbatim() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.append_turn(WireFormat::Anthropic, anthropic_turn(0));
+
+        room.set_web_search(false);
+
+        assert_eq!(room.history, anthropic_turn(0));
+    }
+
+    #[test]
+    fn web_search_toggle_keeps_other_wire_formats_verbatim() {
+        let mut room = RoomState::new(RoomSettings::default());
+        let turn = vec![
+            serde_json::json!({ "type": "reasoning", "encrypted_content": "opaque" }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{ "type": "thinking", "thinking": "not Anthropic's" }]
+            }),
+        ];
+        room.append_turn(WireFormat::Responses, turn.clone());
+
+        room.set_web_search(true);
+
+        assert_eq!(room.history, turn);
+    }
+
+    #[test]
+    fn thinking_only_turn_is_dropped_whole_and_pruning_stays_turn_aligned() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.append_turn(WireFormat::Anthropic, anthropic_turn(0));
+        room.append_turn(
+            WireFormat::Anthropic,
+            vec![
+                serde_json::json!({
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "cut off" }]
+                }),
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "thinking",
+                        "thinking": "ran out of tokens",
+                        "signature": "sig-cut-off"
+                    }]
+                }),
+            ],
+        );
+        room.append_turn(WireFormat::Anthropic, anthropic_turn(2));
+
+        room.set_web_search(true);
+
+        assert_eq!(room.history.len(), 4);
+        assert_eq!(room.history[2]["content"][0]["text"], "question 2");
+
+        // Two turns are left; one more than the limit prunes exactly turn 0.
+        for turn in 3..=MAX_HISTORY_TURNS + 1 {
+            room.append_turn(WireFormat::Anthropic, anthropic_turn(turn));
+        }
+
+        assert_eq!(room.history.len(), MAX_HISTORY_TURNS * 2);
+        assert_eq!(room.history[0]["role"], "user");
+        assert_eq!(room.history[0]["content"][0]["text"], "question 2");
+        assert_eq!(
+            room.history_bytes(),
+            room.history.iter().map(approx_json_bytes).sum::<usize>()
+        );
+    }
+
+    #[test]
     fn reset_generation_rejects_stale_commit_and_rollback() {
         let mut room = RoomState::new(RoomSettings::default());
         room.append_turn(
@@ -690,6 +848,35 @@ mod tests {
 
         assert!(!committed);
         assert!(states.get(1).is_none());
+    }
+
+    fn anthropic_turn(turn: usize) -> Vec<Value> {
+        vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": format!("question {turn}") }]
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": format!("reasoning {turn}"),
+                        "signature": format!("sig-{turn}")
+                    },
+                    { "type": "text", "text": format!("answer {turn}") }
+                ]
+            }),
+        ]
+    }
+
+    fn thinking_blocks(history: &[Value]) -> usize {
+        history
+            .iter()
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .filter(|block| block["type"] == "thinking")
+            .count()
     }
 
     fn with_temp_config_dir(test: impl FnOnce(&std::path::Path)) {
