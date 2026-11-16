@@ -13,6 +13,9 @@ pub(crate) struct ProviderPreset {
     pub(crate) model_name: &'static str,
     pub(crate) base_url: Option<&'static str>,
     pub(crate) api_key_secret: &'static str,
+    /// Written to the model's `max_effort` config: the provider value for
+    /// `thinking = "max"`. `None` leaves the wire format's default tier.
+    pub(crate) max_effort: Option<&'static str>,
 }
 
 /// The built-in provider catalog, shared with /model add.
@@ -35,6 +38,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
         api_key_secret: Some(preset.api_key_secret.to_string()),
         telegram_chat_ids: Vec::new(),
         thinking: ThinkingLevel::default(),
+        max_effort: preset.max_effort.map(str::to_string),
     }
 }
 
@@ -56,6 +60,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         model_name: "claude-opus-5",
         base_url: None,
         api_key_secret: secrets::ANTHROPIC_API_KEY,
+        max_effort: None,
     },
     ProviderPreset {
         key: "openai",
@@ -64,6 +69,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         model_name: "gpt-5.6-sol",
         base_url: None,
         api_key_secret: secrets::OPENAI_API_KEY,
+        max_effort: Some("max"),
     },
     ProviderPreset {
         key: "xai",
@@ -72,6 +78,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         model_name: "grok-4.5",
         base_url: Some(tellm_openai::XAI_BASE_URL),
         api_key_secret: secrets::XAI_API_KEY,
+        max_effort: None,
     },
     ProviderPreset {
         key: "meta",
@@ -80,6 +87,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         model_name: "muse-spark-1.1",
         base_url: Some(tellm_openai::META_MODEL_API_BASE_URL),
         api_key_secret: secrets::META_MODEL_API_KEY,
+        max_effort: None,
     },
     ProviderPreset {
         key: "gemini",
@@ -88,6 +96,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         model_name: "gemini-3.6-flash",
         base_url: None,
         api_key_secret: secrets::GEMINI_API_KEY,
+        max_effort: None,
     },
 ];
 
@@ -266,6 +275,15 @@ mod tests {
         assert_eq!(model.base_url.as_deref(), Some(tellm_openai::XAI_BASE_URL));
         assert_eq!(model.api_key_secret.as_deref(), Some(secrets::XAI_API_KEY));
         assert!(model.telegram_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn preset_max_effort_is_written_to_the_model_config() {
+        let openai = model_config_from_preset(preset_by_key("openai").unwrap());
+        let xai = model_config_from_preset(preset_by_key("xai").unwrap());
+
+        assert_eq!(openai.max_effort.as_deref(), Some("max"));
+        assert_eq!(xai.max_effort, None);
     }
 
     #[test]

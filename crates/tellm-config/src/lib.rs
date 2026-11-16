@@ -75,6 +75,12 @@ pub struct ModelConfig {
     pub telegram_chat_ids: Vec<i64>,
     #[serde(default)]
     pub thinking: ThinkingLevel,
+    /// Provider value sent when the thinking level is `max`, such as `"max"`
+    /// or `"xhigh"`. The tiers above `high` differ from model to model, so
+    /// this is explicit instead of inferred from `model_name`. When unset,
+    /// the wire format's default top tier is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -121,6 +127,13 @@ impl Config {
             }
             if model.model_name.trim().is_empty() {
                 problems.push(format!("model \"{key}\": model_name must not be empty"));
+            }
+            if let Some(max_effort) = &model.max_effort
+                && (max_effort.is_empty() || max_effort.chars().any(char::is_whitespace))
+            {
+                problems.push(format!(
+                    "model \"{key}\": max_effort must be a single provider effort value such as \"max\" or \"xhigh\""
+                ));
             }
 
             if model.wire_format == WireFormat::Compat && model.base_url.is_none() {
@@ -941,6 +954,7 @@ mod tests {
             api_key_secret: (wire_format != WireFormat::Compat).then(|| "test_api_key".to_string()),
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: ThinkingLevel::default(),
+            max_effort: None,
         }
     }
 
@@ -1217,11 +1231,49 @@ mod tests {
         );
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(!text.contains("allow_insecure_http"));
+        assert!(!text.contains("max_effort"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert!(back.validate().is_ok());
         assert_eq!(back.default_model, "claude");
         assert_eq!(back.models["claude"].telegram_chat_ids, vec![1, 2]);
         assert!(!back.models["claude"].allow_insecure_http);
+        assert_eq!(back.models["claude"].max_effort, None);
+    }
+
+    #[test]
+    fn max_effort_roundtrips_through_toml_and_is_optional() {
+        let mut gpt = model(WireFormat::Responses, None, &[]);
+        gpt.max_effort = Some("max".to_string());
+        let c = config(&[("gpt", gpt)], "gpt");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("max_effort = \"max\""), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+
+        assert_eq!(back.models["gpt"].max_effort.as_deref(), Some("max"));
+        assert!(back.validate().is_ok());
+
+        // A config written before the setting existed still loads.
+        let legacy: Config = toml::from_str(
+            "default_model = \"gpt\"\n\n[models.gpt]\nwire_format = \"responses\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.models["gpt"].max_effort, None);
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn max_effort_must_be_one_token() {
+        for bad in ["", " ", "x high", "max\n"] {
+            let mut gpt = model(WireFormat::Responses, None, &[]);
+            gpt.max_effort = Some(bad.to_string());
+            let c = config(&[("gpt", gpt)], "gpt");
+
+            let p = problems(&c);
+
+            assert_eq!(p.len(), 1, "{bad:?}: {p:?}");
+            assert!(p[0].contains("max_effort"), "{bad:?}: {p:?}");
+        }
     }
 
     #[test]

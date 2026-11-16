@@ -202,6 +202,8 @@ model_name = "gpt-5.6-sol"
 api_key_secret = "openai_api_key"
 telegram_chat_ids = []
 thinking = "high"
+# Optional: the provider value sent for thinking = "max" / `/reasoning max`.
+max_effort = "max"
 
 [models.grok]
 wire_format = "responses"
@@ -278,6 +280,14 @@ selection is stored in `rooms.toml`, so these arrays usually stay empty.
 `thinking` in `config.toml` is the model default. A room only writes
 `thinking` to `rooms.toml` after `/reasoning LEVEL`; `/reasoning default`
 clears that room override and returns to the selected model's default.
+
+`max_effort` is optional. The tier above `high` differs from model to model,
+so tellm does not guess it from the model name: `max_effort` names the provider
+value sent for `thinking = "max"` and `/reasoning max`, for example `"max"` or
+`"xhigh"`. Without it tellm sends the wire format's default top tier: `max` for
+`anthropic`, `xhigh` for `responses`, and `high` for `compat` and `gemini`. Set
+it when a model's documentation lists a higher tier, or a lower one; built-in
+presets already carry the value their model needs.
 
 ## Setting Up Model Rooms
 

@@ -46,6 +46,9 @@ pub const WEB_SEARCH_MAX_USES: u32 = 5;
 /// Thinking tokens count toward max_tokens; Anthropic's adaptive-thinking
 /// examples use 16000 to leave room for thinking + text (checked 2026-07-12).
 pub const DEFAULT_MAX_TOKENS: u32 = 16000;
+/// Effort sent for `ThinkingLevel::Max` unless the model's `max_effort`
+/// config names another tier. Valid on every adaptive-thinking model.
+pub const DEFAULT_MAX_EFFORT: &str = "max";
 pub const MAX_PAUSE_TURN_CONTINUATIONS: usize = 5;
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -55,6 +58,7 @@ pub struct Anthropic {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    max_effort: Option<String>,
 }
 
 impl Anthropic {
@@ -66,7 +70,15 @@ impl Anthropic {
             http: default_http_client(),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
         }
+    }
+
+    /// Sets the effort value sent for `ThinkingLevel::Max`, from the model's
+    /// `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
+    pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
+        self.max_effort = max_effort;
+        self
     }
 
     pub fn with_base_url_and_timeout(
@@ -82,6 +94,7 @@ impl Anthropic {
                 .expect("valid reqwest client configuration"),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
         }
     }
 }
@@ -118,7 +131,7 @@ impl Provider for Anthropic {
         let mut text_parts = Vec::new();
 
         for continuation in 0..=MAX_PAUSE_TURN_CONTINUATIONS {
-            let body = request_body(request, messages.clone());
+            let body = request_body(request, messages.clone(), self.max_effort.as_deref());
             let response_body = self.send_request(body).await?;
 
             let stop_reason = response_body
@@ -250,7 +263,7 @@ fn is_thinking_block(block: &Value) -> bool {
     )
 }
 
-fn request_body(request: &ChatRequest, messages: Vec<Value>) -> Value {
+fn request_body(request: &ChatRequest, messages: Vec<Value>, max_effort: Option<&str>) -> Value {
     let mut body = json!({
         "model": request.model,
         "max_tokens": DEFAULT_MAX_TOKENS,
@@ -282,7 +295,7 @@ fn request_body(request: &ChatRequest, messages: Vec<Value>) -> Value {
         ]);
     }
 
-    if let Some(effort) = anthropic_effort(request.thinking) {
+    if let Some(effort) = anthropic_effort(request.thinking, max_effort) {
         // Checked 2026-07-04 against adaptive-thinking docs: adaptive mode uses
         // `thinking: {type: "adaptive"}` plus `output_config.effort`.
         body["thinking"] = json!({ "type": "adaptive" });
@@ -322,13 +335,13 @@ fn content_parts_to_anthropic(parts: &[ContentPart]) -> Vec<Value> {
         .collect()
 }
 
-fn anthropic_effort(thinking: ThinkingLevel) -> Option<&'static str> {
+fn anthropic_effort(thinking: ThinkingLevel, max_effort: Option<&str>) -> Option<&str> {
     match thinking {
         ThinkingLevel::Off => None,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Max => Some("max"),
+        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
     }
 }
 

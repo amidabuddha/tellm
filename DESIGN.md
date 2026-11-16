@@ -107,7 +107,7 @@ Opus 5 refreshed 2026-07-26; xAI and Meta top tiers refreshed 2026-11-16):
 |---|---|---|---|---|---|
 | off | omit `thinking` | omit `reasoning` | omit | omit `reasoning_effort` | omit `thinking_level` |
 | low/medium/high | adaptive + `output_config.effort` | `reasoning: {effort}` | same | `reasoning_effort` | `thinking_level` |
-| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "max"` on GPT-5.6, otherwise `"xhigh"` | `"xhigh"` (grok-4.5 treats it as `"high"`) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
+| max | `max_effort`, else `"max"` (valid on ALL adaptive models) | `max_effort`, else `"xhigh"` | same | `max_effort`, else `"high"` ("max" not in the dialect) | `max_effort`, else `"high"` |
 
 Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
 2026-07-26; xAI and Meta refreshed 2026-11-16):
@@ -115,15 +115,20 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   Sonnet 5, and Fable 5 think anyway; gpt-5.6-sol reasons at its own default;
   grok-4.5 defaults to high; Gemini thinks dynamically. User-facing text must
   say "default", not "off".
-- OpenAI effort is model-dependent: the built-in GPT-5.6 Sol preset supports
-  `max`, while older OpenAI families top out at `xhigh`. `/reasoning max`
-  therefore sends `max` to GPT-5.6 and `xhigh` to older OpenAI models. Meta
-  accepts `max` on muse-spark-1.3, muse-wonder-1.0, and muse-ember-1.0 only,
-  so those ids get `max` and every other Muse model gets `xhigh`. Grok 4.6 and
-  4.7 accept `xhigh` and Grok 4.5 treats it as `high`, so xAI's `Max` sends
-  `xhigh` and never `max`; no Grok model can disable reasoning, so `Off` omits
-  the field. An unsupported value errors explicitly and the user can lower
-  the room's level.
+- The tier above `high` differs from model to model, so it is configuration
+  and not code: `/reasoning max` sends the model's optional `max_effort` value
+  from `config.toml`, and the wire format's default when that is unset. The
+  defaults are `"max"` for Anthropic, `"xhigh"` for Responses (accepted by
+  GPT-5.2 and later, every Muse model, and every current Grok, where 4.5
+  treats it as `high`; an older OpenAI model that stops at `high` needs
+  `max_effort = "high"`), and `"high"` for chat completions and Gemini. Models
+  that list a higher tier opt in with `max_effort = "max"`: OpenAI's GPT-5.6,
+  GPT-6, and GPT-6.1 families, Meta's muse-wonder-1.0, muse-spark-1.3, and
+  muse-ember-1.0, and DeepSeek over chat completions. No Grok model lists
+  `max`. Built-in presets write the value their model needs. tellm checks only
+  that the value is one token; an unsupported value errors explicitly at the
+  provider and the user can lower the room's level. No Grok model can disable
+  reasoning, so `Off` omits the field.
 - Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
   model should be configured with `thinking = "low"` or `thinking = "high"`;
   gemini-3.1-pro and 3.6-flash accept medium.
@@ -372,7 +377,10 @@ restart and local room-setting changes.
   fallback.
 - Non-secrets: human-editable TOML at `dirs::config_dir()/tellm/config.toml`.
   **Capability routing is explicit** (`wire_format` field per model) — never
-  inferred from the spelling of user-chosen keys (parent-app lesson).
+  inferred from the spelling of user-chosen keys (parent-app lesson). The top
+  reasoning tier follows the same rule: the optional per-model `max_effort`
+  names the provider value for `thinking = "max"` instead of tellm inferring
+  it from `model_name`.
   Provider credentials are referenced by secret name (`api_key_secret`),
   never stored inline. Keyless endpoints, especially local Ollama, omit
   `api_key_secret`; `/model add KEY` must not open a key prompt for those
@@ -424,6 +432,7 @@ restart and local room-setting changes.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists; model keys are command-safe; model names and secret names are
   nonempty and secret names cannot use tellm's internal marker prefix;
+  `max_effort`, when present, is one whitespace-free token;
   non-compat models name a secret; compat models have a valid absolute URL;
   credential-bearing endpoints use HTTPS; non-loopback keyless compat HTTP has
   the explicit per-model opt-in described above; URLs contain no embedded

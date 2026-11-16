@@ -32,12 +32,17 @@ use tellm_core::{
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// `thinking_level` sent for `ThinkingLevel::Max` unless the model's
+/// `max_effort` config names another level. Interactions has no level above
+/// "high".
+pub const DEFAULT_MAX_EFFORT: &str = "high";
 
 #[derive(Clone)]
 pub struct Gemini {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    max_effort: Option<String>,
 }
 
 impl Gemini {
@@ -48,7 +53,15 @@ impl Gemini {
             http: default_http_client(),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
         }
+    }
+
+    /// Sets the `thinking_level` sent for `ThinkingLevel::Max`, from the
+    /// model's `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
+    pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
+        self.max_effort = max_effort;
+        self
     }
 
     pub fn with_base_url_and_timeout(
@@ -64,6 +77,7 @@ impl Gemini {
                 .expect("valid reqwest client configuration"),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
         }
     }
 }
@@ -88,7 +102,7 @@ pub fn is_image_generation_model(model_name: &str) -> bool {
 impl Provider for Gemini {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let user_step = user_input_step(&request.input)?;
-        let body = request_body(request, user_step.clone())?;
+        let body = request_body(request, user_step.clone(), self.max_effort.as_deref())?;
         let response_body = self.send_request(body).await?;
         let steps = response_body
             .get("steps")
@@ -140,7 +154,11 @@ impl Gemini {
     }
 }
 
-fn request_body(request: &ChatRequest, user_step: Value) -> Result<Value, ProviderError> {
+fn request_body(
+    request: &ChatRequest,
+    user_step: Value,
+    max_effort: Option<&str>,
+) -> Result<Value, ProviderError> {
     let mut input = request.history.clone();
     input.push(user_step);
 
@@ -158,7 +176,7 @@ fn request_body(request: &ChatRequest, user_step: Value) -> Result<Value, Provid
     }
 
     let mut generation_config = serde_json::Map::new();
-    if let Some(thinking) = thinking_level(request.thinking) {
+    if let Some(thinking) = thinking_level(request.thinking, max_effort) {
         generation_config.insert("thinking_level".to_string(), json!(thinking));
     }
     if !generation_config.is_empty() {
@@ -233,12 +251,13 @@ fn content_part(part: &ContentPart) -> Result<Value, ProviderError> {
     }
 }
 
-fn thinking_level(thinking: ThinkingLevel) -> Option<&'static str> {
+fn thinking_level(thinking: ThinkingLevel, max_effort: Option<&str>) -> Option<&str> {
     match thinking {
         ThinkingLevel::Off => None,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Max => Some("high"),
+        ThinkingLevel::High => Some("high"),
+        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
     }
 }
 

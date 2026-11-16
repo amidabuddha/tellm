@@ -196,7 +196,7 @@ async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
     let body = mock.requests()[0].json_body();
     assert_missing(&body, "instructions");
     assert_missing(&body, "max_output_tokens");
-    // Grok 4.6+ accept xhigh and grok-4.5 treats it as high: Max sends xhigh.
+    // No max_effort is configured, so Max sends the default top tier.
     assert_eq!(body["reasoning"], json!({ "effort": "xhigh" }));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(
@@ -259,6 +259,36 @@ async fn meta_model_api_uses_responses_with_xhigh_search_and_no_generation() {
             }
         ])
     );
+}
+
+#[tokio::test]
+async fn max_reasoning_sends_the_configured_max_effort() {
+    let mock = MockOpenAi::start(vec![MockResponse::json(
+        200,
+        json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "ok" }]
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Max;
+    req.web_search = false;
+    req.image_generation = false;
+
+    client(&mock)
+        .with_max_effort(Some("max".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["reasoning"], json!({ "effort": "max" }));
 }
 
 #[tokio::test]

@@ -2944,6 +2944,7 @@ mod tests {
             api_key_secret: Some("secret".to_string()),
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: tellm_core::ThinkingLevel::default(),
+            max_effort: None,
         }
     }
 

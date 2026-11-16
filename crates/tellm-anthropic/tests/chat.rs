@@ -378,6 +378,36 @@ async fn stalled_provider_request_times_out_instead_of_hanging() {
     assert_eq!(mock.requests()[0].path, "/v1/messages");
 }
 
+#[tokio::test]
+async fn max_reasoning_sends_max_unless_another_tier_is_configured() {
+    for (configured, expected) in [(None, "max"), (Some("xhigh"), "xhigh")] {
+        let mock = MockAnthropic::start(vec![MockResponse::json(
+            200,
+            json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "stop_reason": "end_turn"
+            }),
+        )]);
+        let mut req = request();
+        req.history = Vec::new();
+        req.thinking = ThinkingLevel::Max;
+
+        client(&mock)
+            .with_max_effort(configured.map(str::to_string))
+            .chat(&req)
+            .await
+            .unwrap();
+
+        let body = mock.requests()[0].json_body();
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(
+            body["output_config"],
+            json!({ "effort": expected }),
+            "configured max_effort: {configured:?}"
+        );
+    }
+}
+
 fn assert_missing(value: &Value, key: &str) {
     assert!(
         value.get(key).is_none(),

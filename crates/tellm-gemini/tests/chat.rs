@@ -327,6 +327,39 @@ async fn stalled_provider_request_times_out_instead_of_hanging() {
     assert_eq!(mock.requests()[0].path, "/v1beta/interactions");
 }
 
+#[tokio::test]
+async fn max_reasoning_sends_high_unless_another_level_is_configured() {
+    for (configured, expected) in [(None, "high"), (Some("medium"), "medium")] {
+        let mock = MockGemini::start(vec![MockResponse::json(
+            200,
+            json!({
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{ "type": "text", "text": "ok" }]
+                    }
+                ]
+            }),
+        )]);
+        let mut req = request();
+        req.history = Vec::new();
+        req.thinking = ThinkingLevel::Max;
+
+        client(&mock)
+            .with_max_effort(configured.map(str::to_string))
+            .chat(&req)
+            .await
+            .unwrap();
+
+        let body = mock.requests()[0].json_body();
+        assert_eq!(
+            body["generation_config"]["thinking_level"], expected,
+            "configured max_effort: {configured:?}"
+        );
+    }
+}
+
 fn assert_missing(value: &Value, key: &str) {
     assert!(
         value.get(key).is_none(),
