@@ -196,8 +196,8 @@ async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
     let body = mock.requests()[0].json_body();
     assert_missing(&body, "instructions");
     assert_missing(&body, "max_output_tokens");
-    // grok-4.5 has no xhigh effort: Max must clamp to high on xAI requests.
-    assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+    // Grok 4.6+ accept xhigh and grok-4.5 treats it as high: Max sends xhigh.
+    assert_eq!(body["reasoning"], json!({ "effort": "xhigh" }));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(
         body["tools"],

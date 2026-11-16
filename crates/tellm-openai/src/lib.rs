@@ -287,10 +287,13 @@ fn content_parts_to_responses(parts: &[ContentPart]) -> Vec<Value> {
 /// - GPT-5.6 (sol/terra/luna): none/low/medium/high/xhigh/**max** — Max→"max"
 ///   (checked 2026-07-09 against developers.openai.com latest-model guide).
 /// - Older OpenAI (gpt-5.5 …): none/minimal/low/medium/high/xhigh — Max→"xhigh".
-/// - Meta Muse Spark 1.1: minimal/low/medium/high/xhigh, no "none" — Max→"xhigh"
-///   (checked 2026-07-09 against dev.meta.ai reasoning docs).
-/// - xAI Grok 4.5: low/medium/high, default high, cannot disable — Max→"high"
-///   (checked 2026-07-09 against docs.x.ai reasoning docs).
+/// - Meta: minimal/low/medium/high/xhigh everywhere, no "none"; **max** only on
+///   muse-spark-1.3, muse-wonder-1.0 and muse-ember-1.0 — Max→"max" there,
+///   Max→"xhigh" on muse-spark-1.1/1.2 and the `-contributor` variants
+///   (checked 2026-11-16 against dev.meta.ai choose-a-model and Responses docs).
+/// - xAI Grok 4.6/4.7: low/medium/high/xhigh, default high, cannot disable;
+///   Grok 4.5 stops at high and treats xhigh as high — Max→"xhigh" for all,
+///   never "max" (checked 2026-11-16 against docs.x.ai reasoning docs).
 fn responses_effort(
     thinking: ThinkingLevel,
     model_name: &str,
@@ -301,18 +304,23 @@ fn responses_effort(
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Max if is_xai => Some("high"),
+        ThinkingLevel::Max if is_xai => Some("xhigh"),
         ThinkingLevel::Max if supports_max_effort(model_name) => Some("max"),
         ThinkingLevel::Max => Some("xhigh"),
     }
 }
 
 /// Whether the model accepts the `max` reasoning effort tier above `xhigh`.
-/// Only the OpenAI GPT-5.6 family lists it today; everything else (older
-/// OpenAI, Grok, Muse Spark) tops out at xhigh/high, so unverified models stay
-/// on the safe xhigh mapping until their docs are checked and added here.
+/// The OpenAI GPT-5.6 family lists it, and so do three Meta models, matched by
+/// exact id because their `-contributor` variants and older versions do not.
+/// Everything else stays on the safe xhigh mapping until its docs are checked
+/// and it is added here.
 fn supports_max_effort(model_name: &str) -> bool {
     model_name.starts_with("gpt-5.6")
+        || matches!(
+            model_name,
+            "muse-spark-1.3" | "muse-wonder-1.0" | "muse-ember-1.0"
+        )
 }
 
 fn extract_text(output: &[Value]) -> String {
@@ -423,29 +431,58 @@ mod tests {
             responses_effort(ThinkingLevel::Max, "gpt-5.6", false),
             Some("max")
         );
-        // Older OpenAI and Meta Muse Spark top out at xhigh.
+        // Older OpenAI tops out at xhigh.
         assert_eq!(
             responses_effort(ThinkingLevel::Max, "gpt-5.5", false),
             Some("xhigh")
         );
-        assert_eq!(
-            responses_effort(ThinkingLevel::Max, "muse-spark-1.1", false),
-            Some("xhigh")
-        );
-        // Grok cannot exceed high, even though "gpt-5.6" would — is_xai wins.
+        // Meta lists "max" on three exact ids; older Muse Spark versions and
+        // the contributor variants stop at xhigh.
+        for model in ["muse-spark-1.3", "muse-wonder-1.0", "muse-ember-1.0"] {
+            assert_eq!(
+                responses_effort(ThinkingLevel::Max, model, false),
+                Some("max"),
+                "{model}"
+            );
+        }
+        for model in [
+            "muse-spark-1.1",
+            "muse-spark-1.2",
+            "muse-spark-1.3-contributor",
+        ] {
+            assert_eq!(
+                responses_effort(ThinkingLevel::Max, model, false),
+                Some("xhigh"),
+                "{model}"
+            );
+        }
+        // Grok 4.6+ accept xhigh and 4.5 treats it as high. No Grok accepts
+        // "max", even under a name that would otherwise earn it — is_xai wins.
         assert_eq!(
             responses_effort(ThinkingLevel::Max, "grok-4.5", true),
-            Some("high")
+            Some("xhigh")
+        );
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, "grok-4.7", true),
+            Some("xhigh")
+        );
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, "gpt-5.6-sol", true),
+            Some("xhigh")
         );
     }
 
     #[test]
-    fn supports_max_effort_only_recognizes_gpt_5_6_family() {
+    fn supports_max_effort_recognizes_only_verified_models() {
         assert!(supports_max_effort("gpt-5.6"));
         assert!(supports_max_effort("gpt-5.6-sol"));
         assert!(supports_max_effort("gpt-5.6-terra"));
+        assert!(supports_max_effort("muse-spark-1.3"));
+        assert!(supports_max_effort("muse-wonder-1.0"));
+        assert!(supports_max_effort("muse-ember-1.0"));
         assert!(!supports_max_effort("gpt-5.5"));
         assert!(!supports_max_effort("grok-4.5"));
         assert!(!supports_max_effort("muse-spark-1.1"));
+        assert!(!supports_max_effort("muse-spark-1.3-contributor"));
     }
 }

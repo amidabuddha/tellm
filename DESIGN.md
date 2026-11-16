@@ -101,27 +101,29 @@ state, so:
 Thinking-level translation (verified against live provider docs 2026-07-05;
 Gemini 3.6 Flash refreshed 2026-07-26;
 OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10; Anthropic Claude
-Opus 5 refreshed 2026-07-26):
+Opus 5 refreshed 2026-07-26; xAI and Meta top tiers refreshed 2026-11-16):
 
 | Level | Anthropic Messages | OpenAI Responses | xAI Responses | Chat completions | Gemini |
 |---|---|---|---|---|---|
 | off | omit `thinking` | omit `reasoning` | omit | omit `reasoning_effort` | omit `thinking_level` |
 | low/medium/high | adaptive + `output_config.effort` | `reasoning: {effort}` | same | `reasoning_effort` | `thinking_level` |
-| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "max"` on GPT-5.6, otherwise `"xhigh"` | clamps to `"high"` (grok-4.5 has no xhigh) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
+| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "max"` on GPT-5.6, otherwise `"xhigh"` | `"xhigh"` (grok-4.5 treats it as `"high"`) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
 
 Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
-2026-07-26):
+2026-07-26; xAI and Meta refreshed 2026-11-16):
 - **"off" means provider default everywhere, not "no thinking"**: Opus 5,
   Sonnet 5, and Fable 5 think anyway; gpt-5.6-sol reasons at its own default;
   grok-4.5 defaults to high; Gemini thinks dynamically. User-facing text must
   say "default", not "off".
 - OpenAI effort is model-dependent: the built-in GPT-5.6 Sol preset supports
   `max`, while older OpenAI families top out at `xhigh`. `/reasoning max`
-  therefore sends `max` to GPT-5.6 and `xhigh` to older OpenAI models and Meta
-  Muse Spark. Grok 4.5
-  has no tier above `high` and cannot disable reasoning, so its `Max` clamps to
-  `high` and `Off` omits the field. An unsupported value errors explicitly and
-  the user can lower the room's level.
+  therefore sends `max` to GPT-5.6 and `xhigh` to older OpenAI models. Meta
+  accepts `max` on muse-spark-1.3, muse-wonder-1.0, and muse-ember-1.0 only,
+  so those ids get `max` and every other Muse model gets `xhigh`. Grok 4.6 and
+  4.7 accept `xhigh` and Grok 4.5 treats it as `high`, so xAI's `Max` sends
+  `xhigh` and never `max`; no Grok model can disable reasoning, so `Off` omits
+  the field. An unsupported value errors explicitly and the user can lower
+  the room's level.
 - Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
   model should be configured with `thinking = "low"` or `thinking = "high"`;
   gemini-3.1-pro and 3.6-flash accept medium.
