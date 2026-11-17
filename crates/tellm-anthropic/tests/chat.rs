@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tellm_anthropic::{
-    API_VERSION, Anthropic, CUT_OFF_NOTE, OUTPUT_LIMIT_BEFORE_TEXT, WEB_SEARCH_MAX_USES,
-    WEB_SEARCH_TOOL_TYPE,
+    API_VERSION, Anthropic, CUT_OFF_NOTE, DEFAULT_MAX_TOKENS, MAX_TOKENS_PER_REQUEST_TIMEOUT,
+    OUTPUT_LIMIT_BEFORE_TEXT, WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL_TYPE, request_timeout_for,
 };
 use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
 use tellm_test_support::{MockHttpServer as MockAnthropic, MockResponse};
@@ -503,6 +503,44 @@ async fn max_tokens_is_16000_unless_another_limit_is_configured() {
             "configured max_output_tokens: {configured:?}"
         );
     }
+}
+
+#[test]
+fn request_timeout_grows_with_the_output_limit_and_never_shrinks() {
+    let base = Duration::from_secs(600);
+
+    assert_eq!(request_timeout_for(base, 4_096), base);
+    assert_eq!(request_timeout_for(base, DEFAULT_MAX_TOKENS), base);
+    assert_eq!(
+        request_timeout_for(base, MAX_TOKENS_PER_REQUEST_TIMEOUT),
+        base
+    );
+    let at_64k = request_timeout_for(base, 64_000);
+    assert!(
+        (Duration::from_secs(1800)..Duration::from_secs(1801)).contains(&at_64k),
+        "{at_64k:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_larger_output_limit_waits_longer_before_timing_out() {
+    let mock = MockAnthropic::start_stalled();
+    let started = Instant::now();
+
+    let error = timeout(
+        Duration::from_secs(5),
+        short_timeout_client(&mock)
+            .with_max_tokens(Some(64_000))
+            .chat(&request()),
+    )
+    .await
+    .expect("client future should complete within test timeout")
+    .unwrap_err();
+
+    assert!(matches!(error, ProviderError::Http(_)), "{error}");
+    // The 50 ms base is tripled for a 64000-token limit.
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(140), "{waited:?}");
 }
 
 fn assert_missing(value: &Value, key: &str) {

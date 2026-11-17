@@ -146,11 +146,18 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   and 16000 when it is unset: thinking tokens count toward `max_tokens`, and
   4096 risked mid-thought truncation at high/max effort. The setting exists
   only for the Anthropic wire format, and validation rejects it elsewhere,
-  because the other formats send no output limit. Requests are not streamed
-  and time out after 10 minutes, which bounds the useful values: Anthropic's
-  SDKs refuse a non-streamed request above 21,333 `max_tokens` for that
-  reason, and its guidance is to avoid a large `max_tokens` without streaming
-  (checked 2026-11-16 against platform.claude.com, thinking and API errors).
+  because the other formats send no output limit.
+- A larger Anthropic limit is paid for in waiting, because requests are not
+  streamed and the whole reply arrives in one HTTP response. Anthropic's SDKs
+  refuse a non-streamed request above 21,333 `max_tokens`, the amount they
+  expect to fit in their 10-minute timeout, and its guidance is to avoid a
+  large `max_tokens` without streaming. tellm keeps the no-streaming boundary
+  and follows the guidance for direct integrations instead: the Anthropic
+  request timeout grows with the limit at that ratio and never drops below 10
+  minutes (30 minutes at 64000), and the client sets a 60-second TCP
+  keep-alive so that networks which drop idle connections do not drop a long
+  request (checked 2026-11-16 against platform.claude.com, thinking and API
+  errors). A request that still times out is an ordinary provider error.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
   `/websearch on` refuse in rooms whose wire format or model id can never
   honor them (image generation: Anthropic/compat/xAI/Meta/non-image Gemini models;

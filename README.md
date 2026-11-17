@@ -308,9 +308,9 @@ already carry it.
 `max_output_tokens` is optional and only for `anthropic` models. It is the
 limit on one reply, sent as `max_tokens`, and thinking counts toward it; the
 default is 16000. A reply that reaches the limit ends with a note saying it was
-cut off. tellm does not stream and gives up on a request after 10 minutes, so
-a much larger limit risks a timeout on long replies: Anthropic's own SDKs
-refuse non-streamed requests above 21,333.
+cut off. tellm does not stream, so a larger limit means a longer wait for one
+response: a request gets 10 minutes up to 21,333 tokens and proportionally
+longer above that, which is 30 minutes at 64000.
 
 ## Setting Up Model Rooms
 

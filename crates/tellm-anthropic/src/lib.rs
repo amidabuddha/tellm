@@ -51,12 +51,14 @@ pub const WEB_SEARCH_MAX_USES: u32 = 5;
 /// adaptive-thinking examples use 16000 to leave room for thinking + text
 /// (checked 2026-07-12).
 ///
-/// Requests are not streamed, which bounds how far this can usefully go:
-/// Anthropic's SDKs refuse a non-streamed request above 21,333 `max_tokens`
-/// because it could outlast a 10-minute timeout, and
-/// [`PROVIDER_REQUEST_TIMEOUT`] is that same 10 minutes (checked 2026-11-16
-/// against platform.claude.com, thinking and API errors).
+/// Requests are not streamed, so a larger limit means a longer wait for one
+/// HTTP response; see [`request_timeout_for`].
 pub const DEFAULT_MAX_TOKENS: u32 = 16000;
+/// The `max_tokens` a non-streamed request is expected to fit inside one
+/// [`PROVIDER_REQUEST_TIMEOUT`]. Anthropic's SDKs refuse a non-streamed
+/// request above 21,333 because it could outlast their 10-minute timeout
+/// (checked 2026-11-16 against platform.claude.com, thinking and API errors).
+pub const MAX_TOKENS_PER_REQUEST_TIMEOUT: u32 = 21_333;
 /// Effort sent for `ThinkingLevel::Max` unless the model's `max_effort`
 /// config names another tier. Valid on every adaptive-thinking model.
 pub const DEFAULT_MAX_EFFORT: &str = "max";
@@ -70,6 +72,12 @@ pub const OUTPUT_LIMIT_BEFORE_TEXT: &str =
     "the reply reached the max_tokens output limit before any answer text";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Idle time before TCP keep-alive probes start. A non-streamed reply sends
+/// nothing until it is complete, and Anthropic's guidance for direct API
+/// integrations is a TCP keep-alive, so that networks which drop idle
+/// connections do not drop a long request (checked 2026-11-16 against
+/// platform.claude.com, API errors, long requests).
+pub const PROVIDER_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Anthropic {
@@ -79,6 +87,7 @@ pub struct Anthropic {
     max_effort: Option<String>,
     off_effort: Option<String>,
     max_tokens: Option<u32>,
+    request_timeout: Duration,
 }
 
 impl Anthropic {
@@ -93,6 +102,7 @@ impl Anthropic {
             max_effort: None,
             off_effort: None,
             max_tokens: None,
+            request_timeout: PROVIDER_REQUEST_TIMEOUT,
         }
     }
 
@@ -127,6 +137,7 @@ impl Anthropic {
             http: reqwest::Client::builder()
                 .connect_timeout(PROVIDER_CONNECT_TIMEOUT.min(request_timeout))
                 .timeout(request_timeout)
+                .tcp_keepalive(PROVIDER_TCP_KEEPALIVE)
                 .build()
                 .expect("valid reqwest client configuration"),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
@@ -134,6 +145,7 @@ impl Anthropic {
             max_effort: None,
             off_effort: None,
             max_tokens: None,
+            request_timeout,
         }
     }
 }
@@ -145,10 +157,22 @@ fn default_http_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
                 .timeout(PROVIDER_REQUEST_TIMEOUT)
+                .tcp_keepalive(PROVIDER_TCP_KEEPALIVE)
                 .build()
                 .expect("valid reqwest client configuration")
         })
         .clone()
+}
+
+/// How long one request with this output limit may run. tellm does not
+/// stream, so the whole reply has to arrive inside a single HTTP response and
+/// a larger limit needs a longer wait. The timeout grows with the limit at
+/// the SDKs' ratio, [`MAX_TOKENS_PER_REQUEST_TIMEOUT`] tokens for each
+/// `base`, and never drops below `base`: 16000 keeps 10 minutes and 64000
+/// gets 30.
+pub fn request_timeout_for(base: Duration, max_tokens: u32) -> Duration {
+    let scale = f64::from(max_tokens) / f64::from(MAX_TOKENS_PER_REQUEST_TIMEOUT);
+    base.mul_f64(scale.max(1.0))
 }
 
 impl Provider for Anthropic {
@@ -260,6 +284,10 @@ impl Anthropic {
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
+            .timeout(request_timeout_for(
+                self.request_timeout,
+                self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            ))
             .json(&body)
             .send()
             .await?;
