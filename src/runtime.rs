@@ -2950,6 +2950,7 @@ mod tests {
             thinking: tellm_core::ThinkingLevel::default(),
             max_effort: None,
             off_effort: None,
+            max_output_tokens: None,
         }
     }
 

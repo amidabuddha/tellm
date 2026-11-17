@@ -88,6 +88,12 @@ pub struct ModelConfig {
     /// applies, which on some models is their highest tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off_effort: Option<String>,
+    /// Upper limit on one reply's output tokens, sent as Anthropic
+    /// `max_tokens`; thinking counts toward it. Only the `anthropic` wire
+    /// format takes it, because the other formats leave output length to the
+    /// provider. When unset, the Anthropic client's default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -144,6 +150,17 @@ impl Config {
                 {
                     problems.push(format!(
                         "model \"{key}\": {setting} must be a single provider effort value such as {examples}"
+                    ));
+                }
+            }
+            if let Some(max_output_tokens) = model.max_output_tokens {
+                if model.wire_format != WireFormat::Anthropic {
+                    problems.push(format!(
+                        "model \"{key}\": max_output_tokens is only used by the anthropic wire format"
+                    ));
+                } else if max_output_tokens == 0 {
+                    problems.push(format!(
+                        "model \"{key}\": max_output_tokens must be greater than zero"
                     ));
                 }
             }
@@ -968,6 +985,7 @@ mod tests {
             thinking: ThinkingLevel::default(),
             max_effort: None,
             off_effort: None,
+            max_output_tokens: None,
         }
     }
 
@@ -1246,6 +1264,7 @@ mod tests {
         assert!(!text.contains("allow_insecure_http"));
         assert!(!text.contains("max_effort"), "{text}");
         assert!(!text.contains("off_effort"), "{text}");
+        assert!(!text.contains("max_output_tokens"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert!(back.validate().is_ok());
         assert_eq!(back.default_model, "claude");
@@ -1311,6 +1330,47 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.models["meta"].off_effort, None);
         assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn max_output_tokens_roundtrips_through_toml_and_is_optional() {
+        let mut claude = model(WireFormat::Anthropic, None, &[]);
+        claude.max_output_tokens = Some(21_000);
+        let c = config(&[("claude", claude)], "claude");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("max_output_tokens = 21000"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+
+        assert_eq!(back.models["claude"].max_output_tokens, Some(21_000));
+        assert!(back.validate().is_ok());
+
+        // A config written before the setting existed still loads.
+        let legacy: Config = toml::from_str(
+            "default_model = \"claude\"\n\n[models.claude]\nwire_format = \"anthropic\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.models["claude"].max_output_tokens, None);
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn max_output_tokens_must_be_positive_and_on_an_anthropic_model() {
+        let mut claude = model(WireFormat::Anthropic, None, &[]);
+        claude.max_output_tokens = Some(0);
+        let p = problems(&config(&[("claude", claude)], "claude"));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("greater than zero"), "{p:?}");
+
+        // The other wire formats send no output limit, so the setting would
+        // be silently ignored there.
+        for wire_format in [WireFormat::Responses, WireFormat::Gemini] {
+            let mut other = model(wire_format, None, &[]);
+            other.max_output_tokens = Some(21_000);
+            let p = problems(&config(&[("other", other)], "other"));
+            assert_eq!(p.len(), 1, "{wire_format:?}: {p:?}");
+            assert!(p[0].contains("anthropic wire format"), "{p:?}");
+        }
     }
 
     #[test]

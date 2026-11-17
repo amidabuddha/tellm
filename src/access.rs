@@ -377,6 +377,7 @@ mod tests {
             thinking: ThinkingLevel::default(),
             max_effort: None,
             off_effort: None,
+            max_output_tokens: None,
         }
     }
 

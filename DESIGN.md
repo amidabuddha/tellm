@@ -142,8 +142,15 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   gemini-3.8-flash, and gemini-3.6-flash accept low/medium/high. Gemini 4
   Argon and 3.8 Flash reject `minimal`, which tellm never sends (checked
   2026-11-16).
-- Anthropic always sends `max_tokens: 16000`: thinking tokens count toward
-  `max_tokens`, and 4096 risked mid-thought truncation at high/max effort.
+- Anthropic sends the model's optional `max_output_tokens` as `max_tokens`,
+  and 16000 when it is unset: thinking tokens count toward `max_tokens`, and
+  4096 risked mid-thought truncation at high/max effort. The setting exists
+  only for the Anthropic wire format, and validation rejects it elsewhere,
+  because the other formats send no output limit. Requests are not streamed
+  and time out after 10 minutes, which bounds the useful values: Anthropic's
+  SDKs refuse a non-streamed request above 21,333 `max_tokens` for that
+  reason, and its guidance is to avoid a large `max_tokens` without streaming
+  (checked 2026-11-16 against platform.claude.com, thinking and API errors).
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
   `/websearch on` refuse in rooms whose wire format or model id can never
   honor them (image generation: Anthropic/compat/xAI/Meta/non-image Gemini models;
@@ -175,7 +182,7 @@ Notes:
   before any text. A cut-off answer is delivered with a closing note that says
   so, while the stored turn keeps the model's own content. A reply cut off
   before any text is a provider error, and the error reply suggests
-  `/reasoning low`.
+  `/reasoning low` or a higher `max_output_tokens`.
 - A reply with neither text nor an image is a failed turn in every wire
   format: nothing is stored and the chat gets an error. Stored, it would be
   replayed as a question without a visible answer, and a reasoning-only turn
@@ -465,7 +472,8 @@ restart and local room-setting changes.
   exists; model keys are command-safe; model names and secret names are
   nonempty and secret names cannot use tellm's internal marker prefix;
   `max_effort` and `off_effort`, when present, are each one whitespace-free
-  token;
+  token; `max_output_tokens`, when present, is positive and belongs to an
+  Anthropic model;
   non-compat models name a secret; compat models have a valid absolute URL;
   credential-bearing endpoints use HTTPS; non-loopback keyless compat HTTP has
   the explicit per-model opt-in described above; URLs contain no embedded

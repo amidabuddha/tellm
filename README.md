@@ -197,6 +197,8 @@ telegram_chat_ids = []
 thinking = "max"
 # Optional: the provider value sent for thinking = "off" / `/reasoning off`.
 off_effort = "low"
+# Optional, anthropic only: the reply limit in tokens, thinking included.
+# max_output_tokens = 16000
 
 [models.gpt]
 wire_format = "responses"
@@ -302,6 +304,13 @@ sent for `thinking = "off"` and `/reasoning off`, for example `"none"`,
 model reasons at its own default, which on some models is their highest tier.
 Set it to the lowest value the model's documentation lists; built-in presets
 already carry it.
+
+`max_output_tokens` is optional and only for `anthropic` models. It is the
+limit on one reply, sent as `max_tokens`, and thinking counts toward it; the
+default is 16000. A reply that reaches the limit ends with a note saying it was
+cut off. tellm does not stream and gives up on a request after 10 minutes, so
+a much larger limit risks a timeout on long replies: Anthropic's own SDKs
+refuse non-streamed requests above 21,333.
 
 ## Setting Up Model Rooms
 

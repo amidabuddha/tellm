@@ -46,8 +46,16 @@ pub const API_VERSION: &str = "2023-06-01";
 /// checked 2026-07-04 against platform.claude.com (web-search-tool docs)
 pub const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20260318";
 pub const WEB_SEARCH_MAX_USES: u32 = 5;
-/// Thinking tokens count toward max_tokens; Anthropic's adaptive-thinking
-/// examples use 16000 to leave room for thinking + text (checked 2026-07-12).
+/// `max_tokens` sent unless the model's `max_output_tokens` config names
+/// another limit. Thinking tokens count toward max_tokens; Anthropic's
+/// adaptive-thinking examples use 16000 to leave room for thinking + text
+/// (checked 2026-07-12).
+///
+/// Requests are not streamed, which bounds how far this can usefully go:
+/// Anthropic's SDKs refuse a non-streamed request above 21,333 `max_tokens`
+/// because it could outlast a 10-minute timeout, and
+/// [`PROVIDER_REQUEST_TIMEOUT`] is that same 10 minutes (checked 2026-11-16
+/// against platform.claude.com, thinking and API errors).
 pub const DEFAULT_MAX_TOKENS: u32 = 16000;
 /// Effort sent for `ThinkingLevel::Max` unless the model's `max_effort`
 /// config names another tier. Valid on every adaptive-thinking model.
@@ -70,6 +78,7 @@ pub struct Anthropic {
     api_key: String,
     max_effort: Option<String>,
     off_effort: Option<String>,
+    max_tokens: Option<u32>,
 }
 
 impl Anthropic {
@@ -83,6 +92,7 @@ impl Anthropic {
             api_key: api_key.into(),
             max_effort: None,
             off_effort: None,
+            max_tokens: None,
         }
     }
 
@@ -101,6 +111,13 @@ impl Anthropic {
         self
     }
 
+    /// Sets `max_tokens`, from the model's `max_output_tokens` config. `None`
+    /// keeps [`DEFAULT_MAX_TOKENS`].
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
     pub fn with_base_url_and_timeout(
         api_key: impl Into<String>,
         base_url: Option<String>,
@@ -116,6 +133,7 @@ impl Anthropic {
             api_key: api_key.into(),
             max_effort: None,
             off_effort: None,
+            max_tokens: None,
         }
     }
 }
@@ -157,6 +175,7 @@ impl Provider for Anthropic {
                 messages.clone(),
                 self.off_effort.as_deref(),
                 self.max_effort.as_deref(),
+                self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             );
             let response_body = self.send_request(body).await?;
 
@@ -312,10 +331,11 @@ fn request_body(
     messages: Vec<Value>,
     off_effort: Option<&str>,
     max_effort: Option<&str>,
+    max_tokens: u32,
 ) -> Value {
     let mut body = json!({
         "model": request.model,
-        "max_tokens": DEFAULT_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "messages": messages,
     });
 

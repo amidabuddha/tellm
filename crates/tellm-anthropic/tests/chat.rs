@@ -480,6 +480,31 @@ async fn off_reasoning_sends_the_configured_off_effort_without_asking_for_thinki
     assert_missing(&body, "thinking");
 }
 
+#[tokio::test]
+async fn max_tokens_is_16000_unless_another_limit_is_configured() {
+    for (configured, expected) in [(None, 16_000), (Some(21_000), 21_000)] {
+        let mock = MockAnthropic::start(vec![MockResponse::json(
+            200,
+            json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "stop_reason": "end_turn"
+            }),
+        )]);
+
+        client(&mock)
+            .with_max_tokens(configured)
+            .chat(&request())
+            .await
+            .unwrap();
+
+        let body = mock.requests()[0].json_body();
+        assert_eq!(
+            body["max_tokens"], expected,
+            "configured max_output_tokens: {configured:?}"
+        );
+    }
+}
+
 fn assert_missing(value: &Value, key: &str) {
     assert!(
         value.get(key).is_none(),

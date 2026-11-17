@@ -76,7 +76,8 @@ fn reset_notice(reset: HistoryReset) -> Option<String> {
 
 /// The room's model can change after a toggle was accepted, so a capability
 /// error can still surface per-message; suggest the off switch. A reply that
-/// used its whole output limit on thinking gets the setting that thinks less.
+/// used its whole output limit on thinking gets the two settings that help:
+/// less thinking, or a higher limit.
 pub(crate) fn provider_error_reply(error: &str) -> String {
     // Provider error texts use both spellings ("image generation" from
     // Anthropic/compat, "image_generation" from the xAI backstop) — match
@@ -87,7 +88,9 @@ pub(crate) fn provider_error_reply(error: &str) -> String {
     } else if error.contains("web search") || error.contains("web_search") {
         reply.push_str("\nTip: /websearch off");
     } else if error.contains("output limit") {
-        reply.push_str("\nTip: /reasoning low");
+        reply.push_str(
+            "\nTip: /reasoning low, or raise max_output_tokens for this model in config.toml",
+        );
     }
     reply
 }
@@ -118,6 +121,7 @@ pub(crate) async fn dispatch_provider(
             Anthropic::new(api_key, model.base_url.clone())
                 .with_max_effort(model.max_effort.clone())
                 .with_off_effort(model.off_effort.clone())
+                .with_max_tokens(model.max_output_tokens)
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -437,6 +441,7 @@ mod tests {
         let reply = provider_error_reply(&error);
 
         assert!(reply.contains("Tip: /reasoning low"), "{reply}");
+        assert!(reply.contains("max_output_tokens"), "{reply}");
     }
 
     #[test]
@@ -703,6 +708,7 @@ mod tests {
             thinking: tellm_core::ThinkingLevel::High,
             max_effort: None,
             off_effort: None,
+            max_output_tokens: None,
         }
     }
 }

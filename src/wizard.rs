@@ -44,6 +44,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
         thinking: ThinkingLevel::default(),
         max_effort: preset.max_effort.map(str::to_string),
         off_effort: preset.off_effort.map(str::to_string),
+        max_output_tokens: None,
     }
 }
 
