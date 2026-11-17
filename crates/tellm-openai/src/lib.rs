@@ -49,6 +49,7 @@ pub struct Responses {
     base_url: String,
     api_key: String,
     max_effort: Option<String>,
+    off_effort: Option<String>,
 }
 
 impl Responses {
@@ -60,6 +61,7 @@ impl Responses {
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| OPENAI_BASE_URL.to_string())),
             api_key: api_key.into(),
             max_effort: None,
+            off_effort: None,
         }
     }
 
@@ -67,6 +69,14 @@ impl Responses {
     /// model's `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
     pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
         self.max_effort = max_effort;
+        self
+    }
+
+    /// Sets the `reasoning.effort` sent for `ThinkingLevel::Off`, from the
+    /// model's `off_effort` config. `None` omits `reasoning`, so the model
+    /// reasons at its own default.
+    pub fn with_off_effort(mut self, off_effort: Option<String>) -> Self {
+        self.off_effort = off_effort;
         self
     }
 
@@ -84,6 +94,7 @@ impl Responses {
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| OPENAI_BASE_URL.to_string())),
             api_key: api_key.into(),
             max_effort: None,
+            off_effort: None,
         }
     }
 }
@@ -123,6 +134,7 @@ impl Provider for Responses {
             user_message.clone(),
             is_xai,
             is_meta,
+            self.off_effort.as_deref(),
             self.max_effort.as_deref(),
         );
         let response_body = self.send_request(body).await?;
@@ -206,6 +218,7 @@ fn request_body(
     user_message: Value,
     is_xai: bool,
     is_meta: bool,
+    off_effort: Option<&str>,
     max_effort: Option<&str>,
 ) -> Value {
     let mut input = Vec::new();
@@ -232,7 +245,7 @@ fn request_body(
         body["instructions"] = json!(system);
     }
 
-    let effort = responses_effort(request.thinking, max_effort);
+    let effort = responses_effort(request.thinking, off_effort, max_effort);
     if let Some(effort) = effort {
         // Checked 2026-07-09 against OpenAI/xAI/Meta Responses reasoning docs.
         body["reasoning"] = json!({ "effort": effort });
@@ -309,10 +322,15 @@ fn content_parts_to_responses(parts: &[ContentPart]) -> Vec<Value> {
         .collect()
 }
 
-/// Maps our five thinking levels onto `reasoning.effort`. `Off` always omits
-/// the field (every family then reasons at its own default — Grok and Muse
-/// models cannot disable reasoning at all, so omission is the closest honest
-/// mapping). Low, medium and high mean the same everywhere.
+/// Maps our five thinking levels onto `reasoning.effort`. Low, medium and
+/// high mean the same everywhere; the two ends are the model's config.
+///
+/// `Off` sends the model's `off_effort` and omits the field when that is
+/// unset, so every family then reasons at its own default. What the lowest
+/// tier is differs per model: some OpenAI models accept "none", while Grok
+/// and Muse models cannot disable reasoning, and Muse Wonder's default is
+/// "max" with "minimal" as its shortest pass (checked 2026-11-17 against
+/// dev.meta.ai reasoning and Muse Wonder docs).
 ///
 /// The tier above `high` is the part that differs per model, so it is the
 /// model's `max_effort` config rather than a list of model names here, and
@@ -323,9 +341,13 @@ fn content_parts_to_responses(parts: &[ContentPart]) -> Vec<Value> {
 ///   muse-wonder-1.0, muse-spark-1.3 and muse-ember-1.0; "xhigh" elsewhere.
 /// - xAI (docs.x.ai reasoning docs): Grok 4.6/4.7 stop at "xhigh", and Grok
 ///   4.5 treats "xhigh" as "high". No Grok model lists "max".
-fn responses_effort(thinking: ThinkingLevel, max_effort: Option<&str>) -> Option<&str> {
+fn responses_effort<'a>(
+    thinking: ThinkingLevel,
+    off_effort: Option<&'a str>,
+    max_effort: Option<&'a str>,
+) -> Option<&'a str> {
     match thinking {
-        ThinkingLevel::Off => None,
+        ThinkingLevel::Off => off_effort,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),
@@ -393,24 +415,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effort_off_omits_field_whatever_the_configured_max() {
-        assert_eq!(responses_effort(ThinkingLevel::Off, None), None);
-        assert_eq!(responses_effort(ThinkingLevel::Off, Some("max")), None);
+    fn off_sends_the_configured_tier_or_omits_the_field() {
+        assert_eq!(responses_effort(ThinkingLevel::Off, None, None), None);
+        assert_eq!(
+            responses_effort(ThinkingLevel::Off, None, Some("max")),
+            None,
+            "the configured max tier must not leak into off"
+        );
+        assert_eq!(
+            responses_effort(ThinkingLevel::Off, Some("minimal"), Some("max")),
+            Some("minimal")
+        );
     }
 
     #[test]
-    fn effort_low_medium_high_ignore_the_configured_max() {
-        for max_effort in [None, Some("max")] {
+    fn effort_low_medium_high_ignore_the_configured_ends() {
+        for (off_effort, max_effort) in [(None, None), (Some("none"), Some("max"))] {
             assert_eq!(
-                responses_effort(ThinkingLevel::Low, max_effort),
+                responses_effort(ThinkingLevel::Low, off_effort, max_effort),
                 Some("low")
             );
             assert_eq!(
-                responses_effort(ThinkingLevel::Medium, max_effort),
+                responses_effort(ThinkingLevel::Medium, off_effort, max_effort),
                 Some("medium")
             );
             assert_eq!(
-                responses_effort(ThinkingLevel::High, max_effort),
+                responses_effort(ThinkingLevel::High, off_effort, max_effort),
                 Some("high")
             );
         }
@@ -419,14 +449,17 @@ mod tests {
     #[test]
     fn max_sends_the_configured_tier_or_the_safe_default() {
         // No model names are consulted: an unset value sends the default tier.
-        assert_eq!(responses_effort(ThinkingLevel::Max, None), Some("xhigh"));
+        assert_eq!(
+            responses_effort(ThinkingLevel::Max, None, None),
+            Some("xhigh")
+        );
         assert_eq!(DEFAULT_MAX_EFFORT, "xhigh");
         assert_eq!(
-            responses_effort(ThinkingLevel::Max, Some("max")),
+            responses_effort(ThinkingLevel::Max, Some("low"), Some("max")),
             Some("max")
         );
         assert_eq!(
-            responses_effort(ThinkingLevel::Max, Some("high")),
+            responses_effort(ThinkingLevel::Max, None, Some("high")),
             Some("high")
         );
     }

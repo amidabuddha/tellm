@@ -455,6 +455,31 @@ async fn max_reasoning_sends_max_unless_another_tier_is_configured() {
     }
 }
 
+#[tokio::test]
+async fn off_reasoning_sends_the_configured_off_effort_without_asking_for_thinking() {
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "stop_reason": "end_turn"
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Off;
+
+    client(&mock)
+        .with_off_effort(Some("low".to_string()))
+        .with_max_effort(Some("xhigh".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["output_config"], json!({ "effort": "low" }));
+    assert_missing(&body, "thinking");
+}
+
 fn assert_missing(value: &Value, key: &str) {
     assert!(
         value.get(key).is_none(),

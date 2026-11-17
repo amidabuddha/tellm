@@ -69,6 +69,7 @@ pub struct Anthropic {
     base_url: String,
     api_key: String,
     max_effort: Option<String>,
+    off_effort: Option<String>,
 }
 
 impl Anthropic {
@@ -81,6 +82,7 @@ impl Anthropic {
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
             max_effort: None,
+            off_effort: None,
         }
     }
 
@@ -88,6 +90,14 @@ impl Anthropic {
     /// `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
     pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
         self.max_effort = max_effort;
+        self
+    }
+
+    /// Sets the effort value sent for `ThinkingLevel::Off`, from the model's
+    /// `off_effort` config. `None` sends no effort, so the model's own
+    /// default applies.
+    pub fn with_off_effort(mut self, off_effort: Option<String>) -> Self {
+        self.off_effort = off_effort;
         self
     }
 
@@ -105,6 +115,7 @@ impl Anthropic {
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
             max_effort: None,
+            off_effort: None,
         }
     }
 }
@@ -141,7 +152,12 @@ impl Provider for Anthropic {
         let mut text_parts = Vec::new();
 
         for continuation in 0..=MAX_PAUSE_TURN_CONTINUATIONS {
-            let body = request_body(request, messages.clone(), self.max_effort.as_deref());
+            let body = request_body(
+                request,
+                messages.clone(),
+                self.off_effort.as_deref(),
+                self.max_effort.as_deref(),
+            );
             let response_body = self.send_request(body).await?;
 
             let stop_reason = response_body
@@ -291,7 +307,12 @@ fn is_thinking_block(block: &Value) -> bool {
     )
 }
 
-fn request_body(request: &ChatRequest, messages: Vec<Value>, max_effort: Option<&str>) -> Value {
+fn request_body(
+    request: &ChatRequest,
+    messages: Vec<Value>,
+    off_effort: Option<&str>,
+    max_effort: Option<&str>,
+) -> Value {
     let mut body = json!({
         "model": request.model,
         "max_tokens": DEFAULT_MAX_TOKENS,
@@ -323,10 +344,17 @@ fn request_body(request: &ChatRequest, messages: Vec<Value>, max_effort: Option<
         ]);
     }
 
-    if let Some(effort) = anthropic_effort(request.thinking, max_effort) {
-        // Checked 2026-07-04 against adaptive-thinking docs: adaptive mode uses
-        // `thinking: {type: "adaptive"}` plus `output_config.effort`.
-        body["thinking"] = json!({ "type": "adaptive" });
+    if let Some(effort) = anthropic_effort(request.thinking, off_effort, max_effort) {
+        if request.thinking != ThinkingLevel::Off {
+            // Checked 2026-07-04 against adaptive-thinking docs: adaptive mode
+            // uses `thinking: {type: "adaptive"}` plus `output_config.effort`.
+            body["thinking"] = json!({ "type": "adaptive" });
+        }
+        // `Off` with an `off_effort` still does not ask for thinking; it only
+        // names the effort. Checked 2026-11-16 against platform.claude.com
+        // (effort): effort applies to every output token, with or without
+        // thinking, and it is the control for thinking depth on models whose
+        // adaptive thinking is always on, such as Claude Fable 5.2.
         body["output_config"] = json!({ "effort": effort });
     }
 
@@ -363,9 +391,13 @@ fn content_parts_to_anthropic(parts: &[ContentPart]) -> Vec<Value> {
         .collect()
 }
 
-fn anthropic_effort(thinking: ThinkingLevel, max_effort: Option<&str>) -> Option<&str> {
+fn anthropic_effort<'a>(
+    thinking: ThinkingLevel,
+    off_effort: Option<&'a str>,
+    max_effort: Option<&'a str>,
+) -> Option<&'a str> {
     match thinking {
-        ThinkingLevel::Off => None,
+        ThinkingLevel::Off => off_effort,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),

@@ -47,6 +47,7 @@ pub struct Gemini {
     base_url: String,
     api_key: String,
     max_effort: Option<String>,
+    off_effort: Option<String>,
 }
 
 impl Gemini {
@@ -58,6 +59,7 @@ impl Gemini {
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
             max_effort: None,
+            off_effort: None,
         }
     }
 
@@ -65,6 +67,14 @@ impl Gemini {
     /// model's `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
     pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
         self.max_effort = max_effort;
+        self
+    }
+
+    /// Sets the `thinking_level` sent for `ThinkingLevel::Off`, from the
+    /// model's `off_effort` config. `None` omits the field, so the model's
+    /// own default applies.
+    pub fn with_off_effort(mut self, off_effort: Option<String>) -> Self {
+        self.off_effort = off_effort;
         self
     }
 
@@ -82,6 +92,7 @@ impl Gemini {
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
             max_effort: None,
+            off_effort: None,
         }
     }
 }
@@ -119,7 +130,12 @@ pub fn is_image_generation_model(model_name: &str) -> bool {
 impl Provider for Gemini {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let user_step = user_input_step(&request.input)?;
-        let body = request_body(request, user_step.clone(), self.max_effort.as_deref())?;
+        let body = request_body(
+            request,
+            user_step.clone(),
+            self.off_effort.as_deref(),
+            self.max_effort.as_deref(),
+        )?;
         let response_body = self.send_request(body).await?;
         let steps = response_body
             .get("steps")
@@ -174,6 +190,7 @@ impl Gemini {
 fn request_body(
     request: &ChatRequest,
     user_step: Value,
+    off_effort: Option<&str>,
     max_effort: Option<&str>,
 ) -> Result<Value, ProviderError> {
     let mut input = request.history.clone();
@@ -193,7 +210,7 @@ fn request_body(
     }
 
     let mut generation_config = serde_json::Map::new();
-    if let Some(thinking) = thinking_level(request.thinking, max_effort) {
+    if let Some(thinking) = thinking_level(request.thinking, off_effort, max_effort) {
         generation_config.insert("thinking_level".to_string(), json!(thinking));
     }
     if !generation_config.is_empty() {
@@ -268,9 +285,15 @@ fn content_part(part: &ContentPart) -> Result<Value, ProviderError> {
     }
 }
 
-fn thinking_level(thinking: ThinkingLevel, max_effort: Option<&str>) -> Option<&str> {
+/// Off omits the level unless the model's `off_effort` config names one,
+/// and Max takes `max_effort` before [`DEFAULT_MAX_EFFORT`].
+fn thinking_level<'a>(
+    thinking: ThinkingLevel,
+    off_effort: Option<&'a str>,
+    max_effort: Option<&'a str>,
+) -> Option<&'a str> {
     match thinking {
-        ThinkingLevel::Off => None,
+        ThinkingLevel::Off => off_effort,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),

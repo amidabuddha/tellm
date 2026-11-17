@@ -81,6 +81,13 @@ pub struct ModelConfig {
     /// the wire format's default top tier is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_effort: Option<String>,
+    /// Provider value sent when the thinking level is `off`, such as
+    /// `"none"`, `"minimal"` or `"low"`. Whether reasoning can be disabled,
+    /// and what the lowest tier is called, differs from model to model. When
+    /// unset, no reasoning setting is sent and the provider's own default
+    /// applies, which on some models is their highest tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -128,12 +135,17 @@ impl Config {
             if model.model_name.trim().is_empty() {
                 problems.push(format!("model \"{key}\": model_name must not be empty"));
             }
-            if let Some(max_effort) = &model.max_effort
-                && (max_effort.is_empty() || max_effort.chars().any(char::is_whitespace))
-            {
-                problems.push(format!(
-                    "model \"{key}\": max_effort must be a single provider effort value such as \"max\" or \"xhigh\""
-                ));
+            for (setting, value, examples) in [
+                ("max_effort", &model.max_effort, "\"max\" or \"xhigh\""),
+                ("off_effort", &model.off_effort, "\"none\" or \"low\""),
+            ] {
+                if let Some(value) = value
+                    && (value.is_empty() || value.chars().any(char::is_whitespace))
+                {
+                    problems.push(format!(
+                        "model \"{key}\": {setting} must be a single provider effort value such as {examples}"
+                    ));
+                }
             }
 
             if model.wire_format == WireFormat::Compat && model.base_url.is_none() {
@@ -955,6 +967,7 @@ mod tests {
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: ThinkingLevel::default(),
             max_effort: None,
+            off_effort: None,
         }
     }
 
@@ -1232,12 +1245,14 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(!text.contains("allow_insecure_http"));
         assert!(!text.contains("max_effort"), "{text}");
+        assert!(!text.contains("off_effort"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert!(back.validate().is_ok());
         assert_eq!(back.default_model, "claude");
         assert_eq!(back.models["claude"].telegram_chat_ids, vec![1, 2]);
         assert!(!back.models["claude"].allow_insecure_http);
         assert_eq!(back.models["claude"].max_effort, None);
+        assert_eq!(back.models["claude"].off_effort, None);
     }
 
     #[test]
@@ -1273,6 +1288,42 @@ mod tests {
 
             assert_eq!(p.len(), 1, "{bad:?}: {p:?}");
             assert!(p[0].contains("max_effort"), "{bad:?}: {p:?}");
+        }
+    }
+
+    #[test]
+    fn off_effort_roundtrips_through_toml_and_is_optional() {
+        let mut meta = model(WireFormat::Responses, None, &[]);
+        meta.off_effort = Some("minimal".to_string());
+        let c = config(&[("meta", meta)], "meta");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("off_effort = \"minimal\""), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+
+        assert_eq!(back.models["meta"].off_effort.as_deref(), Some("minimal"));
+        assert!(back.validate().is_ok());
+
+        // A config written before the setting existed still loads.
+        let legacy: Config = toml::from_str(
+            "default_model = \"meta\"\n\n[models.meta]\nwire_format = \"responses\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.models["meta"].off_effort, None);
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn off_effort_must_be_one_token() {
+        for bad in ["", " ", "very low", "none\n"] {
+            let mut gpt = model(WireFormat::Responses, None, &[]);
+            gpt.off_effort = Some(bad.to_string());
+            let c = config(&[("gpt", gpt)], "gpt");
+
+            let p = problems(&c);
+
+            assert_eq!(p.len(), 1, "{bad:?}: {p:?}");
+            assert!(p[0].contains("off_effort"), "{bad:?}: {p:?}");
         }
     }
 

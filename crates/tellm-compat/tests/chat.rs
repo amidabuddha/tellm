@@ -292,6 +292,34 @@ async fn max_reasoning_sends_high_unless_another_tier_is_configured() {
     }
 }
 
+#[tokio::test]
+async fn off_reasoning_sends_the_configured_off_effort() {
+    let mock = MockCompat::start(vec![MockResponse::json(
+        200,
+        json!({
+            "choices": [
+                {
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop"
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Off;
+
+    client(&mock)
+        .with_off_effort(Some("none".to_string()))
+        .with_max_effort(Some("max".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["reasoning_effort"], "none");
+}
+
 fn assert_missing(value: &Value, key: &str) {
     assert!(
         value.get(key).is_none(),

@@ -2949,6 +2949,7 @@ mod tests {
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: tellm_core::ThinkingLevel::default(),
             max_effort: None,
+            off_effort: None,
         }
     }
 

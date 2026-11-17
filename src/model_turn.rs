@@ -117,6 +117,7 @@ pub(crate) async fn dispatch_provider(
             let api_key = required_api_key(model).await?;
             Anthropic::new(api_key, model.base_url.clone())
                 .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -125,6 +126,7 @@ pub(crate) async fn dispatch_provider(
             let api_key = required_api_key(model).await?;
             Responses::new(api_key, model.base_url.clone())
                 .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -149,6 +151,7 @@ pub(crate) async fn dispatch_provider(
             ollama::remember_model(&base_url, &requested_model);
             Compat::new(api_key, base_url)
                 .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -157,6 +160,7 @@ pub(crate) async fn dispatch_provider(
             let api_key = required_api_key(model).await?;
             Gemini::new(api_key, model.base_url.clone())
                 .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -698,6 +702,7 @@ mod tests {
             telegram_chat_ids: Vec::new(),
             thinking: tellm_core::ThinkingLevel::High,
             max_effort: None,
+            off_effort: None,
         }
     }
 }

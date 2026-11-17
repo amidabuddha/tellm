@@ -406,6 +406,35 @@ async fn max_reasoning_sends_high_unless_another_level_is_configured() {
     }
 }
 
+#[tokio::test]
+async fn off_reasoning_sends_the_configured_off_effort() {
+    let mock = MockGemini::start(vec![MockResponse::json(
+        200,
+        json!({
+            "status": "completed",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [{ "type": "text", "text": "ok" }]
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Off;
+
+    client(&mock)
+        .with_off_effort(Some("low".to_string()))
+        .with_max_effort(Some("high".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["generation_config"]["thinking_level"], "low");
+}
+
 fn assert_missing(value: &Value, key: &str) {
     assert!(
         value.get(key).is_none(),

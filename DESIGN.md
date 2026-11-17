@@ -106,18 +106,25 @@ refreshed 2026-11-16):
 
 | Level | Anthropic Messages | OpenAI Responses | xAI Responses | Chat completions | Gemini |
 |---|---|---|---|---|---|
-| off | omit `thinking` | omit `reasoning` | omit | omit `reasoning_effort` | omit `thinking_level` |
+| off | `off_effort` as `output_config.effort`, else no effort; never `thinking` | `off_effort`, else omit `reasoning` | same | `off_effort`, else omit `reasoning_effort` | `off_effort`, else omit `thinking_level` |
 | low/medium/high | adaptive + `output_config.effort` | `reasoning: {effort}` | same | `reasoning_effort` | `thinking_level` |
 | max | `max_effort`, else `"max"` (valid on ALL adaptive models) | `max_effort`, else `"xhigh"` | same | `max_effort`, else `"high"` ("max" not in the dialect) | `max_effort`, else `"high"` |
 
 Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
 2026-07-26; xAI, Meta, and the preset models' defaults refreshed 2026-11-16):
-- **"off" means provider default everywhere, not "no thinking"**, and none of
-  the preset models can turn thinking off: Claude Fable 5.2 defaults to
-  `high`; gpt-6-astra reasons at its own default and rejects `none`; grok-4.7
-  defaults to `high`; muse-wonder-1.0 defaults to `max`, so "off" is its most
-  expensive setting; Gemini 4 Argon defaults to `medium`. User-facing text
-  must say "default", not "off".
+- **"off" is configuration, like the top tier.** `/reasoning off` sends the
+  model's optional `off_effort` value from `config.toml`. When that is unset
+  tellm sends no reasoning setting and the provider default applies, which is
+  not "no thinking": Claude Fable 5.2 defaults to `high`; gpt-6-astra reasons
+  at its own default and rejects `none`; grok-4.7 defaults to `high`;
+  muse-wonder-1.0 defaults to `max`; Gemini 4 Argon defaults to `medium`. None
+  of the preset models can turn thinking off, so each preset writes its
+  model's lowest tier (`minimal` for muse-wonder-1.0, checked 2026-11-17
+  against dev.meta.ai; `low` for the others) and "off" is their cheapest
+  setting. A model that can disable reasoning takes `off_effort = "none"`. On
+  the Anthropic wire format the value is sent as `output_config.effort`
+  without a `thinking` field, since effort works with or without thinking.
+  User-facing text must not promise "no thinking".
 - The tier above `high` differs from model to model, so it is configuration
   and not code: `/reasoning max` sends the model's optional `max_effort` value
   from `config.toml`, and the wire format's default when that is unset. The
@@ -130,8 +137,7 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   muse-ember-1.0, and DeepSeek over chat completions. No Grok model lists
   `max`. Built-in presets write the value their model needs. tellm checks only
   that the value is one token; an unsupported value errors explicitly at the
-  provider and the user can lower the room's level. No Grok model can disable
-  reasoning, so `Off` omits the field.
+  provider and the user can lower the room's level.
 - Gemini thinking levels are model-dependent: gemini-4-argon,
   gemini-3.8-flash, and gemini-3.6-flash accept low/medium/high. Gemini 4
   Argon and 3.8 Flash reject `minimal`, which tellm never sends (checked
@@ -402,10 +408,11 @@ restart and local room-setting changes.
   fallback.
 - Non-secrets: human-editable TOML at `dirs::config_dir()/tellm/config.toml`.
   **Capability routing is explicit** (`wire_format` field per model) — never
-  inferred from the spelling of user-chosen keys (parent-app lesson). The top
-  reasoning tier follows the same rule: the optional per-model `max_effort`
-  names the provider value for `thinking = "max"` instead of tellm inferring
-  it from `model_name`.
+  inferred from the spelling of user-chosen keys (parent-app lesson). The two
+  ends of the reasoning scale follow the same rule: the optional per-model
+  `max_effort` and `off_effort` name the provider values for
+  `thinking = "max"` and `thinking = "off"` instead of tellm inferring them
+  from `model_name`.
   Provider credentials are referenced by secret name (`api_key_secret`),
   never stored inline. Keyless endpoints, especially local Ollama, omit
   `api_key_secret`; `/model add KEY` must not open a key prompt for those
@@ -457,7 +464,8 @@ restart and local room-setting changes.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists; model keys are command-safe; model names and secret names are
   nonempty and secret names cannot use tellm's internal marker prefix;
-  `max_effort`, when present, is one whitespace-free token;
+  `max_effort` and `off_effort`, when present, are each one whitespace-free
+  token;
   non-compat models name a secret; compat models have a valid absolute URL;
   credential-bearing endpoints use HTTPS; non-loopback keyless compat HTTP has
   the explicit per-model opt-in described above; URLs contain no embedded

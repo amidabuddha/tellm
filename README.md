@@ -195,6 +195,8 @@ model_name = "claude-fable-5-2"
 api_key_secret = "anthropic_api_key"
 telegram_chat_ids = []
 thinking = "max"
+# Optional: the provider value sent for thinking = "off" / `/reasoning off`.
+off_effort = "low"
 
 [models.gpt]
 wire_format = "responses"
@@ -204,6 +206,7 @@ telegram_chat_ids = []
 thinking = "high"
 # Optional: the provider value sent for thinking = "max" / `/reasoning max`.
 max_effort = "max"
+off_effort = "low"
 
 [models.grok]
 wire_format = "responses"
@@ -212,6 +215,7 @@ base_url = "https://api.x.ai/v1"
 api_key_secret = "xai_api_key"
 telegram_chat_ids = []
 thinking = "high"
+off_effort = "low"
 
 [models.meta]
 wire_format = "responses"
@@ -221,6 +225,7 @@ api_key_secret = "meta_model_api_key"
 telegram_chat_ids = []
 thinking = "max"
 max_effort = "max"
+off_effort = "minimal"
 
 [models.gemini]
 wire_format = "gemini"
@@ -228,6 +233,7 @@ model_name = "gemini-4-argon"
 api_key_secret = "gemini_api_key"
 telegram_chat_ids = []
 thinking = "high"
+off_effort = "low"
 
 # Gemini image generation requires a Gemini image model id, for example:
 # model_name = "gemini-nano-banana-2.1"
@@ -289,6 +295,13 @@ value sent for `thinking = "max"` and `/reasoning max`, for example `"max"` or
 `anthropic`, `xhigh` for `responses`, and `high` for `compat` and `gemini`. Set
 it when a model's documentation lists a higher tier, or a lower one; built-in
 presets already carry the value their model needs.
+
+`off_effort` is the same idea for the other end. It names the provider value
+sent for `thinking = "off"` and `/reasoning off`, for example `"none"`,
+`"minimal"` or `"low"`. Without it tellm sends no reasoning setting and the
+model reasons at its own default, which on some models is their highest tier.
+Set it to the lowest value the model's documentation lists; built-in presets
+already carry it.
 
 ## Setting Up Model Rooms
 

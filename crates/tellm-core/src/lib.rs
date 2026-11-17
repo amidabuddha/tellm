@@ -33,14 +33,17 @@ use serde::{Deserialize, Serialize};
 /// Gemini Interactions uses `generation_config.thinking_level`, and Off omits
 /// the parameter.
 ///
-/// Low, Medium and High carry the same value everywhere. The value for `Max`
-/// differs per model, so each provider client takes it from the model's
-/// `max_effort` config and falls back to its wire format's default top tier.
+/// Low, Medium and High carry the same value everywhere. The two ends differ
+/// per model, so each provider client takes them from the model's config:
+/// `max_effort` for `Max`, falling back to its wire format's default top
+/// tier, and `off_effort` for `Off`, falling back to omitting the parameter
+/// as the table shows.
 ///
-/// Caveat on `Off`: it means "don't request reasoning", implemented by
-/// omitting the parameter. On models where adaptive thinking is on by
-/// default (and where an explicit disable is rejected), the model may still
-/// think — user-facing text must not promise "no thinking", only "default".
+/// Caveat on `Off`: without an `off_effort` it means "don't request
+/// reasoning", implemented by omitting the parameter. On models where
+/// adaptive thinking is on by default (and where an explicit disable is
+/// rejected), the model may still think, at whatever its default is —
+/// user-facing text must not promise "no thinking".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {

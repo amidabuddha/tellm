@@ -16,6 +16,10 @@ pub(crate) struct ProviderPreset {
     /// Written to the model's `max_effort` config: the provider value for
     /// `thinking = "max"`. `None` leaves the wire format's default tier.
     pub(crate) max_effort: Option<&'static str>,
+    /// Written to the model's `off_effort` config: the provider value for
+    /// `thinking = "off"`. `None` sends no reasoning setting, so the
+    /// provider's default applies.
+    pub(crate) off_effort: Option<&'static str>,
 }
 
 /// The built-in provider catalog, shared with /model add.
@@ -39,6 +43,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
         telegram_chat_ids: Vec::new(),
         thinking: ThinkingLevel::default(),
         max_effort: preset.max_effort.map(str::to_string),
+        off_effort: preset.off_effort.map(str::to_string),
     }
 }
 
@@ -55,10 +60,16 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 //   accepts reasoning effort low/medium/high/xhigh and never max.
 // - dev.meta.ai Model API docs: Muse Wonder uses ID muse-wonder-1.0, is
 //   Meta's most capable model, is in preview on Model API, and accepts
-//   reasoning effort up to max.
+//   reasoning effort from minimal to max (rechecked 2026-11-17: "none" is
+//   an HTTP 400, and the default when no effort is sent is max).
 // - ai.google.dev model docs: Gemini 4 Argon uses ID gemini-4-argon and is
 //   Google's flagship; thinking level accepts low/medium/high and rejects
 //   minimal.
+//
+// None of the five can turn reasoning off, and without an effort each one
+// reasons at its own default, which is the top tier on Muse Wonder. So each
+// preset writes its model's lowest tier as `off_effort`, and `off` is the
+// cheapest setting instead of the provider's default.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -68,6 +79,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: None,
         api_key_secret: secrets::ANTHROPIC_API_KEY,
         max_effort: None,
+        off_effort: Some("low"),
     },
     ProviderPreset {
         key: "openai",
@@ -77,6 +89,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: None,
         api_key_secret: secrets::OPENAI_API_KEY,
         max_effort: Some("max"),
+        off_effort: Some("low"),
     },
     ProviderPreset {
         key: "xai",
@@ -86,6 +99,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: Some(tellm_openai::XAI_BASE_URL),
         api_key_secret: secrets::XAI_API_KEY,
         max_effort: None,
+        off_effort: Some("low"),
     },
     ProviderPreset {
         key: "meta",
@@ -95,6 +109,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: Some(tellm_openai::META_MODEL_API_BASE_URL),
         api_key_secret: secrets::META_MODEL_API_KEY,
         max_effort: Some("max"),
+        off_effort: Some("minimal"),
     },
     ProviderPreset {
         key: "gemini",
@@ -104,6 +119,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: None,
         api_key_secret: secrets::GEMINI_API_KEY,
         max_effort: None,
+        off_effort: Some("low"),
     },
 ];
 
@@ -294,6 +310,23 @@ mod tests {
         assert_eq!(openai.max_effort.as_deref(), Some("max"));
         assert_eq!(meta.max_effort.as_deref(), Some("max"));
         assert_eq!(xai.max_effort, None);
+    }
+
+    #[test]
+    fn presets_write_each_models_lowest_tier_as_off_effort() {
+        // None of the preset models can turn reasoning off; Muse Wonder is
+        // the one with a tier below "low".
+        for (key, lowest) in [
+            ("anthropic", "low"),
+            ("openai", "low"),
+            ("xai", "low"),
+            ("meta", "minimal"),
+            ("gemini", "low"),
+        ] {
+            let model = model_config_from_preset(preset_by_key(key).unwrap());
+
+            assert_eq!(model.off_effort.as_deref(), Some(lowest), "{key}");
+        }
     }
 
     #[test]

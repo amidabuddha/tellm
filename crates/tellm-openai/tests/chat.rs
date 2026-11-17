@@ -292,6 +292,42 @@ async fn max_reasoning_sends_the_configured_max_effort() {
 }
 
 #[tokio::test]
+async fn off_reasoning_sends_the_configured_off_effort() {
+    let mock = MockOpenAi::start(vec![MockResponse::json(
+        200,
+        json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "ok" }]
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Off;
+    req.web_search = false;
+    req.image_generation = false;
+
+    client(&mock)
+        .with_off_effort(Some("minimal".to_string()))
+        .with_max_effort(Some("max".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["reasoning"], json!({ "effort": "minimal" }));
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "an explicit effort asks for replayable reasoning"
+    );
+}
+
+#[tokio::test]
 async fn off_reasoning_and_no_options_omit_optional_fields() {
     let mock = MockOpenAi::start(vec![MockResponse::json(
         200,
