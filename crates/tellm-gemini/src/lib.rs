@@ -10,15 +10,21 @@
 //!   verbatim, including `thought`, `google_search_call`, and
 //!   `google_search_result` signatures. Stateless mode requires those
 //!   signatures back unchanged on future turns.
-//! - Thinking: `generation_config.thinking_level` for low/medium/high; omit
-//!   for `Off`; map `Max` to `high` because Interactions has no `max`.
-//!   Gemini 3.6 Flash supports all three mapped levels. Requests do not send
-//!   its deprecated sampling parameters and always end in a `user_input` step.
+//! - Thinking: `generation_config.thinking_level` for low/medium/high.
+//!   `Off` sends the model's `off_effort` and omits the field when that is
+//!   unset; `Max` sends the model's `max_effort`, or `high` when unset
+//!   because Interactions has no level above it.
+//!   Gemini 4 Carbon, Gemini 4 Argon, 3.8 Flash and 3.6 Flash support all
+//!   three mapped levels; Carbon, Argon and 3.8 Flash reject `minimal`, so
+//!   `low` is the lowest `off_effort` they take (checked 2026-11-16; Carbon
+//!   2026-11-17). Requests do not send the deprecated sampling
+//!   parameters and always end in a `user_input` step.
 //! - Web search: `tools: [{type: "google_search", search_types:
 //!   ["web_search"]}]`.
 //! - Images/documents: native `image` and `document` content blocks with
 //!   inline base64 `data`.
-//! - Image generation: only Gemini image model ids (`*-image*`) are eligible;
+//! - Image generation: only Gemini image model ids are eligible, recognized
+//!   by name (`*-image*` or `*nano-banana*`, see [`is_image_generation_model`]);
 //!   request `response_format: {"type": "image"}`.
 
 use std::sync::OnceLock;
@@ -32,12 +38,18 @@ use tellm_core::{
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// `thinking_level` sent for `ThinkingLevel::Max` unless the model's
+/// `max_effort` config names another level. Interactions has no level above
+/// "high".
+pub const DEFAULT_MAX_EFFORT: &str = "high";
 
 #[derive(Clone)]
 pub struct Gemini {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    max_effort: Option<String>,
+    off_effort: Option<String>,
 }
 
 impl Gemini {
@@ -48,7 +60,24 @@ impl Gemini {
             http: default_http_client(),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
+            off_effort: None,
         }
+    }
+
+    /// Sets the `thinking_level` sent for `ThinkingLevel::Max`, from the
+    /// model's `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
+    pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
+        self.max_effort = max_effort;
+        self
+    }
+
+    /// Sets the `thinking_level` sent for `ThinkingLevel::Off`, from the
+    /// model's `off_effort` config. `None` omits the field, so the model's
+    /// own default applies.
+    pub fn with_off_effort(mut self, off_effort: Option<String>) -> Self {
+        self.off_effort = off_effort;
+        self
     }
 
     pub fn with_base_url_and_timeout(
@@ -64,6 +93,8 @@ impl Gemini {
                 .expect("valid reqwest client configuration"),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
+            off_effort: None,
         }
     }
 }
@@ -81,14 +112,32 @@ fn default_http_client() -> reqwest::Client {
         .clone()
 }
 
+/// Name fragments that mark a Gemini image generation model. `-image` covers
+/// gemini-3.1-flash-image and gemini-3-pro-image; `nano-banana` covers
+/// gemini-nano-banana-2.1, the current image model, whose id no longer
+/// carries `-image` (checked 2026-11-16 against ai.google.dev models and
+/// image generation docs).
+const IMAGE_MODEL_MARKERS: [&str; 2] = ["-image", "nano-banana"];
+
+/// Whether a Gemini model id names an image generation model. This is a
+/// fail-closed naming rule, not a capability lookup: an id that matches no
+/// marker is refused image generation before any request is sent.
 pub fn is_image_generation_model(model_name: &str) -> bool {
-    model_name.to_ascii_lowercase().contains("-image")
+    let model_name = model_name.to_ascii_lowercase();
+    IMAGE_MODEL_MARKERS
+        .iter()
+        .any(|marker| model_name.contains(marker))
 }
 
 impl Provider for Gemini {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let user_step = user_input_step(&request.input)?;
-        let body = request_body(request, user_step.clone())?;
+        let body = request_body(
+            request,
+            user_step.clone(),
+            self.off_effort.as_deref(),
+            self.max_effort.as_deref(),
+        )?;
         let response_body = self.send_request(body).await?;
         let steps = response_body
             .get("steps")
@@ -140,7 +189,12 @@ impl Gemini {
     }
 }
 
-fn request_body(request: &ChatRequest, user_step: Value) -> Result<Value, ProviderError> {
+fn request_body(
+    request: &ChatRequest,
+    user_step: Value,
+    off_effort: Option<&str>,
+    max_effort: Option<&str>,
+) -> Result<Value, ProviderError> {
     let mut input = request.history.clone();
     input.push(user_step);
 
@@ -158,7 +212,7 @@ fn request_body(request: &ChatRequest, user_step: Value) -> Result<Value, Provid
     }
 
     let mut generation_config = serde_json::Map::new();
-    if let Some(thinking) = thinking_level(request.thinking) {
+    if let Some(thinking) = thinking_level(request.thinking, off_effort, max_effort) {
         generation_config.insert("thinking_level".to_string(), json!(thinking));
     }
     if !generation_config.is_empty() {
@@ -177,7 +231,7 @@ fn request_body(request: &ChatRequest, user_step: Value) -> Result<Value, Provid
     if request.image_generation {
         if !is_image_generation_model(&request.model) {
             return Err(ProviderError::Unsupported(format!(
-                "Gemini image generation requires an image-capable model such as gemini-3.1-flash-image, not {}",
+                "Gemini image generation requires an image-capable model such as gemini-nano-banana-2.1, not {}",
                 request.model
             )));
         }
@@ -233,12 +287,19 @@ fn content_part(part: &ContentPart) -> Result<Value, ProviderError> {
     }
 }
 
-fn thinking_level(thinking: ThinkingLevel) -> Option<&'static str> {
+/// Off omits the level unless the model's `off_effort` config names one,
+/// and Max takes `max_effort` before [`DEFAULT_MAX_EFFORT`].
+fn thinking_level<'a>(
+    thinking: ThinkingLevel,
+    off_effort: Option<&'a str>,
+    max_effort: Option<&'a str>,
+) -> Option<&'a str> {
     match thinking {
-        ThinkingLevel::Off => None,
+        ThinkingLevel::Off => off_effort,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Max => Some("high"),
+        ThinkingLevel::High => Some("high"),
+        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
     }
 }
 

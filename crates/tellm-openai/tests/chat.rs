@@ -196,8 +196,8 @@ async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
     let body = mock.requests()[0].json_body();
     assert_missing(&body, "instructions");
     assert_missing(&body, "max_output_tokens");
-    // grok-4.5 has no xhigh effort: Max must clamp to high on xAI requests.
-    assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+    // No max_effort is configured, so Max sends the default top tier.
+    assert_eq!(body["reasoning"], json!({ "effort": "xhigh" }));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(
         body["tools"],
@@ -262,6 +262,72 @@ async fn meta_model_api_uses_responses_with_xhigh_search_and_no_generation() {
 }
 
 #[tokio::test]
+async fn max_reasoning_sends_the_configured_max_effort() {
+    let mock = MockOpenAi::start(vec![MockResponse::json(
+        200,
+        json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "ok" }]
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Max;
+    req.web_search = false;
+    req.image_generation = false;
+
+    client(&mock)
+        .with_max_effort(Some("max".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["reasoning"], json!({ "effort": "max" }));
+}
+
+#[tokio::test]
+async fn off_reasoning_sends_the_configured_off_effort() {
+    let mock = MockOpenAi::start(vec![MockResponse::json(
+        200,
+        json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "ok" }]
+                }
+            ]
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Off;
+    req.web_search = false;
+    req.image_generation = false;
+
+    client(&mock)
+        .with_off_effort(Some("minimal".to_string()))
+        .with_max_effort(Some("max".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["reasoning"], json!({ "effort": "minimal" }));
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "an explicit effort asks for replayable reasoning"
+    );
+}
+
+#[tokio::test]
 async fn off_reasoning_and_no_options_omit_optional_fields() {
     let mock = MockOpenAi::start(vec![MockResponse::json(
         200,
@@ -295,6 +361,49 @@ async fn off_reasoning_and_no_options_omit_optional_fields() {
     assert_missing(&body, "reasoning");
     assert_missing(&body, "include");
     assert_missing(&body, "tools");
+}
+
+#[tokio::test]
+async fn xai_and_meta_request_encrypted_reasoning_even_when_reasoning_is_off() {
+    // The mock's base URL names no provider, so each id is recognized by name.
+    for model in [
+        "grok-4.5",
+        "muse-spark-1.1",
+        "muse-wonder-1.0",
+        "muse-ember-1.0",
+    ] {
+        let mock = MockOpenAi::start(vec![MockResponse::json(
+            200,
+            json!({
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "ok" }]
+                    }
+                ]
+            }),
+        )]);
+        let mut req = request();
+        req.model = model.to_string();
+        req.history = Vec::new();
+        req.input = vec![ContentPart::Text {
+            text: "Hi".to_string(),
+        }];
+        req.thinking = ThinkingLevel::Off;
+        req.web_search = false;
+        req.image_generation = false;
+
+        client(&mock).chat(&req).await.unwrap();
+
+        let body = mock.requests()[0].json_body();
+        assert_missing(&body, "reasoning");
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "{model} reasons at every level and returns encrypted reasoning only on request"
+        );
+    }
 }
 
 #[tokio::test]

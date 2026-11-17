@@ -191,43 +191,54 @@ owner_user_ids = []
 
 [models.claude]
 wire_format = "anthropic"
-model_name = "claude-opus-5"
+model_name = "claude-fable-5-2"
 api_key_secret = "anthropic_api_key"
 telegram_chat_ids = []
 thinking = "max"
+# Optional: the provider value sent for thinking = "off" / `/reasoning off`.
+off_effort = "low"
+# Optional, anthropic only: the reply limit in tokens, thinking included.
+max_output_tokens = 64000
 
 [models.gpt]
 wire_format = "responses"
-model_name = "gpt-5.6-sol"
+model_name = "gpt-6-astra"
 api_key_secret = "openai_api_key"
 telegram_chat_ids = []
 thinking = "high"
+# Optional: the provider value sent for thinking = "max" / `/reasoning max`.
+max_effort = "max"
+off_effort = "low"
 
 [models.grok]
 wire_format = "responses"
-model_name = "grok-4.5"
+model_name = "grok-4.7"
 base_url = "https://api.x.ai/v1"
 api_key_secret = "xai_api_key"
 telegram_chat_ids = []
 thinking = "high"
+off_effort = "low"
 
 [models.meta]
 wire_format = "responses"
-model_name = "muse-spark-1.1"
+model_name = "muse-wonder-1.0"
 base_url = "https://api.meta.ai/v1"
 api_key_secret = "meta_model_api_key"
 telegram_chat_ids = []
 thinking = "max"
+max_effort = "max"
+off_effort = "minimal"
 
 [models.gemini]
 wire_format = "gemini"
-model_name = "gemini-3.6-flash"
+model_name = "gemini-4-carbon"
 api_key_secret = "gemini_api_key"
 telegram_chat_ids = []
 thinking = "high"
+off_effort = "low"
 
 # Gemini image generation requires a Gemini image model id, for example:
-# model_name = "gemini-3.1-flash-image"
+# model_name = "gemini-nano-banana-2.1"
 
 # Any OpenAI chat-completions-compatible paid endpoint, such as Mistral,
 # DeepSeek, OpenRouter, or a proxy. base_url is required for compat models.
@@ -278,6 +289,29 @@ selection is stored in `rooms.toml`, so these arrays usually stay empty.
 `thinking` in `config.toml` is the model default. A room only writes
 `thinking` to `rooms.toml` after `/reasoning LEVEL`; `/reasoning default`
 clears that room override and returns to the selected model's default.
+
+`max_effort` is optional. The tier above `high` differs from model to model,
+so tellm does not guess it from the model name: `max_effort` names the provider
+value sent for `thinking = "max"` and `/reasoning max`, for example `"max"` or
+`"xhigh"`. Without it tellm sends the wire format's default top tier: `max` for
+`anthropic`, `xhigh` for `responses`, and `high` for `compat` and `gemini`. Set
+it when a model's documentation lists a higher tier, or a lower one; built-in
+presets already carry the value their model needs.
+
+`off_effort` is the same idea for the other end. It names the provider value
+sent for `thinking = "off"` and `/reasoning off`, for example `"none"`,
+`"minimal"` or `"low"`. Without it tellm sends no reasoning setting and the
+model reasons at its own default, which on some models is their highest tier.
+Set it to the lowest value the model's documentation lists; built-in presets
+already carry it.
+
+`max_output_tokens` is optional and only for `anthropic` models. It is the
+limit on one reply, sent as `max_tokens`, and thinking counts toward it. The
+default is 16000, and the built-in Claude preset writes 64000 so that a reply
+at `max` effort has room to finish. A reply that reaches the limit ends with a
+note saying it was cut off. tellm does not stream, so a larger limit means a
+longer wait for one response: a request gets 10 minutes up to 21,333 tokens
+and proportionally longer above that, which is 30 minutes at 64000.
 
 ## Setting Up Model Rooms
 

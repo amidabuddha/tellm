@@ -3,7 +3,9 @@
 //! Mapping notes (checked 2026-07-04 against platform.claude.com — re-check
 //! live provider docs before changing these mappings):
 //! - Thinking: `thinking: {"type": "adaptive"}` + `output_config: {"effort": ...}`.
-//!   `budget_tokens` is rejected on current models — never send it.
+//!   `budget_tokens` is rejected on current models — never send it. `Off`
+//!   sends neither, unless the model's `off_effort` names an effort, which
+//!   then goes out without a `thinking` field.
 //! - Prompt caching: `cache_control: {"type": "ephemeral"}` on the system
 //!   block; keep the system prompt byte-stable (no timestamps).
 //! - Web search: `{"type": "web_search_20260318", "name": "web_search",
@@ -28,6 +30,9 @@
 //!   PDFs pass through without client-side extraction.
 //! - Handle `stop_reason: "refusal"` before reading content
 //!   (`ProviderError::Refusal`).
+//! - Handle `stop_reason: "max_tokens"`: thinking counts toward the limit, so
+//!   a reply can stop mid-answer or before any text. A cut-off answer gets
+//!   [`CUT_OFF_NOTE`]; one without text is an error instead of an empty turn.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -43,18 +48,48 @@ pub const API_VERSION: &str = "2023-06-01";
 /// checked 2026-07-04 against platform.claude.com (web-search-tool docs)
 pub const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20260318";
 pub const WEB_SEARCH_MAX_USES: u32 = 5;
-/// Thinking tokens count toward max_tokens; Anthropic's adaptive-thinking
-/// examples use 16000 to leave room for thinking + text (checked 2026-07-12).
+/// `max_tokens` sent unless the model's `max_output_tokens` config names
+/// another limit. Thinking tokens count toward max_tokens; Anthropic's
+/// adaptive-thinking examples use 16000 to leave room for thinking + text
+/// (checked 2026-07-12).
+///
+/// Requests are not streamed, so a larger limit means a longer wait for one
+/// HTTP response; see [`request_timeout_for`].
 pub const DEFAULT_MAX_TOKENS: u32 = 16000;
+/// The `max_tokens` a non-streamed request is expected to fit inside one
+/// [`PROVIDER_REQUEST_TIMEOUT`]. Anthropic's SDKs refuse a non-streamed
+/// request above 21,333 because it could outlast their 10-minute timeout
+/// (checked 2026-11-16 against platform.claude.com, thinking and API errors).
+pub const MAX_TOKENS_PER_REQUEST_TIMEOUT: u32 = 21_333;
+/// Effort sent for `ThinkingLevel::Max` unless the model's `max_effort`
+/// config names another tier. Valid on every adaptive-thinking model.
+pub const DEFAULT_MAX_EFFORT: &str = "max";
 pub const MAX_PAUSE_TURN_CONTINUATIONS: usize = 5;
+/// Appended to the text of a reply that stopped at `max_tokens`, so a cut-off
+/// answer is not mistaken for a finished one. Only the user sees it: the
+/// stored `turn_items` keep the model's own content.
+pub const CUT_OFF_NOTE: &str = "\n\n(Reply cut off: it reached the output limit.)";
+/// Error message for a reply that stopped at `max_tokens` before any text.
+pub const OUTPUT_LIMIT_BEFORE_TEXT: &str =
+    "the reply reached the max_tokens output limit before any answer text";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Idle time before TCP keep-alive probes start. A non-streamed reply sends
+/// nothing until it is complete, and Anthropic's guidance for direct API
+/// integrations is a TCP keep-alive, so that networks which drop idle
+/// connections do not drop a long request (checked 2026-11-16 against
+/// platform.claude.com, API errors, long requests).
+pub const PROVIDER_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Anthropic {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    max_effort: Option<String>,
+    off_effort: Option<String>,
+    max_tokens: Option<u32>,
+    request_timeout: Duration,
 }
 
 impl Anthropic {
@@ -66,7 +101,33 @@ impl Anthropic {
             http: default_http_client(),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
+            off_effort: None,
+            max_tokens: None,
+            request_timeout: PROVIDER_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Sets the effort value sent for `ThinkingLevel::Max`, from the model's
+    /// `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
+    pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
+        self.max_effort = max_effort;
+        self
+    }
+
+    /// Sets the effort value sent for `ThinkingLevel::Off`, from the model's
+    /// `off_effort` config. `None` sends no effort, so the model's own
+    /// default applies.
+    pub fn with_off_effort(mut self, off_effort: Option<String>) -> Self {
+        self.off_effort = off_effort;
+        self
+    }
+
+    /// Sets `max_tokens`, from the model's `max_output_tokens` config. `None`
+    /// keeps [`DEFAULT_MAX_TOKENS`].
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     pub fn with_base_url_and_timeout(
@@ -78,10 +139,15 @@ impl Anthropic {
             http: reqwest::Client::builder()
                 .connect_timeout(PROVIDER_CONNECT_TIMEOUT.min(request_timeout))
                 .timeout(request_timeout)
+                .tcp_keepalive(PROVIDER_TCP_KEEPALIVE)
                 .build()
                 .expect("valid reqwest client configuration"),
             base_url: trim_trailing_slash(base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
             api_key: api_key.into(),
+            max_effort: None,
+            off_effort: None,
+            max_tokens: None,
+            request_timeout,
         }
     }
 }
@@ -93,10 +159,22 @@ fn default_http_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
                 .timeout(PROVIDER_REQUEST_TIMEOUT)
+                .tcp_keepalive(PROVIDER_TCP_KEEPALIVE)
                 .build()
                 .expect("valid reqwest client configuration")
         })
         .clone()
+}
+
+/// How long one request with this output limit may run. tellm does not
+/// stream, so the whole reply has to arrive inside a single HTTP response and
+/// a larger limit needs a longer wait. The timeout grows with the limit at
+/// the SDKs' ratio, [`MAX_TOKENS_PER_REQUEST_TIMEOUT`] tokens for each
+/// `base`, and never drops below `base`: 16000 keeps 10 minutes and 64000
+/// gets 30.
+pub fn request_timeout_for(base: Duration, max_tokens: u32) -> Duration {
+    let scale = f64::from(max_tokens) / f64::from(MAX_TOKENS_PER_REQUEST_TIMEOUT);
+    base.mul_f64(scale.max(1.0))
 }
 
 impl Provider for Anthropic {
@@ -118,7 +196,13 @@ impl Provider for Anthropic {
         let mut text_parts = Vec::new();
 
         for continuation in 0..=MAX_PAUSE_TURN_CONTINUATIONS {
-            let body = request_body(request, messages.clone());
+            let body = request_body(
+                request,
+                messages.clone(),
+                self.off_effort.as_deref(),
+                self.max_effort.as_deref(),
+                self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            );
             let response_body = self.send_request(body).await?;
 
             let stop_reason = response_body
@@ -149,6 +233,19 @@ impl Provider for Anthropic {
                 text_parts.push(text);
             }
 
+            // Checked 2026-11-16 against platform.claude.com (stop reasons;
+            // Claude Fable 5.2 migration guide): thinking tokens count toward
+            // `max_tokens`, so a reply can stop there after a thinking block
+            // and before any text. That is a failed turn: storing it would
+            // keep a question whose answer nobody saw.
+            let cut_off = stop_reason == "max_tokens";
+            if cut_off && text_parts.is_empty() {
+                return Err(ProviderError::Api {
+                    status: 200,
+                    message: OUTPUT_LIMIT_BEFORE_TEXT.to_string(),
+                });
+            }
+
             if stop_reason == "pause_turn" {
                 if continuation == MAX_PAUSE_TURN_CONTINUATIONS {
                     return Err(ProviderError::Api {
@@ -166,8 +263,13 @@ impl Provider for Anthropic {
             turn_items.push(user_message);
             turn_items.extend(assistant_messages);
 
+            let mut text = text_parts.join("");
+            if cut_off {
+                text.push_str(CUT_OFF_NOTE);
+            }
+
             return Ok(ChatResponse {
-                text: text_parts.join(""),
+                text,
                 images: Vec::<GeneratedImage>::new(),
                 turn_items,
             });
@@ -184,6 +286,10 @@ impl Anthropic {
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
+            .timeout(request_timeout_for(
+                self.request_timeout,
+                self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            ))
             .json(&body)
             .send()
             .await?;
@@ -250,10 +356,16 @@ fn is_thinking_block(block: &Value) -> bool {
     )
 }
 
-fn request_body(request: &ChatRequest, messages: Vec<Value>) -> Value {
+fn request_body(
+    request: &ChatRequest,
+    messages: Vec<Value>,
+    off_effort: Option<&str>,
+    max_effort: Option<&str>,
+    max_tokens: u32,
+) -> Value {
     let mut body = json!({
         "model": request.model,
-        "max_tokens": DEFAULT_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "messages": messages,
     });
 
@@ -282,10 +394,17 @@ fn request_body(request: &ChatRequest, messages: Vec<Value>) -> Value {
         ]);
     }
 
-    if let Some(effort) = anthropic_effort(request.thinking) {
-        // Checked 2026-07-04 against adaptive-thinking docs: adaptive mode uses
-        // `thinking: {type: "adaptive"}` plus `output_config.effort`.
-        body["thinking"] = json!({ "type": "adaptive" });
+    if let Some(effort) = anthropic_effort(request.thinking, off_effort, max_effort) {
+        if request.thinking != ThinkingLevel::Off {
+            // Checked 2026-07-04 against adaptive-thinking docs: adaptive mode
+            // uses `thinking: {type: "adaptive"}` plus `output_config.effort`.
+            body["thinking"] = json!({ "type": "adaptive" });
+        }
+        // `Off` with an `off_effort` still does not ask for thinking; it only
+        // names the effort. Checked 2026-11-16 against platform.claude.com
+        // (effort): effort applies to every output token, with or without
+        // thinking, and it is the control for thinking depth on models whose
+        // adaptive thinking is always on, such as Claude Fable 5.2.
         body["output_config"] = json!({ "effort": effort });
     }
 
@@ -322,13 +441,17 @@ fn content_parts_to_anthropic(parts: &[ContentPart]) -> Vec<Value> {
         .collect()
 }
 
-fn anthropic_effort(thinking: ThinkingLevel) -> Option<&'static str> {
+fn anthropic_effort<'a>(
+    thinking: ThinkingLevel,
+    off_effort: Option<&'a str>,
+    max_effort: Option<&'a str>,
+) -> Option<&'a str> {
     match thinking {
-        ThinkingLevel::Off => None,
+        ThinkingLevel::Off => off_effort,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Max => Some("max"),
+        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
     }
 }
 

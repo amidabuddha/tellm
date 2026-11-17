@@ -8,7 +8,8 @@
 //! Mapping notes (checked 2026-07-04 against platform.openai.com and
 //! docs.ollama.com - re-check live provider docs before changing these mappings):
 //! - Reasoning: `reasoning_effort` where the provider supports it; silently
-//!   ignored by those that don't (that's the dialect's convention).
+//!   ignored by those that don't (that's the dialect's convention). `Off`
+//!   omits it unless the model's `off_effort` names a value.
 //! - Web search / image generation: not part of this dialect —
 //!   `ProviderError::Unsupported` so the user gets told instead of guessing.
 //! - Images: `image_url` content parts (data URLs); documents: unsupported.
@@ -23,12 +24,19 @@ use tellm_core::{
 
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// `reasoning_effort` sent for `ThinkingLevel::Max` unless the model's
+/// `max_effort` config names another tier. "max" is not in the dialect and
+/// is an invalid enum value on endpoints that do not define it, so the
+/// default stays at "high".
+pub const DEFAULT_MAX_EFFORT: &str = "high";
 
 #[derive(Clone)]
 pub struct Compat {
     http: reqwest::Client,
     chat_completions_url: String,
     api_key: Option<String>,
+    max_effort: Option<String>,
+    off_effort: Option<String>,
 }
 
 impl Compat {
@@ -45,6 +53,21 @@ impl Compat {
         Self::with_client(api_key, base_url, http)
     }
 
+    /// Sets the `reasoning_effort` sent for `ThinkingLevel::Max`, from the
+    /// model's `max_effort` config. `None` keeps [`DEFAULT_MAX_EFFORT`].
+    pub fn with_max_effort(mut self, max_effort: Option<String>) -> Self {
+        self.max_effort = max_effort;
+        self
+    }
+
+    /// Sets the `reasoning_effort` sent for `ThinkingLevel::Off`, from the
+    /// model's `off_effort` config. `None` omits the field, so the endpoint's
+    /// default applies.
+    pub fn with_off_effort(mut self, off_effort: Option<String>) -> Self {
+        self.off_effort = off_effort;
+        self
+    }
+
     fn with_client(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
@@ -55,6 +78,8 @@ impl Compat {
             http,
             chat_completions_url: chat_completions_url(base_url.into()),
             api_key: (!api_key.trim().is_empty()).then_some(api_key),
+            max_effort: None,
+            off_effort: None,
         }
     }
 }
@@ -64,7 +89,12 @@ impl Provider for Compat {
         validate_supported(request)?;
 
         let user_message = user_message(&request.input);
-        let body = request_body(request, user_message.clone());
+        let body = request_body(
+            request,
+            user_message.clone(),
+            self.off_effort.as_deref(),
+            self.max_effort.as_deref(),
+        );
         let response_body = self.send_request(body).await?;
         let choice = response_body
             .get("choices")
@@ -141,7 +171,12 @@ fn validate_supported(request: &ChatRequest) -> Result<(), ProviderError> {
     Ok(())
 }
 
-fn request_body(request: &ChatRequest, user_message: Value) -> Value {
+fn request_body(
+    request: &ChatRequest,
+    user_message: Value,
+    off_effort: Option<&str>,
+    max_effort: Option<&str>,
+) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = &request.system {
         // Checked 2026-07-04 against OpenAI chat-completions docs.
@@ -156,7 +191,7 @@ fn request_body(request: &ChatRequest, user_message: Value) -> Value {
         "stream": false,
     });
 
-    if let Some(effort) = reasoning_effort(request.thinking) {
+    if let Some(effort) = reasoning_effort(request.thinking, off_effort, max_effort) {
         // Checked 2026-07-04 against Ollama OpenAI-compat docs; other
         // compatible providers either support or ignore this pass-through.
         body["reasoning_effort"] = json!(effort);
@@ -212,13 +247,22 @@ fn content_parts_to_chat(parts: &[ContentPart]) -> Value {
 /// Checked 2026-07-05: the chat-completions dialect defines reasoning_effort
 /// values none/minimal/low/medium/high/xhigh — "max" is not in the dialect
 /// and is an invalid enum value (not an ignorable unknown parameter), so Max
-/// clamps to "high".
-fn reasoning_effort(thinking: ThinkingLevel) -> Option<&'static str> {
+/// sends "high" unless the model's `max_effort` config names a tier its
+/// endpoint documents (DeepSeek accepts "max", checked 2026-11-16 against
+/// api-docs.deepseek.com). Off omits the field unless the model's
+/// `off_effort` config names a value, such as "none" where the endpoint can
+/// disable reasoning.
+fn reasoning_effort<'a>(
+    thinking: ThinkingLevel,
+    off_effort: Option<&'a str>,
+    max_effort: Option<&'a str>,
+) -> Option<&'a str> {
     match thinking {
-        ThinkingLevel::Off => None,
+        ThinkingLevel::Off => off_effort,
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Max => Some("high"),
+        ThinkingLevel::High => Some("high"),
+        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
     }
 }
 

@@ -1,7 +1,10 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tellm_anthropic::{API_VERSION, Anthropic, WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL_TYPE};
+use tellm_anthropic::{
+    API_VERSION, Anthropic, CUT_OFF_NOTE, DEFAULT_MAX_TOKENS, MAX_TOKENS_PER_REQUEST_TIMEOUT,
+    OUTPUT_LIMIT_BEFORE_TEXT, WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL_TYPE, request_timeout_for,
+};
 use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
 use tellm_test_support::{MockHttpServer as MockAnthropic, MockResponse};
 use tokio::time::timeout;
@@ -328,6 +331,50 @@ async fn pre_output_refusal_uses_stop_details_message() {
 }
 
 #[tokio::test]
+async fn max_tokens_stop_marks_the_reply_as_cut_off() {
+    let assistant_content = json!([
+        { "type": "thinking", "thinking": "", "signature": "sig-1" },
+        { "type": "text", "text": "The first half of the answer" }
+    ]);
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": assistant_content,
+            "stop_reason": "max_tokens"
+        }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    assert_eq!(
+        response.text,
+        format!("The first half of the answer{CUT_OFF_NOTE}")
+    );
+    assert_eq!(
+        response.turn_items[1],
+        json!({ "role": "assistant", "content": assistant_content }),
+        "the note is for the user; stored history keeps the model's own content"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_stop_before_any_text_is_an_error_not_an_empty_turn() {
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": [{ "type": "thinking", "thinking": "", "signature": "sig-1" }],
+            "stop_reason": "max_tokens"
+        }),
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(error, ProviderError::Api { status: 200, message } if message == OUTPUT_LIMIT_BEFORE_TEXT)
+    );
+}
+
+#[tokio::test]
 async fn api_error_uses_anthropic_error_message() {
     let mock = MockAnthropic::start(vec![MockResponse::json(
         400,
@@ -376,6 +423,124 @@ async fn stalled_provider_request_times_out_instead_of_hanging() {
 
     assert!(matches!(error, ProviderError::Http(_)), "{error}");
     assert_eq!(mock.requests()[0].path, "/v1/messages");
+}
+
+#[tokio::test]
+async fn max_reasoning_sends_max_unless_another_tier_is_configured() {
+    for (configured, expected) in [(None, "max"), (Some("xhigh"), "xhigh")] {
+        let mock = MockAnthropic::start(vec![MockResponse::json(
+            200,
+            json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "stop_reason": "end_turn"
+            }),
+        )]);
+        let mut req = request();
+        req.history = Vec::new();
+        req.thinking = ThinkingLevel::Max;
+
+        client(&mock)
+            .with_max_effort(configured.map(str::to_string))
+            .chat(&req)
+            .await
+            .unwrap();
+
+        let body = mock.requests()[0].json_body();
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(
+            body["output_config"],
+            json!({ "effort": expected }),
+            "configured max_effort: {configured:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn off_reasoning_sends_the_configured_off_effort_without_asking_for_thinking() {
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "stop_reason": "end_turn"
+        }),
+    )]);
+    let mut req = request();
+    req.history = Vec::new();
+    req.thinking = ThinkingLevel::Off;
+
+    client(&mock)
+        .with_off_effort(Some("low".to_string()))
+        .with_max_effort(Some("xhigh".to_string()))
+        .chat(&req)
+        .await
+        .unwrap();
+
+    let body = mock.requests()[0].json_body();
+    assert_eq!(body["output_config"], json!({ "effort": "low" }));
+    assert_missing(&body, "thinking");
+}
+
+#[tokio::test]
+async fn max_tokens_is_16000_unless_another_limit_is_configured() {
+    for (configured, expected) in [(None, 16_000), (Some(21_000), 21_000)] {
+        let mock = MockAnthropic::start(vec![MockResponse::json(
+            200,
+            json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "stop_reason": "end_turn"
+            }),
+        )]);
+
+        client(&mock)
+            .with_max_tokens(configured)
+            .chat(&request())
+            .await
+            .unwrap();
+
+        let body = mock.requests()[0].json_body();
+        assert_eq!(
+            body["max_tokens"], expected,
+            "configured max_output_tokens: {configured:?}"
+        );
+    }
+}
+
+#[test]
+fn request_timeout_grows_with_the_output_limit_and_never_shrinks() {
+    let base = Duration::from_secs(600);
+
+    assert_eq!(request_timeout_for(base, 4_096), base);
+    assert_eq!(request_timeout_for(base, DEFAULT_MAX_TOKENS), base);
+    assert_eq!(
+        request_timeout_for(base, MAX_TOKENS_PER_REQUEST_TIMEOUT),
+        base
+    );
+    let at_64k = request_timeout_for(base, 64_000);
+    assert!(
+        (Duration::from_secs(1800)..Duration::from_secs(1801)).contains(&at_64k),
+        "{at_64k:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_larger_output_limit_waits_longer_before_timing_out() {
+    let mock = MockAnthropic::start_stalled();
+    let started = Instant::now();
+
+    let error = timeout(
+        Duration::from_secs(5),
+        short_timeout_client(&mock)
+            .with_max_tokens(Some(64_000))
+            .chat(&request()),
+    )
+    .await
+    .expect("client future should complete within test timeout")
+    .unwrap_err();
+
+    assert!(matches!(error, ProviderError::Http(_)), "{error}");
+    // The 50 ms base is tripled for a 64000-token limit.
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(140), "{waited:?}");
 }
 
 fn assert_missing(value: &Value, key: &str) {

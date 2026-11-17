@@ -75,7 +75,9 @@ fn reset_notice(reset: HistoryReset) -> Option<String> {
 }
 
 /// The room's model can change after a toggle was accepted, so a capability
-/// error can still surface per-message; suggest the off switch.
+/// error can still surface per-message; suggest the off switch. A reply that
+/// used its whole output limit on thinking gets the two settings that help:
+/// less thinking, or a higher limit.
 pub(crate) fn provider_error_reply(error: &str) -> String {
     // Provider error texts use both spellings ("image generation" from
     // Anthropic/compat, "image_generation" from the xAI backstop) — match
@@ -85,8 +87,28 @@ pub(crate) fn provider_error_reply(error: &str) -> String {
         reply.push_str("\nTip: /imagegen off");
     } else if error.contains("web search") || error.contains("web_search") {
         reply.push_str("\nTip: /websearch off");
+    } else if error.contains("output limit") {
+        reply.push_str(
+            "\nTip: /reasoning low, or raise max_output_tokens for this model in config.toml",
+        );
     }
     reply
+}
+
+/// Error text for a provider reply that holds neither text nor an image.
+pub(crate) const EMPTY_REPLY_ERROR: &str =
+    "the model returned no text or image, so this turn was not saved";
+
+/// A reply with nothing to show is a failed turn, not history. Stored, it
+/// would be replayed as a question nobody saw an answer to, and a
+/// reasoning-only turn can make every later request invalid: Meta answers a
+/// reasoning item that sits directly before a user message with HTTP 400
+/// (checked 2026-11-16 against dev.meta.ai).
+pub(crate) fn require_reply_content(response: ChatResponse) -> Result<ChatResponse, String> {
+    if response.text.trim().is_empty() && response.images.is_empty() {
+        return Err(EMPTY_REPLY_ERROR.to_string());
+    }
+    Ok(response)
 }
 
 pub(crate) async fn dispatch_provider(
@@ -97,6 +119,9 @@ pub(crate) async fn dispatch_provider(
         WireFormat::Anthropic => {
             let api_key = required_api_key(model).await?;
             Anthropic::new(api_key, model.base_url.clone())
+                .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
+                .with_max_tokens(model.max_output_tokens)
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -104,6 +129,8 @@ pub(crate) async fn dispatch_provider(
         WireFormat::Responses => {
             let api_key = required_api_key(model).await?;
             Responses::new(api_key, model.base_url.clone())
+                .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -127,6 +154,8 @@ pub(crate) async fn dispatch_provider(
             // Ollama loading the model after the HTTP future is dropped.
             ollama::remember_model(&base_url, &requested_model);
             Compat::new(api_key, base_url)
+                .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -134,6 +163,8 @@ pub(crate) async fn dispatch_provider(
         WireFormat::Gemini => {
             let api_key = required_api_key(model).await?;
             Gemini::new(api_key, model.base_url.clone())
+                .with_max_effort(model.max_effort.clone())
+                .with_off_effort(model.off_effort.clone())
                 .chat(request)
                 .await
                 .map_err(|error| error.to_string())
@@ -400,6 +431,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_reply_suggests_less_reasoning_when_the_output_limit_ate_the_reply() {
+        let error = tellm_core::ProviderError::Api {
+            status: 200,
+            message: tellm_anthropic::OUTPUT_LIMIT_BEFORE_TEXT.to_string(),
+        }
+        .to_string();
+
+        let reply = provider_error_reply(&error);
+
+        assert!(reply.contains("Tip: /reasoning low"), "{reply}");
+        assert!(reply.contains("max_output_tokens"), "{reply}");
+    }
+
+    #[test]
+    fn replies_with_nothing_to_show_are_rejected() {
+        let reply = |text: &str, images: Vec<GeneratedImage>| ChatResponse {
+            text: text.to_string(),
+            images,
+            turn_items: vec![serde_json::json!({ "type": "reasoning", "id": "rs_1" })],
+        };
+        let image = || GeneratedImage {
+            media_type: "image/png".to_string(),
+            base64: "aGVsbG8=".to_string(),
+        };
+
+        assert_eq!(
+            require_reply_content(reply("", Vec::new())).unwrap_err(),
+            EMPTY_REPLY_ERROR
+        );
+        assert_eq!(
+            require_reply_content(reply(" \n", Vec::new())).unwrap_err(),
+            EMPTY_REPLY_ERROR
+        );
+        assert_eq!(
+            require_reply_content(reply("Answer.", Vec::new()))
+                .unwrap()
+                .text,
+            "Answer."
+        );
+        assert_eq!(
+            require_reply_content(reply("", vec![image()]))
+                .unwrap()
+                .images
+                .len(),
+            1,
+            "an image-only reply is a real reply"
+        );
+    }
+
+    #[test]
     fn largest_photo_prefers_pixel_area() {
         let photos = vec![
             PhotoSize {
@@ -625,6 +706,9 @@ mod tests {
             api_key_secret: Some("secret".to_string()),
             telegram_chat_ids: Vec::new(),
             thinking: tellm_core::ThinkingLevel::High,
+            max_effort: None,
+            off_effort: None,
+            max_output_tokens: None,
         }
     }
 }

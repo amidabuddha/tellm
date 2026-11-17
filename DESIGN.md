@@ -101,32 +101,69 @@ state, so:
 Thinking-level translation (verified against live provider docs 2026-07-05;
 Gemini 3.6 Flash refreshed 2026-07-26;
 OpenAI availability and xAI Grok 4.5 refreshed 2026-07-10; Anthropic Claude
-Opus 5 refreshed 2026-07-26):
+Opus 5 refreshed 2026-07-26; xAI and Meta top tiers and the preset models
+refreshed 2026-11-16):
 
 | Level | Anthropic Messages | OpenAI Responses | xAI Responses | Chat completions | Gemini |
 |---|---|---|---|---|---|
-| off | omit `thinking` | omit `reasoning` | omit | omit `reasoning_effort` | omit `thinking_level` |
+| off | `off_effort` as `output_config.effort`, else no effort; never `thinking` | `off_effort`, else omit `reasoning` | same | `off_effort`, else omit `reasoning_effort` | `off_effort`, else omit `thinking_level` |
 | low/medium/high | adaptive + `output_config.effort` | `reasoning: {effort}` | same | `reasoning_effort` | `thinking_level` |
-| max | `effort: "max"` (valid on ALL adaptive models) | `effort: "max"` on GPT-5.6, otherwise `"xhigh"` | clamps to `"high"` (grok-4.5 has no xhigh) | clamps to `"high"` ("max" not in the dialect) | clamps to `"high"` |
+| max | `max_effort`, else `"max"` (valid on ALL adaptive models) | `max_effort`, else `"xhigh"` | same | `max_effort`, else `"high"` ("max" not in the dialect) | `max_effort`, else `"high"` |
 
 Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
-2026-07-26):
-- **"off" means provider default everywhere, not "no thinking"**: Opus 5,
-  Sonnet 5, and Fable 5 think anyway; gpt-5.6-sol reasons at its own default;
-  grok-4.5 defaults to high; Gemini thinks dynamically. User-facing text must
-  say "default", not "off".
-- OpenAI effort is model-dependent: the built-in GPT-5.6 Sol preset supports
-  `max`, while older OpenAI families top out at `xhigh`. `/reasoning max`
-  therefore sends `max` to GPT-5.6 and `xhigh` to older OpenAI models and Meta
-  Muse Spark. Grok 4.5
-  has no tier above `high` and cannot disable reasoning, so its `Max` clamps to
-  `high` and `Off` omits the field. An unsupported value errors explicitly and
-  the user can lower the room's level.
-- Gemini `medium` is invalid on gemini-3-pro-preview (low/high only), so that
-  model should be configured with `thinking = "low"` or `thinking = "high"`;
-  gemini-3.1-pro and 3.6-flash accept medium.
-- Anthropic always sends `max_tokens: 16000`: thinking tokens count toward
-  `max_tokens`, and 4096 risked mid-thought truncation at high/max effort.
+2026-07-26; xAI, Meta, and the preset models' defaults refreshed 2026-11-16):
+- **"off" is configuration, like the top tier.** `/reasoning off` sends the
+  model's optional `off_effort` value from `config.toml`. When that is unset
+  tellm sends no reasoning setting and the provider default applies, which is
+  not "no thinking": Claude Fable 5.2 defaults to `high`; gpt-6-astra reasons
+  at its own default and rejects `none`; grok-4.7 defaults to `high`;
+  muse-wonder-1.0 defaults to `max`; Gemini 4 Carbon defaults to `medium`. None
+  of the preset models can turn thinking off, so each preset writes its
+  model's lowest tier (`minimal` for muse-wonder-1.0, checked 2026-11-17
+  against dev.meta.ai; `low` for the others) and "off" is their cheapest
+  setting. A model that can disable reasoning takes `off_effort = "none"`. On
+  the Anthropic wire format the value is sent as `output_config.effort`
+  without a `thinking` field, since effort works with or without thinking.
+  User-facing text must not promise "no thinking".
+- The tier above `high` differs from model to model, so it is configuration
+  and not code: `/reasoning max` sends the model's optional `max_effort` value
+  from `config.toml`, and the wire format's default when that is unset. The
+  defaults are `"max"` for Anthropic, `"xhigh"` for Responses (accepted by
+  GPT-5.2 and later, every Muse model, and every current Grok, where 4.5
+  treats it as `high`; an older OpenAI model that stops at `high` needs
+  `max_effort = "high"`), and `"high"` for chat completions and Gemini. Models
+  that list a higher tier opt in with `max_effort = "max"`: OpenAI's GPT-5.6,
+  GPT-6, and GPT-6.1 families, Meta's muse-wonder-1.0, muse-spark-1.3, and
+  muse-ember-1.0, and DeepSeek over chat completions. No Grok model lists
+  `max`. Built-in presets write the value their model needs. tellm checks only
+  that the value is one token; an unsupported value errors explicitly at the
+  provider and the user can lower the room's level.
+- Gemini thinking levels are model-dependent: gemini-4-carbon,
+  gemini-4-argon, gemini-3.8-flash, and gemini-3.6-flash accept
+  low/medium/high. Carbon, Argon, and 3.8 Flash reject `minimal`, so `low` is
+  the lowest `off_effort` they take (checked 2026-11-16; Carbon checked
+  2026-11-17 against Google's Gemini 4 Carbon developer guide).
+- Anthropic sends the model's optional `max_output_tokens` as `max_tokens`,
+  and 16000 when it is unset: thinking tokens count toward `max_tokens`, and
+  4096 risked mid-thought truncation at high/max effort. The setting exists
+  only for the Anthropic wire format, and validation rejects it elsewhere,
+  because the other formats send no output limit. The Claude Fable 5.2 preset
+  writes 64000 so that a reply at `max` effort has room to finish: Anthropic
+  says to set a large `max_tokens` at `high` and above on that model and gives
+  no number for it, 64k is its starting point for Claude Opus 5 at `xhigh` or
+  `max` (checked 2026-11-17 against platform.claude.com, effort), and the
+  model's output maximum is 128k (checked 2026-11-16).
+- A larger Anthropic limit is paid for in waiting, because requests are not
+  streamed and the whole reply arrives in one HTTP response. Anthropic's SDKs
+  refuse a non-streamed request above 21,333 `max_tokens`, the amount they
+  expect to fit in their 10-minute timeout, and its guidance is to avoid a
+  large `max_tokens` without streaming. tellm keeps the no-streaming boundary
+  and follows the guidance for direct integrations instead: the Anthropic
+  request timeout grows with the limit at that ratio and never drops below 10
+  minutes (30 minutes at 64000), and the client sets a 60-second TCP
+  keep-alive so that networks which drop idle connections do not drop a long
+  request (checked 2026-11-16 against platform.claude.com, thinking and API
+  errors). A request that still times out is an ordinary provider error.
 - **Capability toggles are gated at the toggle**: `/imagegen on` and
   `/websearch on` refuse in rooms whose wire format or model id can never
   honor them (image generation: Anthropic/compat/xAI/Meta/non-image Gemini models;
@@ -152,6 +189,19 @@ Notes:
   continuing the request with the paused assistant message appended; return all
   assistant messages from the loop in `turn_items` so opaque history remains
   replayable.
+- Handle Anthropic `stop_reason: max_tokens` (checked 2026-11-16 against
+  platform.claude.com, stop reasons and the Claude Fable 5.2 migration
+  guide): thinking counts toward the limit, so a reply can stop mid-answer or
+  before any text. A cut-off answer is delivered with a closing note that says
+  so, while the stored turn keeps the model's own content. A reply cut off
+  before any text is a provider error, and the error reply suggests
+  `/reasoning low` or a higher `max_output_tokens`.
+- A reply with neither text nor an image is a failed turn in every wire
+  format: nothing is stored and the chat gets an error. Stored, it would be
+  replayed as a question without a visible answer, and a reasoning-only turn
+  can break the room, because Meta answers a reasoning item that sits directly
+  before a user message with HTTP 400 (checked 2026-11-16 against
+  dev.meta.ai).
 - Anthropic thinking blocks are bound to everything sent before them:
   `system`, `tools`, and every earlier message (checked 2026-11-16 against
   platform.claude.com, preserved thinking / prefix checks). Replaying one
@@ -168,10 +218,19 @@ Notes:
   provider-native input/output items are replayed in `input`, and every
   response `output` item is returned in `turn_items` verbatim. When reasoning
   is requested, `include: ["reasoning.encrypted_content"]` is set so encrypted
-  reasoning can be replayed on later stateless turns. OpenAI system prompts use
+  reasoning can be replayed on later stateless turns. xAI and Meta get the
+  flag at every level, `off` included: their models reason anyway, both return
+  encrypted reasoning only on request (grok-4.7 always does), and Meta answers
+  a replayed reasoning item without it with HTTP 400 (checked 2026-11-16
+  against docs.x.ai and dev.meta.ai). OpenAI returns it by default and still
+  accepts the flag. OpenAI system prompts use
   top-level `instructions`; xAI currently rejects `instructions`, so xAI
   system prompts are sent as compatible input message items instead (checked
   2026-07-04; still shown as input messages in 2026-07-09 Grok 4.5 docs).
+- A Responses request gets xAI or Meta handling when its base URL names the
+  provider (`api.x.ai`, `api.meta.ai`) or, behind a proxy, when its model id
+  starts with `grok-` or `muse-`; every Meta Model API id starts with `muse-`
+  (checked 2026-11-17 against dev.meta.ai).
 - OpenAI Responses web search uses the `web_search` tool. xAI Responses uses
   `web_search` plus `x_search` for tellm's search toggle (checked
   2026-07-09 against docs.x.ai for Grok 4.5). Meta Model API Responses uses
@@ -189,16 +248,25 @@ Notes:
 - Gemini Interactions uses `POST /v1beta/interactions`, `x-goog-api-key`,
   `store:false`, `stream:false`, `system_instruction`, and stateless `input`
   as an array of Interactions `Step` objects (checked 2026-07-26 against
-  ai.google.dev for Gemini 3.6 Flash). Requests omit deprecated sampling
-  parameters and end in a `user_input` step, never a prefilled model turn.
+  ai.google.dev for Gemini 3.6 Flash; rechecked 2026-11-16 for Gemini 4
+  Argon). Gemini 4 Carbon is a drop-in model id on the same API (checked
+  2026-11-17 against Google's Gemini 4 Carbon developer guide). Requests omit
+  deprecated sampling parameters and end in a `user_input` step, never a
+  prefilled model turn. Long decode past 64K output tokens on Gemini 4 Carbon
+  and Argon needs background execution or a continuation token; tellm uses
+  neither, so a reply that stops early comes back with a non-completed status
+  and is reported as unsupported follow-up handling.
   Raw response `steps` are replayed through `turn_items`
   verbatim, including `thought` and Google Search call/result signatures.
   Web search is `tools: [{type:"google_search",
   search_types:["web_search"]}]`; image generation is allowed only for Gemini
-  image model ids (`*-image*`) and sends `response_format: {"type":"image"}`;
+  image model ids and sends `response_format: {"type":"image"}`;
   generated image content becomes `GeneratedImage`. The image-model gate is a
-  fail-closed naming heuristic, not a capability-discovery API; update it if
-  Google's public model ids stop using `-image`.
+  fail-closed naming heuristic, not a capability-discovery API: an id counts
+  when it contains `-image` (gemini-3.1-flash-image, gemini-3-pro-image) or
+  `nano-banana` (gemini-nano-banana-2.1, the current image model; checked
+  2026-11-16). Update it when Google's public image model ids change shape
+  again.
 - **File upload requires no extraction.** PDFs/images pass through natively:
   Anthropic `document`/`image` blocks, OpenAI `input_file`/`input_image`,
   Gemini `document`/`image` content blocks.
@@ -365,7 +433,11 @@ restart and local room-setting changes.
   fallback.
 - Non-secrets: human-editable TOML at `dirs::config_dir()/tellm/config.toml`.
   **Capability routing is explicit** (`wire_format` field per model) — never
-  inferred from the spelling of user-chosen keys (parent-app lesson).
+  inferred from the spelling of user-chosen keys (parent-app lesson). The two
+  ends of the reasoning scale follow the same rule: the optional per-model
+  `max_effort` and `off_effort` name the provider values for
+  `thinking = "max"` and `thinking = "off"` instead of tellm inferring them
+  from `model_name`.
   Provider credentials are referenced by secret name (`api_key_secret`),
   never stored inline. Keyless endpoints, especially local Ollama, omit
   `api_key_secret`; `/model add KEY` must not open a key prompt for those
@@ -417,6 +489,9 @@ restart and local room-setting changes.
 - **Semantic validation at startup** (`Config::validate()`): default model
   exists; model keys are command-safe; model names and secret names are
   nonempty and secret names cannot use tellm's internal marker prefix;
+  `max_effort` and `off_effort`, when present, are each one whitespace-free
+  token; `max_output_tokens`, when present, is positive and belongs to an
+  Anthropic model;
   non-compat models name a secret; compat models have a valid absolute URL;
   credential-bearing endpoints use HTTPS; non-loopback keyless compat HTTP has
   the explicit per-model opt-in described above; URLs contain no embedded
@@ -437,8 +512,11 @@ restart and local room-setting changes.
   No encrypted-file theater.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
-  from the built-in list (checked 2026-07-26: Claude Opus 5, GPT-5.6 Sol,
-  Grok 4.5, Muse Spark 1.1, Gemini 3.6 Flash), stores Telegram/provider
+  from the built-in list, which is each lab's most capable model that an
+  ordinary API key can call (checked 2026-11-16, Google on 2026-11-17: Claude
+  Fable 5.2, GPT-6 Astra, Grok 4.7, Muse Wonder 1.0 in preview, Gemini 4
+  Carbon), stores
+  Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather
   than repeatedly prompting on a closed input stream.

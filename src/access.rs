@@ -375,6 +375,9 @@ mod tests {
             api_key_secret: None,
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: ThinkingLevel::default(),
+            max_effort: None,
+            off_effort: None,
+            max_output_tokens: None,
         }
     }
 

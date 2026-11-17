@@ -75,6 +75,25 @@ pub struct ModelConfig {
     pub telegram_chat_ids: Vec<i64>,
     #[serde(default)]
     pub thinking: ThinkingLevel,
+    /// Provider value sent when the thinking level is `max`, such as `"max"`
+    /// or `"xhigh"`. The tiers above `high` differ from model to model, so
+    /// this is explicit instead of inferred from `model_name`. When unset,
+    /// the wire format's default top tier is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_effort: Option<String>,
+    /// Provider value sent when the thinking level is `off`, such as
+    /// `"none"`, `"minimal"` or `"low"`. Whether reasoning can be disabled,
+    /// and what the lowest tier is called, differs from model to model. When
+    /// unset, no reasoning setting is sent and the provider's own default
+    /// applies, which on some models is their highest tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_effort: Option<String>,
+    /// Upper limit on one reply's output tokens, sent as Anthropic
+    /// `max_tokens`; thinking counts toward it. Only the `anthropic` wire
+    /// format takes it, because the other formats leave output length to the
+    /// provider. When unset, the Anthropic client's default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -121,6 +140,29 @@ impl Config {
             }
             if model.model_name.trim().is_empty() {
                 problems.push(format!("model \"{key}\": model_name must not be empty"));
+            }
+            for (setting, value, examples) in [
+                ("max_effort", &model.max_effort, "\"max\" or \"xhigh\""),
+                ("off_effort", &model.off_effort, "\"none\" or \"low\""),
+            ] {
+                if let Some(value) = value
+                    && (value.is_empty() || value.chars().any(char::is_whitespace))
+                {
+                    problems.push(format!(
+                        "model \"{key}\": {setting} must be a single provider effort value such as {examples}"
+                    ));
+                }
+            }
+            if let Some(max_output_tokens) = model.max_output_tokens {
+                if model.wire_format != WireFormat::Anthropic {
+                    problems.push(format!(
+                        "model \"{key}\": max_output_tokens is only used by the anthropic wire format"
+                    ));
+                } else if max_output_tokens == 0 {
+                    problems.push(format!(
+                        "model \"{key}\": max_output_tokens must be greater than zero"
+                    ));
+                }
             }
 
             if model.wire_format == WireFormat::Compat && model.base_url.is_none() {
@@ -941,6 +983,9 @@ mod tests {
             api_key_secret: (wire_format != WireFormat::Compat).then(|| "test_api_key".to_string()),
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: ThinkingLevel::default(),
+            max_effort: None,
+            off_effort: None,
+            max_output_tokens: None,
         }
     }
 
@@ -1217,11 +1262,129 @@ mod tests {
         );
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(!text.contains("allow_insecure_http"));
+        assert!(!text.contains("max_effort"), "{text}");
+        assert!(!text.contains("off_effort"), "{text}");
+        assert!(!text.contains("max_output_tokens"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert!(back.validate().is_ok());
         assert_eq!(back.default_model, "claude");
         assert_eq!(back.models["claude"].telegram_chat_ids, vec![1, 2]);
         assert!(!back.models["claude"].allow_insecure_http);
+        assert_eq!(back.models["claude"].max_effort, None);
+        assert_eq!(back.models["claude"].off_effort, None);
+    }
+
+    #[test]
+    fn max_effort_roundtrips_through_toml_and_is_optional() {
+        let mut gpt = model(WireFormat::Responses, None, &[]);
+        gpt.max_effort = Some("max".to_string());
+        let c = config(&[("gpt", gpt)], "gpt");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("max_effort = \"max\""), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+
+        assert_eq!(back.models["gpt"].max_effort.as_deref(), Some("max"));
+        assert!(back.validate().is_ok());
+
+        // A config written before the setting existed still loads.
+        let legacy: Config = toml::from_str(
+            "default_model = \"gpt\"\n\n[models.gpt]\nwire_format = \"responses\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.models["gpt"].max_effort, None);
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn max_effort_must_be_one_token() {
+        for bad in ["", " ", "x high", "max\n"] {
+            let mut gpt = model(WireFormat::Responses, None, &[]);
+            gpt.max_effort = Some(bad.to_string());
+            let c = config(&[("gpt", gpt)], "gpt");
+
+            let p = problems(&c);
+
+            assert_eq!(p.len(), 1, "{bad:?}: {p:?}");
+            assert!(p[0].contains("max_effort"), "{bad:?}: {p:?}");
+        }
+    }
+
+    #[test]
+    fn off_effort_roundtrips_through_toml_and_is_optional() {
+        let mut meta = model(WireFormat::Responses, None, &[]);
+        meta.off_effort = Some("minimal".to_string());
+        let c = config(&[("meta", meta)], "meta");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("off_effort = \"minimal\""), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+
+        assert_eq!(back.models["meta"].off_effort.as_deref(), Some("minimal"));
+        assert!(back.validate().is_ok());
+
+        // A config written before the setting existed still loads.
+        let legacy: Config = toml::from_str(
+            "default_model = \"meta\"\n\n[models.meta]\nwire_format = \"responses\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.models["meta"].off_effort, None);
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn max_output_tokens_roundtrips_through_toml_and_is_optional() {
+        let mut claude = model(WireFormat::Anthropic, None, &[]);
+        claude.max_output_tokens = Some(21_000);
+        let c = config(&[("claude", claude)], "claude");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("max_output_tokens = 21000"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+
+        assert_eq!(back.models["claude"].max_output_tokens, Some(21_000));
+        assert!(back.validate().is_ok());
+
+        // A config written before the setting existed still loads.
+        let legacy: Config = toml::from_str(
+            "default_model = \"claude\"\n\n[models.claude]\nwire_format = \"anthropic\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.models["claude"].max_output_tokens, None);
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn max_output_tokens_must_be_positive_and_on_an_anthropic_model() {
+        let mut claude = model(WireFormat::Anthropic, None, &[]);
+        claude.max_output_tokens = Some(0);
+        let p = problems(&config(&[("claude", claude)], "claude"));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("greater than zero"), "{p:?}");
+
+        // The other wire formats send no output limit, so the setting would
+        // be silently ignored there.
+        for wire_format in [WireFormat::Responses, WireFormat::Gemini] {
+            let mut other = model(wire_format, None, &[]);
+            other.max_output_tokens = Some(21_000);
+            let p = problems(&config(&[("other", other)], "other"));
+            assert_eq!(p.len(), 1, "{wire_format:?}: {p:?}");
+            assert!(p[0].contains("anthropic wire format"), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn off_effort_must_be_one_token() {
+        for bad in ["", " ", "very low", "none\n"] {
+            let mut gpt = model(WireFormat::Responses, None, &[]);
+            gpt.off_effort = Some(bad.to_string());
+            let c = config(&[("gpt", gpt)], "gpt");
+
+            let p = problems(&c);
+
+            assert_eq!(p.len(), 1, "{bad:?}: {p:?}");
+            assert!(p[0].contains("off_effort"), "{bad:?}: {p:?}");
+        }
     }
 
     #[test]

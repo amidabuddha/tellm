@@ -1176,7 +1176,9 @@ async fn handle_model_message(
     }
 
     let typing = AbortOnDrop(spawn_typing_indicator(handles.telegram.clone(), chat_id));
-    let response = model_turn::dispatch_provider(&prepared.model_config, &prepared.request).await;
+    let response = model_turn::dispatch_provider(&prepared.model_config, &prepared.request)
+        .await
+        .and_then(model_turn::require_reply_content);
     typing.abort();
 
     match response {
@@ -2905,10 +2907,12 @@ mod tests {
         assert!(capabilities.web_search);
         assert!(!capabilities.image_generation);
 
-        config.models.get_mut("gemini").unwrap().model_name = "gemini-3.1-flash-image".to_string();
-        let capabilities = room_capabilities(&config, &room, 42);
-        assert!(capabilities.web_search);
-        assert!(capabilities.image_generation);
+        for image_model in ["gemini-3.1-flash-image", "gemini-nano-banana-2.1"] {
+            config.models.get_mut("gemini").unwrap().model_name = image_model.to_string();
+            let capabilities = room_capabilities(&config, &room, 42);
+            assert!(capabilities.web_search, "{image_model}");
+            assert!(capabilities.image_generation, "{image_model}");
+        }
     }
 
     #[test]
@@ -2944,6 +2948,9 @@ mod tests {
             api_key_secret: Some("secret".to_string()),
             telegram_chat_ids: chat_ids.to_vec(),
             thinking: tellm_core::ThinkingLevel::default(),
+            max_effort: None,
+            off_effort: None,
+            max_output_tokens: None,
         }
     }
 

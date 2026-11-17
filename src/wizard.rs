@@ -13,6 +13,16 @@ pub(crate) struct ProviderPreset {
     pub(crate) model_name: &'static str,
     pub(crate) base_url: Option<&'static str>,
     pub(crate) api_key_secret: &'static str,
+    /// Written to the model's `max_effort` config: the provider value for
+    /// `thinking = "max"`. `None` leaves the wire format's default tier.
+    pub(crate) max_effort: Option<&'static str>,
+    /// Written to the model's `off_effort` config: the provider value for
+    /// `thinking = "off"`. `None` sends no reasoning setting, so the
+    /// provider's default applies.
+    pub(crate) off_effort: Option<&'static str>,
+    /// Written to the model's `max_output_tokens` config. `None` leaves the
+    /// wire format's default; only Anthropic models take a value.
+    pub(crate) max_output_tokens: Option<u32>,
 }
 
 /// The built-in provider catalog, shared with /model add.
@@ -35,59 +45,103 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
         api_key_secret: Some(preset.api_key_secret.to_string()),
         telegram_chat_ids: Vec::new(),
         thinking: ThinkingLevel::default(),
+        max_effort: preset.max_effort.map(str::to_string),
+        off_effort: preset.off_effort.map(str::to_string),
+        max_output_tokens: preset.max_output_tokens,
     }
 }
 
-// Checked 2026-07-26 against platform.claude.com model docs: Claude Opus 5
-// uses ID claude-opus-5 and is Anthropic's recommended starting model for
-// complex agentic coding and enterprise work.
-// Checked 2026-07-04 against developers.openai.com API model docs and
-// docs.x.ai model docs.
-// Checked 2026-07-09 against dev.meta.ai Model API docs for Muse Spark.
-// Checked 2026-07-09 against docs.x.ai model docs for Grok 4.5.
-// Checked 2026-07-10 against developers.openai.com API model docs: GPT-5.6
-// Sol is the flagship model, uses ID gpt-5.6-sol, supports Responses, and
-// accepts reasoning effort none/low/medium/high/xhigh/max.
+// Each preset is its lab's most capable model that an ordinary API key can
+// call; that is what tellm is for. All checked 2026-11-16:
+// - platform.claude.com model docs: Claude Fable 5.2 uses ID claude-fable-5-2
+//   and is Anthropic's most capable generally available model (Claude Mythos
+//   5.2 is limited to verified organizations). Thinking is always adaptive,
+//   and effort accepts low/medium/high/xhigh/max.
+// - developers.openai.com API model docs: GPT-6 Astra uses ID gpt-6-astra, is
+//   OpenAI's most capable model, supports Responses with web search and
+//   image generation, and accepts reasoning effort low/medium/high/xhigh/max.
+// - docs.x.ai model docs: Grok 4.7 uses ID grok-4.7 and is the flagship; it
+//   accepts reasoning effort low/medium/high/xhigh and never max.
+// - dev.meta.ai Model API docs: Muse Wonder uses ID muse-wonder-1.0, is
+//   Meta's most capable model, is in preview on Model API, and accepts
+//   reasoning effort from minimal to max (rechecked 2026-11-17: "none" is
+//   an HTTP 400, and the default when no effort is sent is max).
+// - Google (checked 2026-11-17): Gemini 4 Carbon uses ID gemini-4-carbon and
+//   is Google's strongest model, open to every paid Gemini API key since
+//   2026-11-10 (blog.google, "Gemini 4 Carbon is now available"). It runs on
+//   the Interactions API as a drop-in for gemini-4-argon, and its thinking
+//   level accepts low/medium/high with medium the default (Gemini 4 Carbon
+//   developer guide on aistudio.google.com); minimal is an HTTP 400
+//   (docs.cloud.google.com developer's guide). The ai.google.dev pages do
+//   not list Carbon and still call Gemini 4 Argon the most capable model,
+//   so they are not enough to check Google's lineup.
+//
+// None of the five can turn reasoning off, and without an effort each one
+// reasons at its own default, which is the top tier on Muse Wonder. So each
+// preset writes its model's lowest tier as `off_effort`, and `off` is the
+// cheapest setting instead of the provider's default.
+//
+// The Claude preset also writes a 64000-token output limit, four times the
+// client default, so a reply at `max` effort has room to finish. Anthropic's
+// effort docs say to set a large `max_tokens` at `high` and above on Claude
+// Fable 5.2 and give no number for it; 64k is their starting point for Claude
+// Opus 5 at `xhigh` or `max` (checked 2026-11-17). The model's output maximum
+// is 128k (checked 2026-11-16).
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
-        label: "Anthropic Claude Opus 5",
+        label: "Anthropic Claude Fable 5.2",
         wire_format: WireFormat::Anthropic,
-        model_name: "claude-opus-5",
+        model_name: "claude-fable-5-2",
         base_url: None,
         api_key_secret: secrets::ANTHROPIC_API_KEY,
+        max_effort: None,
+        off_effort: Some("low"),
+        max_output_tokens: Some(64_000),
     },
     ProviderPreset {
         key: "openai",
-        label: "OpenAI GPT-5.6 Sol",
+        label: "OpenAI GPT-6 Astra",
         wire_format: WireFormat::Responses,
-        model_name: "gpt-5.6-sol",
+        model_name: "gpt-6-astra",
         base_url: None,
         api_key_secret: secrets::OPENAI_API_KEY,
+        max_effort: Some("max"),
+        off_effort: Some("low"),
+        max_output_tokens: None,
     },
     ProviderPreset {
         key: "xai",
-        label: "xAI Grok 4.5",
+        label: "xAI Grok 4.7",
         wire_format: WireFormat::Responses,
-        model_name: "grok-4.5",
+        model_name: "grok-4.7",
         base_url: Some(tellm_openai::XAI_BASE_URL),
         api_key_secret: secrets::XAI_API_KEY,
+        max_effort: None,
+        off_effort: Some("low"),
+        max_output_tokens: None,
     },
     ProviderPreset {
         key: "meta",
-        label: "Meta Muse Spark 1.1",
+        label: "Meta Muse Wonder 1.0",
         wire_format: WireFormat::Responses,
-        model_name: "muse-spark-1.1",
+        model_name: "muse-wonder-1.0",
         base_url: Some(tellm_openai::META_MODEL_API_BASE_URL),
         api_key_secret: secrets::META_MODEL_API_KEY,
+        max_effort: Some("max"),
+        off_effort: Some("minimal"),
+        max_output_tokens: None,
     },
     ProviderPreset {
         key: "gemini",
-        label: "Google Gemini 3.6 Flash",
+        label: "Google Gemini 4 Carbon",
         wire_format: WireFormat::Gemini,
-        model_name: "gemini-3.6-flash",
+        model_name: "gemini-4-carbon",
         base_url: None,
         api_key_secret: secrets::GEMINI_API_KEY,
+        max_effort: None,
+        off_effort: Some("low"),
+        max_output_tokens: None,
     },
 ];
 
@@ -262,28 +316,88 @@ mod tests {
 
         assert_eq!(config.default_model, "xai");
         assert_eq!(model.wire_format, WireFormat::Responses);
-        assert_eq!(model.model_name, "grok-4.5");
+        assert_eq!(model.model_name, "grok-4.7");
         assert_eq!(model.base_url.as_deref(), Some(tellm_openai::XAI_BASE_URL));
         assert_eq!(model.api_key_secret.as_deref(), Some(secrets::XAI_API_KEY));
         assert!(model.telegram_chat_ids.is_empty());
     }
 
     #[test]
-    fn anthropic_preset_uses_claude_opus_5() {
-        let preset = preset_by_key("anthropic").unwrap();
+    fn preset_max_effort_is_written_to_the_model_config() {
+        let openai = model_config_from_preset(preset_by_key("openai").unwrap());
+        let meta = model_config_from_preset(preset_by_key("meta").unwrap());
+        let xai = model_config_from_preset(preset_by_key("xai").unwrap());
 
-        assert_eq!(preset.label, "Anthropic Claude Opus 5");
-        assert_eq!(preset.model_name, "claude-opus-5");
-        assert_eq!(preset.wire_format, WireFormat::Anthropic);
+        // Astra and Wonder list "max"; Grok stops at the Responses default.
+        assert_eq!(openai.max_effort.as_deref(), Some("max"));
+        assert_eq!(meta.max_effort.as_deref(), Some("max"));
+        assert_eq!(xai.max_effort, None);
     }
 
     #[test]
-    fn openai_preset_uses_current_flagship_gpt_5_6_sol() {
-        let preset = preset_by_key("openai").unwrap();
+    fn claude_preset_gives_long_replies_room_and_the_others_send_no_limit() {
+        let claude = model_config_from_preset(preset_by_key("anthropic").unwrap());
+        assert_eq!(claude.max_output_tokens, Some(64_000));
 
-        assert_eq!(preset.label, "OpenAI GPT-5.6 Sol");
-        assert_eq!(preset.model_name, "gpt-5.6-sol");
-        assert_eq!(preset.wire_format, WireFormat::Responses);
+        for key in ["openai", "xai", "meta", "gemini"] {
+            let model = model_config_from_preset(preset_by_key(key).unwrap());
+            assert_eq!(model.max_output_tokens, None, "{key}");
+        }
+    }
+
+    #[test]
+    fn presets_write_each_models_lowest_tier_as_off_effort() {
+        // None of the preset models can turn reasoning off; Muse Wonder is
+        // the one with a tier below "low".
+        for (key, lowest) in [
+            ("anthropic", "low"),
+            ("openai", "low"),
+            ("xai", "low"),
+            ("meta", "minimal"),
+            ("gemini", "low"),
+        ] {
+            let model = model_config_from_preset(preset_by_key(key).unwrap());
+
+            assert_eq!(model.off_effort.as_deref(), Some(lowest), "{key}");
+        }
+    }
+
+    #[test]
+    fn presets_name_each_labs_most_capable_model() {
+        for (key, label, model_name, wire_format) in [
+            (
+                "anthropic",
+                "Anthropic Claude Fable 5.2",
+                "claude-fable-5-2",
+                WireFormat::Anthropic,
+            ),
+            (
+                "openai",
+                "OpenAI GPT-6 Astra",
+                "gpt-6-astra",
+                WireFormat::Responses,
+            ),
+            ("xai", "xAI Grok 4.7", "grok-4.7", WireFormat::Responses),
+            (
+                "meta",
+                "Meta Muse Wonder 1.0",
+                "muse-wonder-1.0",
+                WireFormat::Responses,
+            ),
+            (
+                "gemini",
+                "Google Gemini 4 Carbon",
+                "gemini-4-carbon",
+                WireFormat::Gemini,
+            ),
+        ] {
+            let preset = preset_by_key(key).unwrap();
+
+            assert_eq!(preset.label, label);
+            assert_eq!(preset.model_name, model_name);
+            assert_eq!(preset.wire_format, wire_format);
+        }
+        assert_eq!(provider_presets().len(), 5);
     }
 
     #[test]
