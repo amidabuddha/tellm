@@ -170,6 +170,12 @@ Notes:
   so, while the stored turn keeps the model's own content. A reply cut off
   before any text is a provider error, and the error reply suggests
   `/reasoning low`.
+- A reply with neither text nor an image is a failed turn in every wire
+  format: nothing is stored and the chat gets an error. Stored, it would be
+  replayed as a question without a visible answer, and a reasoning-only turn
+  can break the room, because Meta answers a reasoning item that sits directly
+  before a user message with HTTP 400 (checked 2026-11-16 against
+  dev.meta.ai).
 - Anthropic thinking blocks are bound to everything sent before them:
   `system`, `tools`, and every earlier message (checked 2026-11-16 against
   platform.claude.com, preserved thinking / prefix checks). Replaying one

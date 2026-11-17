@@ -92,6 +92,22 @@ pub(crate) fn provider_error_reply(error: &str) -> String {
     reply
 }
 
+/// Error text for a provider reply that holds neither text nor an image.
+pub(crate) const EMPTY_REPLY_ERROR: &str =
+    "the model returned no text or image, so this turn was not saved";
+
+/// A reply with nothing to show is a failed turn, not history. Stored, it
+/// would be replayed as a question nobody saw an answer to, and a
+/// reasoning-only turn can make every later request invalid: Meta answers a
+/// reasoning item that sits directly before a user message with HTTP 400
+/// (checked 2026-11-16 against dev.meta.ai).
+pub(crate) fn require_reply_content(response: ChatResponse) -> Result<ChatResponse, String> {
+    if response.text.trim().is_empty() && response.images.is_empty() {
+        return Err(EMPTY_REPLY_ERROR.to_string());
+    }
+    Ok(response)
+}
+
 pub(crate) async fn dispatch_provider(
     model: &ModelConfig,
     request: &ChatRequest,
@@ -417,6 +433,42 @@ mod tests {
         let reply = provider_error_reply(&error);
 
         assert!(reply.contains("Tip: /reasoning low"), "{reply}");
+    }
+
+    #[test]
+    fn replies_with_nothing_to_show_are_rejected() {
+        let reply = |text: &str, images: Vec<GeneratedImage>| ChatResponse {
+            text: text.to_string(),
+            images,
+            turn_items: vec![serde_json::json!({ "type": "reasoning", "id": "rs_1" })],
+        };
+        let image = || GeneratedImage {
+            media_type: "image/png".to_string(),
+            base64: "aGVsbG8=".to_string(),
+        };
+
+        assert_eq!(
+            require_reply_content(reply("", Vec::new())).unwrap_err(),
+            EMPTY_REPLY_ERROR
+        );
+        assert_eq!(
+            require_reply_content(reply(" \n", Vec::new())).unwrap_err(),
+            EMPTY_REPLY_ERROR
+        );
+        assert_eq!(
+            require_reply_content(reply("Answer.", Vec::new()))
+                .unwrap()
+                .text,
+            "Answer."
+        );
+        assert_eq!(
+            require_reply_content(reply("", vec![image()]))
+                .unwrap()
+                .images
+                .len(),
+            1,
+            "an image-only reply is a real reply"
+        );
     }
 
     #[test]

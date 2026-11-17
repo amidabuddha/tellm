@@ -1176,7 +1176,9 @@ async fn handle_model_message(
     }
 
     let typing = AbortOnDrop(spawn_typing_indicator(handles.telegram.clone(), chat_id));
-    let response = model_turn::dispatch_provider(&prepared.model_config, &prepared.request).await;
+    let response = model_turn::dispatch_provider(&prepared.model_config, &prepared.request)
+        .await
+        .and_then(model_turn::require_reply_content);
     typing.abort();
 
     match response {
