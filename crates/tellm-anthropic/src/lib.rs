@@ -3,7 +3,9 @@
 //! Mapping notes (checked 2026-07-04 against platform.claude.com — re-check
 //! live provider docs before changing these mappings):
 //! - Thinking: `thinking: {"type": "adaptive"}` + `output_config: {"effort": ...}`.
-//!   `budget_tokens` is rejected on current models — never send it.
+//!   `budget_tokens` is rejected on current models — never send it. `Off`
+//!   sends neither, unless the model's `off_effort` names an effort, which
+//!   then goes out without a `thinking` field.
 //! - Prompt caching: `cache_control: {"type": "ephemeral"}` on the system
 //!   block; keep the system prompt byte-stable (no timestamps).
 //! - Web search: `{"type": "web_search_20260318", "name": "web_search",

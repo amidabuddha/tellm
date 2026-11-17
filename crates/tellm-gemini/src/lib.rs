@@ -10,8 +10,9 @@
 //!   verbatim, including `thought`, `google_search_call`, and
 //!   `google_search_result` signatures. Stateless mode requires those
 //!   signatures back unchanged on future turns.
-//! - Thinking: `generation_config.thinking_level` for low/medium/high; omit
-//!   for `Off`; `Max` sends the model's `max_effort`, or `high` when unset
+//! - Thinking: `generation_config.thinking_level` for low/medium/high.
+//!   `Off` sends the model's `off_effort` and omits the field when that is
+//!   unset; `Max` sends the model's `max_effort`, or `high` when unset
 //!   because Interactions has no level above it.
 //!   Gemini 4 Argon, 3.8 Flash and 3.6 Flash support all three mapped levels;
 //!   Gemini 4 Argon and 3.8 Flash reject `minimal`, which is never sent

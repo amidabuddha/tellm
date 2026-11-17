@@ -4,7 +4,9 @@
 //! Mapping notes (checked 2026-07-04 against platform.openai.com, refreshed
 //! 2026-07-09 against docs.x.ai for Grok 4.5, and checked 2026-07-09 against
 //! dev.meta.ai - re-check live provider docs before changing these mappings):
-//! - Reasoning: `reasoning: {"effort": ...}`; omit for ThinkingLevel::Off.
+//! - Reasoning: `reasoning: {"effort": ...}`. The two ends come from the
+//!   model's config: `Off` sends its `off_effort` and omits the field when
+//!   that is unset, and `Max` sends its `max_effort`.
 //!   Include `reasoning.encrypted_content` when reasoning is requested so
 //!   stateless history can replay reasoning items later. xAI and Meta get
 //!   the flag at every level, `Off` included: their models reason anyway and

@@ -8,7 +8,8 @@
 //! Mapping notes (checked 2026-07-04 against platform.openai.com and
 //! docs.ollama.com - re-check live provider docs before changing these mappings):
 //! - Reasoning: `reasoning_effort` where the provider supports it; silently
-//!   ignored by those that don't (that's the dialect's convention).
+//!   ignored by those that don't (that's the dialect's convention). `Off`
+//!   omits it unless the model's `off_effort` names a value.
 //! - Web search / image generation: not part of this dialect —
 //!   `ProviderError::Unsupported` so the user gets told instead of guessing.
 //! - Images: `image_url` content parts (data URLs); documents: unsupported.
