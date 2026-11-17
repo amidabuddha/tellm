@@ -231,7 +231,7 @@ off_effort = "minimal"
 
 [models.gemini]
 wire_format = "gemini"
-model_name = "gemini-4-argon"
+model_name = "gemini-4-carbon"
 api_key_secret = "gemini_api_key"
 telegram_chat_ids = []
 thinking = "high"

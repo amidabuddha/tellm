@@ -14,9 +14,10 @@
 //!   `Off` sends the model's `off_effort` and omits the field when that is
 //!   unset; `Max` sends the model's `max_effort`, or `high` when unset
 //!   because Interactions has no level above it.
-//!   Gemini 4 Argon, 3.8 Flash and 3.6 Flash support all three mapped levels;
-//!   Gemini 4 Argon and 3.8 Flash reject `minimal`, which is never sent
-//!   (checked 2026-11-16). Requests do not send the deprecated sampling
+//!   Gemini 4 Carbon, Gemini 4 Argon, 3.8 Flash and 3.6 Flash support all
+//!   three mapped levels; Carbon, Argon and 3.8 Flash reject `minimal`, so
+//!   `low` is the lowest `off_effort` they take (checked 2026-11-16; Carbon
+//!   2026-11-17). Requests do not send the deprecated sampling
 //!   parameters and always end in a `user_input` step.
 //! - Web search: `tools: [{type: "google_search", search_types:
 //!   ["web_search"]}]`.

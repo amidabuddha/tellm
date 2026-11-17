@@ -66,9 +66,15 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 //   Meta's most capable model, is in preview on Model API, and accepts
 //   reasoning effort from minimal to max (rechecked 2026-11-17: "none" is
 //   an HTTP 400, and the default when no effort is sent is max).
-// - ai.google.dev model docs: Gemini 4 Argon uses ID gemini-4-argon and is
-//   Google's flagship; thinking level accepts low/medium/high and rejects
-//   minimal.
+// - Google (checked 2026-11-17): Gemini 4 Carbon uses ID gemini-4-carbon and
+//   is Google's strongest model, open to every paid Gemini API key since
+//   2026-11-10 (blog.google, "Gemini 4 Carbon is now available"). It runs on
+//   the Interactions API as a drop-in for gemini-4-argon, and its thinking
+//   level accepts low/medium/high with medium the default (Gemini 4 Carbon
+//   developer guide on aistudio.google.com); minimal is an HTTP 400
+//   (docs.cloud.google.com developer's guide). The ai.google.dev pages do
+//   not list Carbon and still call Gemini 4 Argon the most capable model,
+//   so they are not enough to check Google's lineup.
 //
 // None of the five can turn reasoning off, and without an effort each one
 // reasons at its own default, which is the top tier on Muse Wonder. So each
@@ -128,9 +134,9 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         key: "gemini",
-        label: "Google Gemini 4 Argon",
+        label: "Google Gemini 4 Carbon",
         wire_format: WireFormat::Gemini,
-        model_name: "gemini-4-argon",
+        model_name: "gemini-4-carbon",
         base_url: None,
         api_key_secret: secrets::GEMINI_API_KEY,
         max_effort: None,
@@ -380,8 +386,8 @@ mod tests {
             ),
             (
                 "gemini",
-                "Google Gemini 4 Argon",
-                "gemini-4-argon",
+                "Google Gemini 4 Carbon",
+                "gemini-4-carbon",
                 WireFormat::Gemini,
             ),
         ] {

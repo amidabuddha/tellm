@@ -249,7 +249,12 @@ fn image_model_rule_covers_current_google_image_ids() {
     ] {
         assert!(tellm_gemini::is_image_generation_model(model), "{model}");
     }
-    for model in ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash"] {
+    for model in [
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+    ] {
         assert!(!tellm_gemini::is_image_generation_model(model), "{model}");
     }
 }
