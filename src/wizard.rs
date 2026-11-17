@@ -20,6 +20,9 @@ pub(crate) struct ProviderPreset {
     /// `thinking = "off"`. `None` sends no reasoning setting, so the
     /// provider's default applies.
     pub(crate) off_effort: Option<&'static str>,
+    /// Written to the model's `max_output_tokens` config. `None` leaves the
+    /// wire format's default; only Anthropic models take a value.
+    pub(crate) max_output_tokens: Option<u32>,
 }
 
 /// The built-in provider catalog, shared with /model add.
@@ -44,7 +47,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
         thinking: ThinkingLevel::default(),
         max_effort: preset.max_effort.map(str::to_string),
         off_effort: preset.off_effort.map(str::to_string),
-        max_output_tokens: None,
+        max_output_tokens: preset.max_output_tokens,
     }
 }
 
@@ -71,6 +74,13 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 // reasons at its own default, which is the top tier on Muse Wonder. So each
 // preset writes its model's lowest tier as `off_effort`, and `off` is the
 // cheapest setting instead of the provider's default.
+//
+// The Claude preset also writes a 64000-token output limit, four times the
+// client default, so a reply at `max` effort has room to finish. Anthropic's
+// effort docs say to set a large `max_tokens` at `high` and above on Claude
+// Fable 5.2 and give no number for it; 64k is their starting point for Claude
+// Opus 5 at `xhigh` or `max` (checked 2026-11-17). The model's output maximum
+// is 128k (checked 2026-11-16).
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -81,6 +91,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_secret: secrets::ANTHROPIC_API_KEY,
         max_effort: None,
         off_effort: Some("low"),
+        max_output_tokens: Some(64_000),
     },
     ProviderPreset {
         key: "openai",
@@ -91,6 +102,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_secret: secrets::OPENAI_API_KEY,
         max_effort: Some("max"),
         off_effort: Some("low"),
+        max_output_tokens: None,
     },
     ProviderPreset {
         key: "xai",
@@ -101,6 +113,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_secret: secrets::XAI_API_KEY,
         max_effort: None,
         off_effort: Some("low"),
+        max_output_tokens: None,
     },
     ProviderPreset {
         key: "meta",
@@ -111,6 +124,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_secret: secrets::META_MODEL_API_KEY,
         max_effort: Some("max"),
         off_effort: Some("minimal"),
+        max_output_tokens: None,
     },
     ProviderPreset {
         key: "gemini",
@@ -121,6 +135,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_secret: secrets::GEMINI_API_KEY,
         max_effort: None,
         off_effort: Some("low"),
+        max_output_tokens: None,
     },
 ];
 
@@ -311,6 +326,17 @@ mod tests {
         assert_eq!(openai.max_effort.as_deref(), Some("max"));
         assert_eq!(meta.max_effort.as_deref(), Some("max"));
         assert_eq!(xai.max_effort, None);
+    }
+
+    #[test]
+    fn claude_preset_gives_long_replies_room_and_the_others_send_no_limit() {
+        let claude = model_config_from_preset(preset_by_key("anthropic").unwrap());
+        assert_eq!(claude.max_output_tokens, Some(64_000));
+
+        for key in ["openai", "xai", "meta", "gemini"] {
+            let model = model_config_from_preset(preset_by_key(key).unwrap());
+            assert_eq!(model.max_output_tokens, None, "{key}");
+        }
     }
 
     #[test]

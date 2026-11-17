@@ -146,7 +146,12 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   and 16000 when it is unset: thinking tokens count toward `max_tokens`, and
   4096 risked mid-thought truncation at high/max effort. The setting exists
   only for the Anthropic wire format, and validation rejects it elsewhere,
-  because the other formats send no output limit.
+  because the other formats send no output limit. The Claude Fable 5.2 preset
+  writes 64000 so that a reply at `max` effort has room to finish: Anthropic
+  says to set a large `max_tokens` at `high` and above on that model and gives
+  no number for it, 64k is its starting point for Claude Opus 5 at `xhigh` or
+  `max` (checked 2026-11-17 against platform.claude.com, effort), and the
+  model's output maximum is 128k (checked 2026-11-16).
 - A larger Anthropic limit is paid for in waiting, because requests are not
   streamed and the whole reply arrives in one HTTP response. Anthropic's SDKs
   refuse a non-streamed request above 21,333 `max_tokens`, the amount they

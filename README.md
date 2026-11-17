@@ -198,7 +198,7 @@ thinking = "max"
 # Optional: the provider value sent for thinking = "off" / `/reasoning off`.
 off_effort = "low"
 # Optional, anthropic only: the reply limit in tokens, thinking included.
-# max_output_tokens = 16000
+max_output_tokens = 64000
 
 [models.gpt]
 wire_format = "responses"
@@ -306,11 +306,12 @@ Set it to the lowest value the model's documentation lists; built-in presets
 already carry it.
 
 `max_output_tokens` is optional and only for `anthropic` models. It is the
-limit on one reply, sent as `max_tokens`, and thinking counts toward it; the
-default is 16000. A reply that reaches the limit ends with a note saying it was
-cut off. tellm does not stream, so a larger limit means a longer wait for one
-response: a request gets 10 minutes up to 21,333 tokens and proportionally
-longer above that, which is 30 minutes at 64000.
+limit on one reply, sent as `max_tokens`, and thinking counts toward it. The
+default is 16000, and the built-in Claude preset writes 64000 so that a reply
+at `max` effort has room to finish. A reply that reaches the limit ends with a
+note saying it was cut off. tellm does not stream, so a larger limit means a
+longer wait for one response: a request gets 10 minutes up to 21,333 tokens
+and proportionally longer above that, which is 30 minutes at 64000.
 
 ## Setting Up Model Rooms
 
