@@ -163,6 +163,13 @@ Notes:
   continuing the request with the paused assistant message appended; return all
   assistant messages from the loop in `turn_items` so opaque history remains
   replayable.
+- Handle Anthropic `stop_reason: max_tokens` (checked 2026-11-16 against
+  platform.claude.com, stop reasons and the Claude Fable 5.2 migration
+  guide): thinking counts toward the limit, so a reply can stop mid-answer or
+  before any text. A cut-off answer is delivered with a closing note that says
+  so, while the stored turn keeps the model's own content. A reply cut off
+  before any text is a provider error, and the error reply suggests
+  `/reasoning low`.
 - Anthropic thinking blocks are bound to everything sent before them:
   `system`, `tools`, and every earlier message (checked 2026-11-16 against
   platform.claude.com, preserved thinking / prefix checks). Replaying one

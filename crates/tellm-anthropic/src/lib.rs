@@ -28,6 +28,9 @@
 //!   PDFs pass through without client-side extraction.
 //! - Handle `stop_reason: "refusal"` before reading content
 //!   (`ProviderError::Refusal`).
+//! - Handle `stop_reason: "max_tokens"`: thinking counts toward the limit, so
+//!   a reply can stop mid-answer or before any text. A cut-off answer gets
+//!   [`CUT_OFF_NOTE`]; one without text is an error instead of an empty turn.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -50,6 +53,13 @@ pub const DEFAULT_MAX_TOKENS: u32 = 16000;
 /// config names another tier. Valid on every adaptive-thinking model.
 pub const DEFAULT_MAX_EFFORT: &str = "max";
 pub const MAX_PAUSE_TURN_CONTINUATIONS: usize = 5;
+/// Appended to the text of a reply that stopped at `max_tokens`, so a cut-off
+/// answer is not mistaken for a finished one. Only the user sees it: the
+/// stored `turn_items` keep the model's own content.
+pub const CUT_OFF_NOTE: &str = "\n\n(Reply cut off: it reached the output limit.)";
+/// Error message for a reply that stopped at `max_tokens` before any text.
+pub const OUTPUT_LIMIT_BEFORE_TEXT: &str =
+    "the reply reached the max_tokens output limit before any answer text";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -162,6 +172,19 @@ impl Provider for Anthropic {
                 text_parts.push(text);
             }
 
+            // Checked 2026-11-16 against platform.claude.com (stop reasons;
+            // Claude Fable 5.2 migration guide): thinking tokens count toward
+            // `max_tokens`, so a reply can stop there after a thinking block
+            // and before any text. That is a failed turn: storing it would
+            // keep a question whose answer nobody saw.
+            let cut_off = stop_reason == "max_tokens";
+            if cut_off && text_parts.is_empty() {
+                return Err(ProviderError::Api {
+                    status: 200,
+                    message: OUTPUT_LIMIT_BEFORE_TEXT.to_string(),
+                });
+            }
+
             if stop_reason == "pause_turn" {
                 if continuation == MAX_PAUSE_TURN_CONTINUATIONS {
                     return Err(ProviderError::Api {
@@ -179,8 +202,13 @@ impl Provider for Anthropic {
             turn_items.push(user_message);
             turn_items.extend(assistant_messages);
 
+            let mut text = text_parts.join("");
+            if cut_off {
+                text.push_str(CUT_OFF_NOTE);
+            }
+
             return Ok(ChatResponse {
-                text: text_parts.join(""),
+                text,
                 images: Vec::<GeneratedImage>::new(),
                 turn_items,
             });

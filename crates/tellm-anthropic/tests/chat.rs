@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tellm_anthropic::{API_VERSION, Anthropic, WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL_TYPE};
+use tellm_anthropic::{
+    API_VERSION, Anthropic, CUT_OFF_NOTE, OUTPUT_LIMIT_BEFORE_TEXT, WEB_SEARCH_MAX_USES,
+    WEB_SEARCH_TOOL_TYPE,
+};
 use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
 use tellm_test_support::{MockHttpServer as MockAnthropic, MockResponse};
 use tokio::time::timeout;
@@ -324,6 +327,50 @@ async fn pre_output_refusal_uses_stop_details_message() {
 
     assert!(
         matches!(error, ProviderError::Refusal(message) if message == "The request was declined by safety policy.")
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_stop_marks_the_reply_as_cut_off() {
+    let assistant_content = json!([
+        { "type": "thinking", "thinking": "", "signature": "sig-1" },
+        { "type": "text", "text": "The first half of the answer" }
+    ]);
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": assistant_content,
+            "stop_reason": "max_tokens"
+        }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    assert_eq!(
+        response.text,
+        format!("The first half of the answer{CUT_OFF_NOTE}")
+    );
+    assert_eq!(
+        response.turn_items[1],
+        json!({ "role": "assistant", "content": assistant_content }),
+        "the note is for the user; stored history keeps the model's own content"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_stop_before_any_text_is_an_error_not_an_empty_turn() {
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": [{ "type": "thinking", "thinking": "", "signature": "sig-1" }],
+            "stop_reason": "max_tokens"
+        }),
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(error, ProviderError::Api { status: 200, message } if message == OUTPUT_LIMIT_BEFORE_TEXT)
     );
 }
 

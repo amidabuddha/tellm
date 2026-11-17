@@ -75,7 +75,8 @@ fn reset_notice(reset: HistoryReset) -> Option<String> {
 }
 
 /// The room's model can change after a toggle was accepted, so a capability
-/// error can still surface per-message; suggest the off switch.
+/// error can still surface per-message; suggest the off switch. A reply that
+/// used its whole output limit on thinking gets the setting that thinks less.
 pub(crate) fn provider_error_reply(error: &str) -> String {
     // Provider error texts use both spellings ("image generation" from
     // Anthropic/compat, "image_generation" from the xAI backstop) — match
@@ -85,6 +86,8 @@ pub(crate) fn provider_error_reply(error: &str) -> String {
         reply.push_str("\nTip: /imagegen off");
     } else if error.contains("web search") || error.contains("web_search") {
         reply.push_str("\nTip: /websearch off");
+    } else if error.contains("output limit") {
+        reply.push_str("\nTip: /reasoning low");
     }
     reply
 }
@@ -401,6 +404,19 @@ mod tests {
         assert!(compat.contains("Tip: /websearch off"), "{compat}");
         let plain = provider_error_reply("api error 500: boom");
         assert!(!plain.contains("Tip:"), "{plain}");
+    }
+
+    #[test]
+    fn provider_error_reply_suggests_less_reasoning_when_the_output_limit_ate_the_reply() {
+        let error = tellm_core::ProviderError::Api {
+            status: 200,
+            message: tellm_anthropic::OUTPUT_LIMIT_BEFORE_TEXT.to_string(),
+        }
+        .to_string();
+
+        let reply = provider_error_reply(&error);
+
+        assert!(reply.contains("Tip: /reasoning low"), "{reply}");
     }
 
     #[test]
