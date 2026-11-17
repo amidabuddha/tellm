@@ -206,11 +206,14 @@ pub fn is_xai_endpoint(base_url: Option<&str>, model_name: &str) -> bool {
 /// runtime so `/imagegen` gating matches the provider backstop.
 pub fn is_meta_model_api_endpoint(base_url: Option<&str>, model_name: &str) -> bool {
     // Checked 2026-07-09 against dev.meta.ai Model API docs: the Responses
-    // base URL is https://api.meta.ai/v1 and the launch model is muse-spark-1.1.
+    // base URL is https://api.meta.ai/v1. Rechecked 2026-11-17 (choose a
+    // model): every Model API id starts with "muse-", as in muse-wonder-1.0,
+    // muse-spark-1.3 and muse-ember-1.0, so the name test covers all of them
+    // when a proxy hides the base URL.
     base_url.is_some_and(|url| url.contains("api.meta.ai"))
         || model_name
-            .get(..10)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("muse-spark"))
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("muse-"))
 }
 
 fn request_body(

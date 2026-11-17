@@ -226,6 +226,10 @@ Notes:
   top-level `instructions`; xAI currently rejects `instructions`, so xAI
   system prompts are sent as compatible input message items instead (checked
   2026-07-04; still shown as input messages in 2026-07-09 Grok 4.5 docs).
+- A Responses request gets xAI or Meta handling when its base URL names the
+  provider (`api.x.ai`, `api.meta.ai`) or, behind a proxy, when its model id
+  starts with `grok-` or `muse-`; every Meta Model API id starts with `muse-`
+  (checked 2026-11-17 against dev.meta.ai).
 - OpenAI Responses web search uses the `web_search` tool. xAI Responses uses
   `web_search` plus `x_search` for tellm's search toggle (checked
   2026-07-09 against docs.x.ai for Grok 4.5). Meta Model API Responses uses

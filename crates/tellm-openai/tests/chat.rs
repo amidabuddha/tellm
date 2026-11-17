@@ -365,7 +365,13 @@ async fn off_reasoning_and_no_options_omit_optional_fields() {
 
 #[tokio::test]
 async fn xai_and_meta_request_encrypted_reasoning_even_when_reasoning_is_off() {
-    for model in ["grok-4.5", "muse-spark-1.1"] {
+    // The mock's base URL names no provider, so each id is recognized by name.
+    for model in [
+        "grok-4.5",
+        "muse-spark-1.1",
+        "muse-wonder-1.0",
+        "muse-ember-1.0",
+    ] {
         let mock = MockOpenAi::start(vec![MockResponse::json(
             200,
             json!({
