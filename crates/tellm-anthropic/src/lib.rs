@@ -33,6 +33,12 @@
 //! - Handle `stop_reason: "max_tokens"`: thinking counts toward the limit, so
 //!   a reply can stop mid-answer or before any text. A cut-off answer gets
 //!   [`CUT_OFF_NOTE`]; one without text is an error instead of an empty turn.
+//! - Usage: `usage.input_tokens` counts only input that was neither read from
+//!   nor written to the cache; `cache_read_input_tokens` and
+//!   `cache_creation_input_tokens` are reported beside it, and
+//!   `server_tool_use.web_search_requests` counts billed searches (checked
+//!   2026-11-18 against platform.claude.com, prompt caching and pricing).
+//!   A reply that took `pause_turn` continuations sums every request.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -40,6 +46,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
+    Usage, usage_count,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -194,6 +201,7 @@ impl Provider for Anthropic {
         messages.push(user_message.clone());
         let mut assistant_messages = Vec::new();
         let mut text_parts = Vec::new();
+        let mut usage: Option<Usage> = None;
 
         for continuation in 0..=MAX_PAUSE_TURN_CONTINUATIONS {
             let body = request_body(
@@ -204,6 +212,12 @@ impl Provider for Anthropic {
                 self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             );
             let response_body = self.send_request(body).await?;
+            if let Some(request_usage) = usage_from_response(&response_body) {
+                match usage.as_mut() {
+                    Some(total) => total.add(&request_usage),
+                    None => usage = Some(request_usage),
+                }
+            }
 
             let stop_reason = response_body
                 .get("stop_reason")
@@ -272,11 +286,29 @@ impl Provider for Anthropic {
                 text,
                 images: Vec::<GeneratedImage>::new(),
                 turn_items,
+                usage,
             });
         }
 
         unreachable!("pause_turn loop always returns")
     }
+}
+
+/// Reads one Messages response's `usage` block. Anthropic reports cache reads
+/// and writes beside `input_tokens`, not inside it, so the three map straight
+/// onto the disjoint [`Usage`] buckets. Thinking is billed as output and is
+/// not reported separately.
+pub fn usage_from_response(body: &Value) -> Option<Usage> {
+    let usage = body.get("usage")?;
+    Some(Usage {
+        input_tokens: usage_count(usage, "/input_tokens"),
+        cached_input_tokens: usage_count(usage, "/cache_read_input_tokens"),
+        cache_write_tokens: usage_count(usage, "/cache_creation_input_tokens"),
+        output_tokens: usage_count(usage, "/output_tokens"),
+        reasoning_tokens: 0,
+        web_searches: usage_count(usage, "/server_tool_use/web_search_requests"),
+        reported_cost_usd: None,
+    })
 }
 
 impl Anthropic {

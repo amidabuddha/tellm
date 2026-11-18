@@ -102,6 +102,61 @@ pub struct GeneratedImage {
     pub base64: String,
 }
 
+/// What one reply was billed for, normalized into disjoint buckets so a
+/// price table applies directly. Providers report usage in different shapes:
+/// OpenAI-style APIs count cache reads and writes inside their input total,
+/// while Anthropic reports them beside it. Each wire-format crate converts its
+/// own shape, so a token is counted in exactly one input bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Usage {
+    /// Input tokens billed at the full input rate: neither read from nor
+    /// written to the provider's prompt cache.
+    pub input_tokens: u64,
+    /// Input tokens read from the provider's prompt cache.
+    pub cached_input_tokens: u64,
+    /// Input tokens written to the provider's prompt cache.
+    pub cache_write_tokens: u64,
+    /// Output tokens, reasoning included; providers bill reasoning as output.
+    pub output_tokens: u64,
+    /// The part of `output_tokens` spent on reasoning, for display only.
+    pub reasoning_tokens: u64,
+    /// Provider-native web searches the reply ran.
+    pub web_searches: u64,
+    /// The cost the provider says it charged for the reply, in US dollars,
+    /// when the provider reports one (xAI, OpenRouter).
+    pub reported_cost_usd: Option<f64>,
+}
+
+impl Usage {
+    /// Adds the usage of another request that belongs to the same reply, such
+    /// as an Anthropic `pause_turn` continuation. A reported cost survives
+    /// only when both sides report one, since a partial sum would understate
+    /// the reply.
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.web_searches = self.web_searches.saturating_add(other.web_searches);
+        self.reported_cost_usd = match (self.reported_cost_usd, other.reported_cost_usd) {
+            (Some(left), Some(right)) => Some(left + right),
+            _ => None,
+        };
+    }
+
+    /// Every input token the reply was billed for, in any bucket.
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+}
+
 /// A completed model reply. No streaming: Telegram delivers whole messages,
 /// so providers are called in non-streaming mode by design.
 #[derive(Debug, Clone)]
@@ -115,6 +170,9 @@ pub struct ChatResponse {
     /// the opaque state (encrypted search results, reasoning items) the
     /// provider requires on later turns — do not filter or reshape it.
     pub turn_items: Vec<serde_json::Value>,
+    /// What the reply was billed for, summed over every request it took.
+    /// `None` when the provider sent no usage block.
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,4 +195,61 @@ pub trait Provider {
         &self,
         request: &ChatRequest,
     ) -> impl Future<Output = Result<ChatResponse, ProviderError>> + Send;
+}
+
+/// Reads a non-negative integer token count from a provider usage object.
+/// Missing, negative, or non-integer values count as zero, so a provider that
+/// omits a field never fails the reply it belongs to.
+pub fn usage_count(value: &serde_json::Value, pointer: &str) -> u64 {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_add_sums_tokens_and_keeps_a_cost_only_when_both_report_one() {
+        let mut total = Usage {
+            input_tokens: 10,
+            cached_input_tokens: 1,
+            cache_write_tokens: 2,
+            output_tokens: 5,
+            reasoning_tokens: 3,
+            web_searches: 1,
+            reported_cost_usd: Some(0.5),
+        };
+        total.add(&Usage {
+            input_tokens: 4,
+            cached_input_tokens: 6,
+            cache_write_tokens: 0,
+            output_tokens: 7,
+            reasoning_tokens: 2,
+            web_searches: 2,
+            reported_cost_usd: Some(0.25),
+        });
+        assert_eq!(total.input_tokens, 14);
+        assert_eq!(total.cached_input_tokens, 7);
+        assert_eq!(total.cache_write_tokens, 2);
+        assert_eq!(total.output_tokens, 12);
+        assert_eq!(total.reasoning_tokens, 5);
+        assert_eq!(total.web_searches, 3);
+        assert_eq!(total.reported_cost_usd, Some(0.75));
+        assert_eq!(total.total_input_tokens(), 23);
+
+        total.add(&Usage::default());
+        assert_eq!(total.reported_cost_usd, None);
+    }
+
+    #[test]
+    fn usage_count_treats_missing_and_malformed_values_as_zero() {
+        let value = serde_json::json!({"a": {"b": 7}, "neg": -1, "text": "9"});
+        assert_eq!(usage_count(&value, "/a/b"), 7);
+        assert_eq!(usage_count(&value, "/a/missing"), 0);
+        assert_eq!(usage_count(&value, "/neg"), 0);
+        assert_eq!(usage_count(&value, "/text"), 0);
+    }
 }

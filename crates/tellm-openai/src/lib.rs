@@ -22,6 +22,17 @@
 //!   Meta Model API supports image understanding, not image generation.
 //!   Results come back as base64 in `image_generation_call` output items.
 //! - Files/images: `input_file` / `input_image` content parts.
+//! - Usage: `usage.input_tokens` includes cache reads and writes;
+//!   `input_tokens_details.cached_tokens` counts billed reads and
+//!   `input_tokens_details.cache_write_tokens` billed writes, so ordinary input
+//!   is the remainder; `output_tokens` includes
+//!   `output_tokens_details.reasoning_tokens` (checked 2026-11-18 against
+//!   developers.openai.com, prompt caching). Web search is billed per call,
+//!   counted here as `web_search_call` output items (developers.openai.com
+//!   pricing). xAI adds `usage.cost_in_usd_ticks`, the billed cost after
+//!   caching discounts and server-side tool fees at 10^10 ticks per US dollar
+//!   (checked 2026-11-18 against docs.x.ai, cost tracking). Meta Model API
+//!   reports the same OpenAI-shaped fields and no cost.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -29,6 +40,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
+    Usage, usage_count,
 };
 
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -152,6 +164,7 @@ impl Provider for Responses {
 
         let text = extract_text(&output);
         let images = extract_images(&output);
+        let usage = usage_from_response(&response_body, &output);
         let mut turn_items = Vec::with_capacity(1 + output.len());
         turn_items.push(user_message);
         turn_items.extend(output);
@@ -160,8 +173,44 @@ impl Provider for Responses {
             text,
             images,
             turn_items,
+            usage,
         })
     }
+}
+
+/// xAI's `cost_in_usd_ticks` unit: 10^10 ticks per US dollar (checked
+/// 2026-11-18 against docs.x.ai, cost tracking).
+pub const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
+
+/// Reads a Responses `usage` block into disjoint [`Usage`] buckets. Cache
+/// reads and writes are counted inside `input_tokens`, so ordinary input is
+/// what remains after both. Web searches are the `web_search_call` items in
+/// `output`, since search is billed per call.
+pub fn usage_from_response(body: &Value, output: &[Value]) -> Option<Usage> {
+    let usage = body.get("usage")?;
+    let cached_input_tokens = usage_count(usage, "/input_tokens_details/cached_tokens");
+    let cache_write_tokens = usage_count(usage, "/input_tokens_details/cache_write_tokens");
+    let input_tokens = usage_count(usage, "/input_tokens")
+        .saturating_sub(cached_input_tokens)
+        .saturating_sub(cache_write_tokens);
+    let web_searches = output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+        .count() as u64;
+    let reported_cost_usd = usage
+        .get("cost_in_usd_ticks")
+        .and_then(Value::as_u64)
+        .map(|ticks| ticks as f64 / USD_TICKS_PER_DOLLAR);
+
+    Some(Usage {
+        input_tokens,
+        cached_input_tokens,
+        cache_write_tokens,
+        output_tokens: usage_count(usage, "/output_tokens"),
+        reasoning_tokens: usage_count(usage, "/output_tokens_details/reasoning_tokens"),
+        web_searches,
+        reported_cost_usd,
+    })
 }
 
 impl Responses {
@@ -449,6 +498,46 @@ mod tests {
                 Some("high")
             );
         }
+    }
+
+    #[test]
+    fn usage_splits_cache_reads_and_writes_out_of_input() {
+        let body = json!({
+            "usage": {
+                "input_tokens": 12000,
+                "input_tokens_details": { "cached_tokens": 4000, "cache_write_tokens": 7000 },
+                "output_tokens": 900,
+                "output_tokens_details": { "reasoning_tokens": 600 },
+                "total_tokens": 12900
+            }
+        });
+        let output = [
+            json!({ "type": "web_search_call", "id": "ws_1" }),
+            json!({ "type": "web_search_call", "id": "ws_2" }),
+            json!({ "type": "message", "content": [] }),
+        ];
+        let usage = usage_from_response(&body, &output).unwrap();
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_input_tokens, 4000);
+        assert_eq!(usage.cache_write_tokens, 7000);
+        assert_eq!(usage.output_tokens, 900);
+        assert_eq!(usage.reasoning_tokens, 600);
+        assert_eq!(usage.web_searches, 2);
+        assert_eq!(usage.reported_cost_usd, None);
+    }
+
+    #[test]
+    fn usage_reads_the_xai_billed_cost_and_tolerates_missing_details() {
+        let body = json!({
+            "usage": { "input_tokens": 199, "output_tokens": 1, "cost_in_usd_ticks": 158500 }
+        });
+        let usage = usage_from_response(&body, &[]).unwrap();
+        assert_eq!(usage.input_tokens, 199);
+        assert_eq!(usage.cached_input_tokens, 0);
+        assert_eq!(usage.output_tokens, 1);
+        assert_eq!(usage.reported_cost_usd, Some(0.000_015_85));
+
+        assert_eq!(usage_from_response(&json!({}), &[]), None);
     }
 
     #[test]

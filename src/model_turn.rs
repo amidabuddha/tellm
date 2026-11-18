@@ -262,14 +262,25 @@ fn attachment_too_large_error(kind: &str, size: usize) -> String {
     )
 }
 
+/// Delivers a reply. `cost_line` closes the text when there is any; a reply
+/// that is only images gets it as its own message after them, so it still
+/// arrives last.
 pub(crate) async fn send_response(
     telegram: &Telegram,
     chat_id: i64,
     response: ChatResponse,
+    cost_line: Option<String>,
 ) -> Result<(), String> {
-    if !response.text.trim().is_empty() || response.images.is_empty() {
+    let has_text = !response.text.trim().is_empty();
+    let mut separate_cost_line = cost_line;
+    if has_text || response.images.is_empty() {
+        let text = match separate_cost_line.take() {
+            Some(line) if has_text => with_cost_line(&response.text, &line),
+            Some(line) => line,
+            None => response.text.clone(),
+        };
         telegram
-            .send_message(chat_id, &response.text)
+            .send_message(chat_id, &text)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -282,7 +293,21 @@ pub(crate) async fn send_response(
             .map_err(|error| error.to_string())?;
     }
 
+    if let Some(line) = separate_cost_line {
+        telegram
+            .send_message(chat_id, &line)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
     Ok(())
+}
+
+/// The reply text with its cost line below a blank line. Only the delivered
+/// copy carries it: the stored turn keeps the model's own content, so the
+/// model never sees its own bill.
+fn with_cost_line(text: &str, line: &str) -> String {
+    format!("{}\n\n{line}", text.trim_end())
 }
 
 pub(crate) fn message_text(message: &IncomingMessage) -> Option<&str> {
@@ -450,6 +475,7 @@ mod tests {
             text: text.to_string(),
             images,
             turn_items: vec![serde_json::json!({ "type": "reasoning", "id": "rs_1" })],
+            usage: None,
         };
         let image = || GeneratedImage {
             media_type: "image/png".to_string(),
@@ -477,6 +503,14 @@ mod tests {
                 .len(),
             1,
             "an image-only reply is a real reply"
+        );
+    }
+
+    #[test]
+    fn cost_line_follows_the_reply_text_after_a_blank_line() {
+        assert_eq!(
+            with_cost_line("Answer.\n\n", "Cost ≈ $0.010 · this chat ≈ $0.020"),
+            "Answer.\n\nCost ≈ $0.010 · this chat ≈ $0.020"
         );
     }
 
@@ -709,6 +743,7 @@ mod tests {
             max_effort: None,
             off_effort: None,
             max_output_tokens: None,
+            price: None,
         }
     }
 }

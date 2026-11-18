@@ -94,6 +94,66 @@ pub struct ModelConfig {
     /// provider. When unset, the Anthropic client's default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// The model's list prices, used to estimate what each reply cost from
+    /// the token usage the provider reports. Prices change and are the
+    /// user's to keep current; tellm never fetches them. When unset, the
+    /// cost line shows the provider's own reported cost if it sends one
+    /// (xAI, OpenRouter), and token counts otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<ModelPrice>,
+}
+
+/// US-dollar list prices for one model. Token prices are per million tokens;
+/// `web_search` is per 1,000 searches. Only `input` and `output` are
+/// required: cache reads and writes fall back to the input price, which can
+/// overstate a cached reply but never understates one, and searches fall back
+/// to free.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrice {
+    /// Input tokens that were neither read from nor written to a cache.
+    pub input: f64,
+    /// Input tokens read from the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input: Option<f64>,
+    /// Input tokens written to the provider's prompt cache, where the
+    /// provider bills writes (Anthropic, OpenAI GPT-5.6 and later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+    /// Output tokens, reasoning included.
+    pub output: f64,
+    /// Provider-native web searches, per 1,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<f64>,
+}
+
+impl ModelPrice {
+    /// Estimated US-dollar cost of one reply's usage at these prices.
+    pub fn cost_usd(&self, usage: &tellm_core::Usage) -> f64 {
+        let per_token =
+            |price_per_million: f64, tokens: u64| price_per_million * tokens as f64 / 1_000_000.0;
+        per_token(self.input, usage.input_tokens)
+            + per_token(
+                self.cached_input.unwrap_or(self.input),
+                usage.cached_input_tokens,
+            )
+            + per_token(
+                self.cache_write.unwrap_or(self.input),
+                usage.cache_write_tokens,
+            )
+            + per_token(self.output, usage.output_tokens)
+            + self.web_search.unwrap_or(0.0) * usage.web_searches as f64 / 1_000.0
+    }
+
+    fn fields(&self) -> [(&'static str, Option<f64>); 5] {
+        [
+            ("input", Some(self.input)),
+            ("cached_input", self.cached_input),
+            ("cache_write", self.cache_write),
+            ("output", Some(self.output)),
+            ("web_search", self.web_search),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -151,6 +211,17 @@ impl Config {
                     problems.push(format!(
                         "model \"{key}\": {setting} must be a single provider effort value such as {examples}"
                     ));
+                }
+            }
+            if let Some(price) = &model.price {
+                for (field, value) in price.fields() {
+                    if let Some(value) = value
+                        && !(value.is_finite() && value >= 0.0)
+                    {
+                        problems.push(format!(
+                            "model \"{key}\": price.{field} must be a non-negative number of US dollars"
+                        ));
+                    }
                 }
             }
             if let Some(max_output_tokens) = model.max_output_tokens {
@@ -986,6 +1057,7 @@ mod tests {
             max_effort: None,
             off_effort: None,
             max_output_tokens: None,
+            price: None,
         }
     }
 
@@ -1352,6 +1424,94 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.models["claude"].max_output_tokens, None);
         assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn price_roundtrips_through_toml_as_a_model_subtable_and_is_optional() {
+        let mut gpt = model(WireFormat::Responses, None, &[]);
+        gpt.price = Some(ModelPrice {
+            input: 8.0,
+            cached_input: Some(0.4),
+            cache_write: Some(10.0),
+            output: 40.0,
+            web_search: Some(10.0),
+        });
+        let c = config(&[("gpt", gpt)], "gpt");
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("[models.gpt.price]"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.models["gpt"].price, c.models["gpt"].price);
+        assert!(back.validate().is_ok());
+
+        let minimal: Config = toml::from_str(
+            "default_model = \"gpt\"\n\n[models.gpt]\nwire_format = \"responses\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n\n[models.gpt.price]\ninput = 2\noutput = 10\n",
+        )
+        .unwrap();
+        let price = minimal.models["gpt"].price.unwrap();
+        assert_eq!((price.input, price.output), (2.0, 10.0));
+        assert_eq!(price.cached_input, None);
+        assert!(minimal.validate().is_ok());
+
+        let misspelled = toml::from_str::<Config>(
+            "default_model = \"gpt\"\n\n[models.gpt]\nwire_format = \"responses\"\nmodel_name = \"m\"\napi_key_secret = \"k\"\n\n[models.gpt.price]\ninput = 2\noutput = 10\ncached = 1\n",
+        );
+        assert!(
+            misspelled.is_err(),
+            "unknown price fields must not be ignored"
+        );
+    }
+
+    #[test]
+    fn price_values_must_be_finite_and_non_negative() {
+        let mut gpt = model(WireFormat::Responses, None, &[]);
+        gpt.price = Some(ModelPrice {
+            input: -1.0,
+            cached_input: Some(f64::NAN),
+            cache_write: None,
+            output: f64::INFINITY,
+            web_search: Some(0.0),
+        });
+        let error = config(&[("gpt", gpt)], "gpt")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("price.input"), "{error}");
+        assert!(error.contains("price.cached_input"), "{error}");
+        assert!(error.contains("price.output"), "{error}");
+        assert!(!error.contains("price.web_search"), "{error}");
+    }
+
+    #[test]
+    fn price_cost_applies_each_rate_and_falls_back_to_input_for_cache_tokens() {
+        let usage = tellm_core::Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 2_000_000,
+            cache_write_tokens: 1_000_000,
+            output_tokens: 500_000,
+            reasoning_tokens: 400_000,
+            web_searches: 3,
+            reported_cost_usd: None,
+        };
+        let full = ModelPrice {
+            input: 8.0,
+            cached_input: Some(0.4),
+            cache_write: Some(10.0),
+            output: 40.0,
+            web_search: Some(10.0),
+        };
+        // 8 + 0.8 + 10 + 20 + 0.03
+        assert!((full.cost_usd(&usage) - 38.83).abs() < 1e-9);
+
+        let minimal = ModelPrice {
+            input: 2.0,
+            cached_input: None,
+            cache_write: None,
+            output: 10.0,
+            web_search: None,
+        };
+        // 2 + 4 + 2 + 5, searches free
+        assert!((minimal.cost_usd(&usage) - 13.0).abs() < 1e-9);
     }
 
     #[test]

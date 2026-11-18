@@ -8,6 +8,8 @@ use tellm_core::ThinkingLevel;
 
 use tellm_config::{ConfigError, WireFormat};
 
+use crate::cost::ChatCost;
+
 const ROOMS_FILE: &str = "rooms.toml";
 /// Keep enough context for long conversations without allowing opaque provider
 /// state to grow without bound. Pruning always removes complete provider turns.
@@ -36,6 +38,18 @@ pub struct RoomSettings {
     pub web_search: bool,
     #[serde(default)]
     pub image_generation: bool,
+    /// Whether each reply ends with its cost line. On by default, so the
+    /// file only records rooms that turned it off.
+    #[serde(default = "default_show_cost", skip_serializing_if = "is_true")]
+    pub show_cost: bool,
+}
+
+fn default_show_cost() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl Default for RoomSettings {
@@ -47,6 +61,7 @@ impl Default for RoomSettings {
             thinking: None,
             web_search: false,
             image_generation: false,
+            show_cost: true,
         }
     }
 }
@@ -56,6 +71,9 @@ pub struct RoomState {
     pub settings: RoomSettings,
     pub wire_format: Option<WireFormat>,
     pub history: Vec<Value>,
+    /// Running cost of the current conversation; in memory only, like the
+    /// conversation itself.
+    pub cost: ChatCost,
     history_turns: VecDeque<HistoryTurn>,
     generation: u64,
 }
@@ -92,6 +110,7 @@ impl RoomState {
             settings,
             wire_format: None,
             history: Vec::new(),
+            cost: ChatCost::default(),
             history_turns: VecDeque::new(),
             generation: 0,
         }
@@ -144,8 +163,10 @@ impl RoomState {
         }
     }
 
+    /// Starts a new conversation: the history and its running cost.
     pub fn reset_history(&mut self) {
         self.invalidate_history();
+        self.cost = ChatCost::default();
     }
 
     /// Apply a `/websearch` change. The tool list precedes the whole
@@ -426,6 +447,7 @@ mod tests {
                     thinking: Some(ThinkingLevel::High),
                     web_search: true,
                     image_generation: true,
+                    show_cost: true,
                 },
             );
             settings.insert(
@@ -437,6 +459,7 @@ mod tests {
                     thinking: Some(ThinkingLevel::Off),
                     web_search: false,
                     image_generation: false,
+                    show_cost: false,
                 },
             );
 
@@ -447,6 +470,9 @@ mod tests {
             let text = std::fs::read_to_string(dir.join("rooms.toml")).unwrap();
             assert!(text.contains("[rooms.42]"));
             assert!(text.contains("[rooms.-7]"));
+            // Only the room that hides its cost line records the setting.
+            assert_eq!(text.matches("show_cost").count(), 1, "{text}");
+            assert!(text.contains("show_cost = false"), "{text}");
         });
     }
 
@@ -813,6 +839,36 @@ mod tests {
         let room = states.get_or_default(1);
         assert!(room.history.is_empty());
         assert_eq!(room.settings.role.as_deref(), Some("terse"));
+    }
+
+    #[test]
+    fn reset_history_starts_the_chat_cost_over_and_appending_keeps_it() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.cost.record(&crate::cost::ReplyCost::new(
+            Some(tellm_core::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                reported_cost_usd: Some(0.01),
+                ..Default::default()
+            }),
+            None,
+        ));
+        room.append_turn(
+            WireFormat::Anthropic,
+            vec![serde_json::json!({"role": "assistant"})],
+        );
+        assert_eq!(room.cost.replies, 1);
+
+        room.reset_history();
+
+        assert_eq!(room.cost, crate::cost::ChatCost::default());
+    }
+
+    #[test]
+    fn rooms_toml_without_show_cost_defaults_the_cost_line_on() {
+        let file: RoomsToml = toml::from_str("[rooms.5]\nweb_search = true\n").unwrap();
+        assert!(file.rooms["5"].show_cost);
+        assert!(file.rooms["5"].web_search);
     }
 
     #[test]

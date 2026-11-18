@@ -326,3 +326,75 @@ fn assert_missing(value: &Value, key: &str) {
         "expected {key} to be omitted, got {value}"
     );
 }
+
+#[tokio::test]
+async fn usage_separates_cached_input_and_ignores_a_cost_from_other_endpoints() {
+    let mock = MockCompat::start(vec![MockResponse::json(
+        200,
+        json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "A cat." },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1500,
+                "prompt_tokens_details": { "cached_tokens": 1200 },
+                "completion_tokens": 500,
+                "completion_tokens_details": { "reasoning_tokens": 300 },
+                "total_tokens": 2000,
+                "cost": 0.5
+            }
+        }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    let usage = response.usage.unwrap();
+    assert_eq!(usage.input_tokens, 300);
+    assert_eq!(usage.cached_input_tokens, 1200);
+    assert_eq!(usage.output_tokens, 500);
+    assert_eq!(usage.reasoning_tokens, 300);
+    assert_eq!(
+        usage.reported_cost_usd, None,
+        "only OpenRouter's usage.cost is known to be US dollars"
+    );
+}
+
+#[test]
+fn usage_reads_deepseek_cache_hits_and_the_openrouter_cost() {
+    let deepseek = json!({
+        "usage": {
+            "prompt_tokens": 18234,
+            "prompt_cache_hit_tokens": 16000,
+            "prompt_cache_miss_tokens": 2234,
+            "completion_tokens": 412
+        }
+    });
+    let usage = tellm_compat::usage_from_response(&deepseek, false).unwrap();
+    assert_eq!(usage.input_tokens, 2234);
+    assert_eq!(usage.cached_input_tokens, 16000);
+    assert_eq!(usage.output_tokens, 412);
+
+    let openrouter = json!({
+        "usage": {
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 300 },
+            "completion_tokens": 50,
+            "cost": 0.0123
+        }
+    });
+    let usage = tellm_compat::usage_from_response(&openrouter, true).unwrap();
+    assert_eq!(usage.input_tokens, 500);
+    assert_eq!(usage.cache_write_tokens, 300);
+    assert_eq!(usage.reported_cost_usd, Some(0.0123));
+
+    assert!(tellm_compat::is_openrouter_url(
+        "https://openrouter.ai/api/v1/chat/completions"
+    ));
+    assert!(!tellm_compat::is_openrouter_url(
+        "https://openrouter.ai.example.com/v1/chat/completions"
+    ));
+    assert!(!tellm_compat::is_openrouter_url(
+        "http://localhost:11434/v1/chat/completions"
+    ));
+}

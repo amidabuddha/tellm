@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
-use tellm_config::{Config, ModelConfig, TelegramConfig, WireFormat, config_path, secrets};
+use tellm_config::{
+    Config, ModelConfig, ModelPrice, TelegramConfig, WireFormat, config_path, secrets,
+};
 use tellm_core::ThinkingLevel;
 use tellm_telegram::Telegram;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProviderPreset {
     pub(crate) key: &'static str,
     pub(crate) label: &'static str,
@@ -23,6 +25,10 @@ pub(crate) struct ProviderPreset {
     /// Written to the model's `max_output_tokens` config. `None` leaves the
     /// wire format's default; only Anthropic models take a value.
     pub(crate) max_output_tokens: Option<u32>,
+    /// Written to the model's `price` config, for the per-reply cost line.
+    /// `None` when the provider reports its own cost or when tellm could not
+    /// check the list price against the provider's pricing page.
+    pub(crate) price: Option<ModelPrice>,
 }
 
 /// The built-in provider catalog, shared with /model add.
@@ -48,6 +54,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
         max_effort: preset.max_effort.map(str::to_string),
         off_effort: preset.off_effort.map(str::to_string),
         max_output_tokens: preset.max_output_tokens,
+        price: preset.price,
     }
 }
 
@@ -87,6 +94,19 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 // Fable 5.2 and give no number for it; 64k is their starting point for Claude
 // Opus 5 at `xhigh` or `max` (checked 2026-11-17). The model's output maximum
 // is 128k (checked 2026-11-16).
+//
+// Prices are standard list prices, checked 2026-11-18, for the per-reply cost
+// line; they go stale and the user keeps them current in config.toml:
+// - platform.claude.com pricing: Claude Fable 5.2 is $8 input, $10 5-minute
+//   cache writes (tellm's `ephemeral` cache uses the 5-minute TTL), $0.20
+//   cache hits and $40 output per MTok; web search is $10 per 1,000.
+// - developers.openai.com pricing: gpt-6-astra is $10 input, $1 cached input,
+//   $12.50 30-minute cache writes (the default TTL, which tellm keeps) and $50
+//   output per MTok; web search is $10 per 1,000 calls.
+// - xAI reports each response's billed cost, so the Grok preset needs none.
+// - Meta's and Google's pricing pages could not be checked from the
+//   implementation environment, so those presets ship without a price and
+//   show token counts until the user adds one.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -98,6 +118,13 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         max_effort: None,
         off_effort: Some("low"),
         max_output_tokens: Some(64_000),
+        price: Some(ModelPrice {
+            input: 8.0,
+            cached_input: Some(0.20),
+            cache_write: Some(10.0),
+            output: 40.0,
+            web_search: Some(10.0),
+        }),
     },
     ProviderPreset {
         key: "openai",
@@ -109,6 +136,13 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         max_effort: Some("max"),
         off_effort: Some("low"),
         max_output_tokens: None,
+        price: Some(ModelPrice {
+            input: 10.0,
+            cached_input: Some(1.0),
+            cache_write: Some(12.50),
+            output: 50.0,
+            web_search: Some(10.0),
+        }),
     },
     ProviderPreset {
         key: "xai",
@@ -120,6 +154,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         max_effort: None,
         off_effort: Some("low"),
         max_output_tokens: None,
+        price: None,
     },
     ProviderPreset {
         key: "meta",
@@ -131,6 +166,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         max_effort: Some("max"),
         off_effort: Some("minimal"),
         max_output_tokens: None,
+        price: None,
     },
     ProviderPreset {
         key: "gemini",
@@ -142,6 +178,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         max_effort: None,
         off_effort: Some("low"),
         max_output_tokens: None,
+        price: None,
     },
 ];
 
@@ -343,6 +380,37 @@ mod tests {
             let model = model_config_from_preset(preset_by_key(key).unwrap());
             assert_eq!(model.max_output_tokens, None, "{key}");
         }
+    }
+
+    #[test]
+    fn presets_write_only_the_list_prices_that_were_checked() {
+        let claude = model_config_from_preset(preset_by_key("anthropic").unwrap());
+        assert_eq!(
+            claude.price,
+            Some(ModelPrice {
+                input: 8.0,
+                cached_input: Some(0.20),
+                cache_write: Some(10.0),
+                output: 40.0,
+                web_search: Some(10.0),
+            })
+        );
+        let openai = model_config_from_preset(preset_by_key("openai").unwrap());
+        assert_eq!(openai.price.map(|price| price.output), Some(50.0));
+
+        // xAI reports its own billed cost; Meta and Google prices were not
+        // checked against their pricing pages.
+        for key in ["xai", "meta", "gemini"] {
+            let model = model_config_from_preset(preset_by_key(key).unwrap());
+            assert_eq!(model.price, None, "{key}");
+        }
+
+        let mut config = config_for_preset(preset_by_key("anthropic").unwrap());
+        config.validate().unwrap();
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains(".price]"), "{text}");
+        config = toml::from_str(&text).unwrap();
+        assert_eq!(config.models.values().next().unwrap().price, claude.price);
     }
 
     #[test]

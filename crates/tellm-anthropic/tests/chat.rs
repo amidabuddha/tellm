@@ -549,3 +549,61 @@ fn assert_missing(value: &Value, key: &str) {
         "expected {key} to be omitted, got {value}"
     );
 }
+
+#[tokio::test]
+async fn usage_keeps_cache_buckets_apart_and_sums_pause_turn_requests() {
+    let mock = MockAnthropic::start(vec![
+        MockResponse::json(
+            200,
+            json!({
+                "content": [{ "type": "text", "text": "Part one. " }],
+                "stop_reason": "pause_turn",
+                "usage": {
+                    "input_tokens": 21,
+                    "cache_creation_input_tokens": 188086,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 393,
+                    "server_tool_use": { "web_search_requests": 2 }
+                }
+            }),
+        ),
+        MockResponse::json(
+            200,
+            json!({
+                "content": [{ "type": "text", "text": "Part two." }],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 30,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 188086,
+                    "output_tokens": 100
+                }
+            }),
+        ),
+    ]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    let usage = response.usage.expect("usage from both requests");
+    assert_eq!(usage.input_tokens, 51);
+    assert_eq!(usage.cache_write_tokens, 188086);
+    assert_eq!(usage.cached_input_tokens, 188086);
+    assert_eq!(usage.output_tokens, 493);
+    assert_eq!(usage.web_searches, 2);
+    assert_eq!(usage.reported_cost_usd, None);
+}
+
+#[tokio::test]
+async fn a_reply_without_a_usage_block_reports_no_usage() {
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": [{ "type": "text", "text": "Answer." }],
+            "stop_reason": "end_turn"
+        }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    assert_eq!(response.usage, None);
+}
