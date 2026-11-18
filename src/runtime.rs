@@ -14,6 +14,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::access::{AccessConfig, AccessControl, AccessTime, ChatAccess, PairingAttempt};
 use crate::commands::{self, CommandAction, CommandContext, CommandReject, KnownCommand, Route};
+use crate::cost;
 use crate::model_turn::{self, PreparedChatRequest};
 use crate::ollama;
 use crate::persistence::{self, Persistence};
@@ -1119,6 +1120,30 @@ async fn handle_command(
             )
             .await
         }
+        CommandAction::ShowCost => {
+            let summary = {
+                let config = handles.config.lock().await;
+                let mut rooms = handles.rooms.lock().await;
+                let room = rooms.get_or_default(chat_id);
+                let model_key = selected_model_key(&config, room, chat_id);
+                let has_price = config
+                    .models
+                    .get(&model_key)
+                    .is_some_and(|model| model.price.is_some());
+                cost::summary(&room.cost, room.settings.show_cost, &model_key, has_price)
+            };
+            send_command_reply(handles, chat_id, &summary).await
+        }
+        CommandAction::SetCostLine { enabled } => {
+            handles
+                .persistence
+                .mutate_room(&handles.rooms, chat_id, |room| {
+                    room.settings.show_cost = enabled;
+                })
+                .await?;
+            let state = if enabled { "on" } else { "off" };
+            send_command_reply(handles, chat_id, &format!("Cost line set to {state}.")).await
+        }
         CommandAction::AllowChat {
             chat_id: target_chat_id,
         } => handle_allow_chat(chat_id, target_chat_id, handles).await,
@@ -1187,20 +1212,31 @@ async fn handle_model_message(
                 return Ok(());
             }
             let turn_items = std::mem::take(&mut response.turn_items);
+            let reply_cost =
+                cost::ReplyCost::new(response.usage, prepared.model_config.price.as_ref());
+            // The cost joins the room's total only with the turn it paid for,
+            // so a reply dropped by a reset never counts toward the new chat.
             let committed = {
                 let mut rooms = handles.rooms.lock().await;
-                rooms.get_mut(chat_id).is_some_and(|room| {
+                rooms.get_mut(chat_id).and_then(|room| {
                     room.append_turn_if_generation(
                         prepared.generation,
                         prepared.model_config.wire_format,
                         turn_items,
                     )
+                    .then(|| {
+                        room.cost.record(&reply_cost);
+                        room.settings
+                            .show_cost
+                            .then(|| cost::cost_line(&reply_cost, &room.cost))
+                    })
                 })
             };
-            if committed && worker_can_reply(chat_id, handles, cancelled).await {
-                model_turn::send_response(&handles.telegram, chat_id, response).await
-            } else {
-                Ok(())
+            match committed {
+                Some(cost_line) if worker_can_reply(chat_id, handles, cancelled).await => {
+                    model_turn::send_response(&handles.telegram, chat_id, response, cost_line).await
+                }
+                _ => Ok(()),
             }
         }
         Err(error) => {
@@ -2265,6 +2301,7 @@ fn command_name(command: KnownCommand) -> &'static str {
         KnownCommand::Reasoning => "reasoning",
         KnownCommand::WebSearch => "websearch",
         KnownCommand::ImageGeneration => "imagegen",
+        KnownCommand::Cost => "cost",
         KnownCommand::Allow => "allow",
         KnownCommand::Deny => "deny",
         KnownCommand::Pair => "pair",
@@ -2295,6 +2332,7 @@ const HELP_TEXT: &str = "\
 - /reasoning default|off|low|medium|high|max - show or set reasoning level
 - /websearch on|off|status - toggle, set, or show web search
 - /imagegen on|off|status - toggle, set, or show image generation
+- /cost on|off - show this chat's cost, or show or hide the cost line under each reply
 - /allow CHAT_ID - allow a chat (owner)
 - /deny CHAT_ID - deny a chat and clear its room state (owner)
 - /pair CODE - pair a new chat
@@ -2951,6 +2989,7 @@ mod tests {
             max_effort: None,
             off_effort: None,
             max_output_tokens: None,
+            price: None,
         }
     }
 

@@ -507,3 +507,36 @@ fn assert_missing(value: &Value, key: &str) {
         "expected {key} to be omitted, got {value}"
     );
 }
+
+#[tokio::test]
+async fn usage_counts_web_search_calls_and_splits_cached_input() {
+    let mock = MockOpenAi::start(vec![MockResponse::json(
+        200,
+        json!({
+            "output": [
+                { "type": "web_search_call", "id": "ws_1", "status": "completed" },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Found it." }]
+                }
+            ],
+            "usage": {
+                "input_tokens": 9708,
+                "input_tokens_details": { "cached_tokens": 5578 },
+                "output_tokens": 167,
+                "output_tokens_details": { "reasoning_tokens": 64 },
+                "total_tokens": 9875
+            }
+        }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    let usage = response.usage.unwrap();
+    assert_eq!(usage.input_tokens, 4130);
+    assert_eq!(usage.cached_input_tokens, 5578);
+    assert_eq!(usage.output_tokens, 167);
+    assert_eq!(usage.reasoning_tokens, 64);
+    assert_eq!(usage.web_searches, 1);
+}

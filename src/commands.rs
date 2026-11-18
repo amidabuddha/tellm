@@ -111,6 +111,10 @@ pub enum CommandAction {
     SetImageGeneration {
         enabled: bool,
     },
+    ShowCost,
+    SetCostLine {
+        enabled: bool,
+    },
     AllowChat {
         chat_id: i64,
     },
@@ -140,6 +144,7 @@ pub enum KnownCommand {
     Reasoning,
     WebSearch,
     ImageGeneration,
+    Cost,
     Allow,
     Deny,
     Pair,
@@ -215,6 +220,7 @@ pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) 
         KnownCommand::ImageGeneration => {
             route_image_generation(args, context.settings, &context.capabilities)
         }
+        KnownCommand::Cost => route_cost(args),
         KnownCommand::Allow => route_chat_approval(command, args, context.privileged_access),
         KnownCommand::Deny => route_chat_approval(command, args, context.privileged_access),
         KnownCommand::Pair => route_pair(args),
@@ -430,6 +436,27 @@ fn route_image_generation(
     }
 }
 
+/// `/cost` shows the conversation's running cost; `/cost on|off` shows or
+/// hides the cost line under each reply. Unlike the capability toggles, a
+/// bare `/cost` reports instead of toggling, since the totals are what it is
+/// for.
+fn route_cost(args: &str) -> CommandAction {
+    let Some(value) = first_arg(args) else {
+        return CommandAction::ShowCost;
+    };
+    if value.eq_ignore_ascii_case("status") {
+        return CommandAction::ShowCost;
+    }
+    match parse_bool(value) {
+        Some(enabled) => CommandAction::SetCostLine { enabled },
+        None => CommandAction::Reject {
+            reason: CommandReject::UnknownBoolean {
+                value: value.to_string(),
+            },
+        },
+    }
+}
+
 fn capability_reject(feature: &str, capabilities: &RoomCapabilities) -> CommandAction {
     CommandAction::Reject {
         reason: CommandReject::CapabilityUnsupported {
@@ -597,6 +624,7 @@ fn parse_known_command(name: &str) -> Option<KnownCommand> {
         "reasoning" => Some(KnownCommand::Reasoning),
         "websearch" => Some(KnownCommand::WebSearch),
         "imagegen" => Some(KnownCommand::ImageGeneration),
+        "cost" => Some(KnownCommand::Cost),
         "allow" => Some(KnownCommand::Allow),
         "deny" => Some(KnownCommand::Deny),
         "pair" => Some(KnownCommand::Pair),
@@ -958,6 +986,35 @@ mod tests {
                 reason: CommandReject::UnknownBoolean {
                     value: "maybe".to_string(),
                 },
+            })
+        );
+    }
+
+    #[test]
+    fn cost_command_shows_totals_and_sets_the_cost_line() {
+        let settings = rooms::RoomSettings::default();
+        assert_eq!(
+            route_command_with_default_settings("/cost", settings.clone()),
+            Route::Command(CommandAction::ShowCost)
+        );
+        assert_eq!(
+            route_command_with_default_settings("/cost status", settings.clone()),
+            Route::Command(CommandAction::ShowCost)
+        );
+        assert_eq!(
+            route_command_with_default_settings("/cost off", settings.clone()),
+            Route::Command(CommandAction::SetCostLine { enabled: false })
+        );
+        assert_eq!(
+            route_command_with_default_settings("/COST On", settings.clone()),
+            Route::Command(CommandAction::SetCostLine { enabled: true })
+        );
+        assert_eq!(
+            route_command_with_default_settings("/cost maybe", settings),
+            Route::Command(CommandAction::Reject {
+                reason: CommandReject::UnknownBoolean {
+                    value: "maybe".to_string()
+                }
             })
         );
     }

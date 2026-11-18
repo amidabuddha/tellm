@@ -446,3 +446,36 @@ fn assert_missing(value: &Value, key: &str) {
         "expected {key} to be absent from {value}"
     );
 }
+
+#[tokio::test]
+async fn usage_bills_thoughts_as_output_and_counts_grounding_queries() {
+    let mock = MockGemini::start(vec![MockResponse::json(
+        200,
+        json!({
+            "status": "completed",
+            "steps": [{
+                "type": "model_output",
+                "content": [{ "type": "text", "text": "Answer." }]
+            }],
+            "usage": {
+                "input_tokens_by_modality": [{ "modality": "text", "tokens": 100 }],
+                "total_cached_tokens": 40,
+                "total_input_tokens": 100,
+                "total_output_tokens": 25,
+                "total_thought_tokens": 22,
+                "total_tool_use_tokens": 50,
+                "total_tokens": 147,
+                "grounding_tool_count": [{ "type": "google_search", "count": 3 }]
+            }
+        }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    let usage = response.usage.unwrap();
+    assert_eq!(usage.input_tokens, 60);
+    assert_eq!(usage.cached_input_tokens, 40);
+    assert_eq!(usage.output_tokens, 47);
+    assert_eq!(usage.reasoning_tokens, 22);
+    assert_eq!(usage.web_searches, 3);
+}

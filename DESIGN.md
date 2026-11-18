@@ -9,7 +9,9 @@ which remains the reference implementation and the author's fallback during the 
 > Binary-first personal Telegram LLM gateway with first-run pairing, direct
 > provider APIs, per-room model pinning, and no Docker/config ceremony.
 
-- Usage is billed directly by your API providers. tellm never touches billing.
+- Usage is billed directly by your API providers. tellm never touches billing:
+  it only reads the token usage each reply reports and shows what the reply
+  cost (see § Usage and cost).
 - **Not an agent.** No shell, no skills registry, no browser control, no MCP.
   The entire capability surface is calls to Telegram and model providers.
   Provider traffic is HTTPS by default; cleartext is limited to keyless compat
@@ -40,7 +42,7 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 
 | Crate | Concern |
 |---|---|
-| `tellm-core` | Unified types (`ChatRequest`, `ChatResponse`, `ThinkingLevel`, `ContentPart`), opaque-history contract, `Provider` trait |
+| `tellm-core` | Unified types (`ChatRequest`, `ChatResponse`, `Usage`, `ThinkingLevel`, `ContentPart`), opaque-history contract, `Provider` trait |
 | `tellm-telegram` | Bot API client: long polling, rich→HTML→plain delivery chain, chunking, markdown→HTML |
 | `tellm-config` | TOML config (non-secrets), keychain/0600 secret store, explicit capability routing |
 | `tellm-anthropic` | Anthropic Messages API |
@@ -51,7 +53,7 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | root binary | Runtime loop, command router, sessions, pairing, wizard, local Ollama lifecycle |
 
 Inside the root binary, runtime-owned concerns are split into
-`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama}.rs`.
+`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama,cost}.rs`.
 The private `model_turn` module owns Telegram input/attachment normalization,
 provider-neutral request construction, provider dispatch and secret lookup,
 and model-response delivery. `runtime` retains access checks, cancellation,
@@ -59,7 +61,9 @@ and generation-guarded commit/rollback orchestration. The private `persistence`
 module owns the ordered blocking writer plus serialized room setting snapshots
 and their rollback semantics. The private `ollama` module owns recognition and
 lifecycle management for the narrowly supported local endpoint; `tellm-config`
-deliberately keeps only nonsecret config, secret storage, and validation.
+deliberately keeps only nonsecret config, secret storage, and validation. The
+private `cost` module turns a reply's usage into its cost line and keeps each
+room's running total.
 
 ## Unified parameter set
 
@@ -69,6 +73,9 @@ The core model is deliberately minimal — only what is common across providers:
   document parts for the new user turn)
 - `thinking: off | low | medium | high | max`
 - `web_search: bool`, `image_generation: bool`
+
+Each `ChatResponse` also carries the reply's `usage`, normalized as described
+in § Usage and cost.
 
 ### Opaque provider state
 
@@ -281,6 +288,76 @@ Notes:
   calls use bounded request/upload/download timeouts and long-poll timeout plus
   a grace window.
 
+## Usage and cost
+
+Every reply ends with what it cost, so a user can decide whether to continue.
+tellm reads only what the provider already returns with the reply; it never
+calls a billing API and never fetches prices.
+
+- `ChatResponse.usage` is a provider-neutral `Usage` with disjoint buckets:
+  ordinary input (neither read from nor written to a cache), cache reads,
+  cache writes, output (reasoning included, since every provider bills
+  reasoning as output), the reasoning part of that output for display,
+  provider-native web searches, and the cost the provider reports, if any.
+  Disjoint buckets matter because the shapes differ: OpenAI-style APIs count
+  cache reads and writes inside their input total, while Anthropic reports
+  them beside it. Each wire-format crate converts its own shape; a reply made
+  of several requests (Anthropic `pause_turn`) sums them. `usage` is `None`
+  when the provider sent no usage block, and missing fields count as zero.
+- Field mappings (checked 2026-11-18):
+  - Anthropic Messages: `input_tokens` is input outside the cache;
+    `cache_read_input_tokens` and `cache_creation_input_tokens` are reported
+    beside it; `server_tool_use.web_search_requests` counts billed searches
+    (platform.claude.com, prompt caching and pricing).
+  - OpenAI Responses: `input_tokens` includes
+    `input_tokens_details.cached_tokens` and
+    `input_tokens_details.cache_write_tokens`, so ordinary input is the
+    remainder; `output_tokens` includes `output_tokens_details.reasoning_tokens`
+    (developers.openai.com, prompt caching). Web search is billed per call and
+    counted as `web_search_call` output items (developers.openai.com pricing).
+    Meta Model API reports the same OpenAI-shaped fields and no cost.
+  - xAI Responses adds `usage.cost_in_usd_ticks`, the billed amount after
+    caching discounts and including server-side tool fees, at 10^10 ticks per
+    US dollar (docs.x.ai, cost tracking).
+  - Chat completions: `prompt_tokens` includes
+    `prompt_tokens_details.cached_tokens` and, where the endpoint bills
+    writes, `prompt_tokens_details.cache_write_tokens`; `completion_tokens`
+    includes `completion_tokens_details.reasoning_tokens` (openrouter.ai usage
+    accounting). DeepSeek reports cache reads as `prompt_cache_hit_tokens`
+    (api-docs.deepseek.com, context caching). OpenRouter's `usage.cost` is
+    the amount charged in credits, which are US dollars; it is read only from
+    an openrouter.ai URL, because the field has no shared meaning in the
+    dialect.
+  - Gemini Interactions: `total_input_tokens` is the prompt and
+    `total_cached_tokens` the cached part of it; `total_thought_tokens` is
+    added to `total_output_tokens`, since output is billed including thinking;
+    `grounding_tool_count[].count` becomes web searches, which Google bills
+    per query (Google's Interactions API reference and the js-genai
+    Interactions `Usage` type; ai.google.dev pricing).
+    `total_tool_use_tokens` is not priced: for Google Search it holds the
+    grounding results, which Google's pricing does not charge as input
+    (cloud.google.com Vertex AI pricing).
+- Cost of one reply: a cost the provider reports wins, because it is what was
+  billed. Otherwise the model's optional `price` table in `config.toml` gives
+  an estimate: each bucket times its per-million-token price, plus searches
+  times the per-1,000 search price. Only `input` and `output` are required; a
+  missing cache price falls back to `input`, which can overstate a cached
+  reply but never understates it, and a missing search price counts searches
+  as free. Prices are the user's to keep current. Without a reported cost or a
+  price, the reply shows its token counts instead.
+- Delivery: the cost line follows the reply text after a blank line, or comes
+  as its own message after an image-only reply. Only the delivered copy
+  carries it; the stored turn keeps the model's own content, so the model
+  never sees its bill. An estimate is marked `≈`; a chat total that includes
+  replies with no known cost is marked `≥`.
+- Each room keeps the running total of its current conversation in memory,
+  like the conversation itself. A reply's cost joins the total only when its
+  turn is committed, so a reply dropped by a reset never counts toward the
+  new chat. The total starts over with the conversation: `/new`, `/model`,
+  `/role`, `/mode message`, and the terminal `reset`. A failed reply is not
+  counted even though the provider may have billed it, so the provider's own
+  billing stays the source of truth.
+
 ## Runtime model (ported from console-chat-gpt)
 
 - Long polling (`getUpdates`, modest timeout so terminal controls stay responsive).
@@ -293,7 +370,7 @@ Notes:
   busy-notice send may be outstanding per room.
 - In-memory conversations; **room settings persist** across restarts
   (model pin, mode, role, optional thinking override, web-search toggle,
-  image-generation toggle) in `config_dir()/rooms.toml` — runtime state
+  image-generation toggle, cost-line toggle) in `config_dir()/rooms.toml` — runtime state
   deliberately separate from the user-owned config.toml. If a room has no
   `thinking` entry, it uses the selected model's `config.toml` thinking value;
   `/reasoning default` clears the room override. Conversations don't persist.
@@ -334,7 +411,7 @@ Notes:
 ### Telegram commands (v1)
 
 `/new`, `/id`, `/mode`, `/model` (incl. `pin`/`unpin`/`add`, owner-gated), `/role`,
-`/reasoning`, `/websearch`, `/imagegen`, `/allow`, `/deny`, `/pair`,
+`/reasoning`, `/websearch`, `/imagegen`, `/cost`, `/allow`, `/deny`, `/pair`,
 `/ollama unload` (owner-gated), `/shutdown` (owner-gated), `/help`.
 Dropped as waste:
 `/webfetch` (fold into websearch decision later), assistants, AI-managed mode,
@@ -346,7 +423,10 @@ Argument semantics: `/id` replies with the current Telegram chat id,
 `/mode [chat|message]`, `/model [key]`, `/role [text]`
 with `clear|off|none|reset` clearing the role, `/reasoning
 [default|off|low|medium|high|max]`, `/websearch [on|off|status]` (no argument
-toggles), `/imagegen [on|off|status]` (no argument toggles),
+toggles), `/imagegen [on|off|status]` (no argument toggles), `/cost
+[on|off|status]` (no argument or `status` shows the conversation's running
+cost and token breakdown; `on`/`off` shows or hides the cost line under each
+reply, on by default),
 `/ollama unload` to unload local Ollama models invoked by this tellm process,
 and `/allow CHAT_ID` / `/deny CHAT_ID` from any owner, and `/pair CODE`.
 If a chat id appears in a model's `telegram_chat_ids`, that model is the
@@ -491,7 +571,9 @@ restart and local room-setting changes.
   nonempty and secret names cannot use tellm's internal marker prefix;
   `max_effort` and `off_effort`, when present, are each one whitespace-free
   token; `max_output_tokens`, when present, is positive and belongs to an
-  Anthropic model;
+  Anthropic model; every `price` value, when present, is a finite,
+  non-negative number of US dollars, and unknown `price` fields are a parse
+  error rather than silently ignored;
   non-compat models name a secret; compat models have a valid absolute URL;
   credential-bearing endpoints use HTTPS; non-loopback keyless compat HTTP has
   the explicit per-model opt-in described above; URLs contain no embedded
@@ -515,7 +597,11 @@ restart and local room-setting changes.
   from the built-in list, which is each lab's most capable model that an
   ordinary API key can call (checked 2026-11-16, Google on 2026-11-17: Claude
   Fable 5.2, GPT-6 Astra, Grok 4.7, Muse Wonder 1.0 in preview, Gemini 4
-  Carbon), stores
+  Carbon), each with the list prices that could be checked against the
+  provider's pricing page (checked 2026-11-18: Claude Fable 5.2 and GPT-6
+  Astra; Grok needs none because xAI reports its billed cost; Muse Wonder and
+  Gemini 4 Carbon ship without a price, so their replies show token counts
+  until the user adds one), stores
   Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather

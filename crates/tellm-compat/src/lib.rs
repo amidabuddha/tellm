@@ -13,6 +13,17 @@
 //! - Web search / image generation: not part of this dialect —
 //!   `ProviderError::Unsupported` so the user gets told instead of guessing.
 //! - Images: `image_url` content parts (data URLs); documents: unsupported.
+//! - Usage: `usage.prompt_tokens` includes cached input;
+//!   `prompt_tokens_details.cached_tokens` counts cache reads and
+//!   `prompt_tokens_details.cache_write_tokens` cache writes where the endpoint
+//!   bills them, and `completion_tokens` includes
+//!   `completion_tokens_details.reasoning_tokens` (checked 2026-11-18 against
+//!   openrouter.ai usage accounting). DeepSeek reports cache reads as
+//!   `prompt_cache_hit_tokens` instead (checked 2026-11-18 against
+//!   api-docs.deepseek.com, context caching). OpenRouter adds `usage.cost`,
+//!   the amount charged in credits, which are US dollars; it is trusted only
+//!   from openrouter.ai, because the field has no shared meaning in the
+//!   dialect.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -20,6 +31,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
+    Usage, usage_count,
 };
 
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -119,12 +131,57 @@ impl Provider for Compat {
         }
 
         let text = extract_text(&message);
+        let usage = usage_from_response(
+            &response_body,
+            is_openrouter_url(&self.chat_completions_url),
+        );
         Ok(ChatResponse {
             text,
             images: Vec::<GeneratedImage>::new(),
             turn_items: vec![user_message, message],
+            usage,
         })
     }
+}
+
+/// Whether a chat-completions URL points at OpenRouter, whose `usage.cost` is
+/// the amount actually charged.
+pub fn is_openrouter_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+}
+
+/// Reads a chat-completions `usage` block into disjoint [`Usage`] buckets.
+/// `prompt_tokens` includes cached input, so ordinary input is what remains
+/// after cache reads and writes. `trust_reported_cost` accepts `usage.cost`
+/// as US dollars; only OpenRouter documents that meaning.
+pub fn usage_from_response(body: &Value, trust_reported_cost: bool) -> Option<Usage> {
+    let usage = body.get("usage")?;
+    let cached_input_tokens = match usage.get("prompt_cache_hit_tokens") {
+        // DeepSeek's own field for cache reads.
+        Some(_) => usage_count(usage, "/prompt_cache_hit_tokens"),
+        None => usage_count(usage, "/prompt_tokens_details/cached_tokens"),
+    };
+    let cache_write_tokens = usage_count(usage, "/prompt_tokens_details/cache_write_tokens");
+    let input_tokens = usage_count(usage, "/prompt_tokens")
+        .saturating_sub(cached_input_tokens)
+        .saturating_sub(cache_write_tokens);
+    let reported_cost_usd = trust_reported_cost
+        .then(|| usage.get("cost").and_then(Value::as_f64))
+        .flatten()
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+
+    Some(Usage {
+        input_tokens,
+        cached_input_tokens,
+        cache_write_tokens,
+        output_tokens: usage_count(usage, "/completion_tokens"),
+        reasoning_tokens: usage_count(usage, "/completion_tokens_details/reasoning_tokens"),
+        web_searches: 0,
+        reported_cost_usd,
+    })
 }
 
 impl Compat {

@@ -14,7 +14,8 @@ client — usage billed directly by your API providers, not by a subscription.
 ## Why
 
 - **Pay per use, not per month.** Occasional access to frontier models costs
-  cents via their APIs. tellm is the mobile-friendly front end for that.
+  cents via their APIs. tellm is the mobile-friendly front end for that, and
+  every reply ends with what it cost, so you can decide whether to keep going.
 - **Per-room model pinning.** One Telegram chat is your Opus room, another is
   your Grok room, a third runs your local Ollama model. Switch by switching
   chats.
@@ -170,6 +171,7 @@ Send these to the bot in any allowed chat. Owner-only commands are marked.
 | `/reasoning default\|off\|low\|medium\|high\|max` | Thinking effort |
 | `/websearch on\|off\|status` | Provider-native web search |
 | `/imagegen on\|off\|status` | Image generation (capable models only) |
+| `/cost` · `/cost on\|off` | This chat's running cost, or show/hide the cost line under each reply |
 | `/pair CODE` | Claim an unpaired chat with the code from the terminal |
 | `/allow CHAT_ID` · `/deny CHAT_ID` | Approve or revoke a chat (owner) |
 | `/ollama unload` | Unload this session's local Ollama models (owner) |
@@ -312,6 +314,40 @@ at `max` effort has room to finish. A reply that reaches the limit ends with a
 note saying it was cut off. tellm does not stream, so a larger limit means a
 longer wait for one response: a request gets 10 minutes up to 21,333 tokens
 and proportionally longer above that, which is 30 minutes at 64000.
+
+### Reply costs
+
+Each reply ends with a cost line, for example
+`Cost ≈ $0.031 (2 searches) · this chat ≈ $0.42`. The figure comes from the
+token usage the provider reports with the reply:
+
+- xAI and OpenRouter report what they charged, and tellm shows that as is.
+- For the other providers tellm multiplies the reported tokens by the model's
+  `price` table and marks the result with `≈`. The built-in Claude and OpenAI
+  presets carry list prices; add a table for any other model:
+
+  ```toml
+  [models.gpt.price]   # US dollars
+  input = 8.0          # per million input tokens
+  cached_input = 0.40  # per million tokens read from the prompt cache
+  cache_write = 10.0   # per million tokens written to the prompt cache
+  output = 40.0        # per million output tokens, reasoning included
+  web_search = 10.0    # per 1,000 provider-native web searches
+  ```
+
+  Only `input` and `output` are required. A missing `cached_input` or
+  `cache_write` falls back to `input`, which can overstate a cached reply but
+  never understates it; a missing `web_search` counts searches as free.
+  Prices change, and tellm never fetches them: keep the table current with the
+  provider's pricing page.
+- Without either, the line shows the token counts.
+
+"This chat" covers the current conversation and starts over with `/new`,
+`/model`, `/role` and `/mode message`. A `≥` means some replies in it had no
+known cost. `/cost` shows the totals with a token breakdown, and `/cost off`
+hides the line in that room. Failed replies are not counted, although a
+provider may still bill them; the provider's own billing page stays the
+source of truth.
 
 ## Setting Up Model Rooms
 

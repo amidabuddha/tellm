@@ -378,6 +378,7 @@ mod tests {
             max_effort: None,
             off_effort: None,
             max_output_tokens: None,
+            price: None,
         }
     }
 

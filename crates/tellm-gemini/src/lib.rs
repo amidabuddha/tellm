@@ -26,6 +26,18 @@
 //! - Image generation: only Gemini image model ids are eligible, recognized
 //!   by name (`*-image*` or `*nano-banana*`, see [`is_image_generation_model`]);
 //!   request `response_format: {"type": "image"}`.
+//! - Usage: the Interaction `usage` object reports `total_input_tokens`
+//!   (the prompt), `total_cached_tokens` (the cached part of that prompt),
+//!   `total_output_tokens`, `total_thought_tokens`, `total_tool_use_tokens`,
+//!   and `grounding_tool_count` entries with a `count` (checked 2026-11-18
+//!   against Google's Interactions API reference and the Interactions `Usage`
+//!   type of googleapis js-genai). Output is billed including thinking, and
+//!   Google Search grounding is billed per search query (ai.google.dev
+//!   pricing). Tool-use prompt tokens are not priced: for Google Search they
+//!   are the grounding results, and Google's pricing says input tokens from
+//!   Grounding with Google Search are not charged (checked 2026-11-18
+//!   against cloud.google.com Vertex AI pricing; the ai.google.dev pricing
+//!   page bills grounding per query and lists no token charge for it).
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -33,6 +45,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
+    Usage, usage_count,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -154,6 +167,7 @@ impl Provider for Gemini {
 
         let text = extract_text(&steps);
         let images = extract_images(&steps);
+        let usage = usage_from_response(&response_body);
         let mut turn_items = Vec::with_capacity(1 + steps.len());
         turn_items.push(user_step);
         turn_items.extend(steps);
@@ -162,8 +176,36 @@ impl Provider for Gemini {
             text,
             images,
             turn_items,
+            usage,
         })
     }
+}
+
+/// Reads an Interaction `usage` object into disjoint [`Usage`] buckets. The
+/// cached tokens are part of the prompt total, so ordinary input is what
+/// remains; thinking is billed as output, so it is added to it. Grounding
+/// tool counts become web searches.
+pub fn usage_from_response(body: &Value) -> Option<Usage> {
+    let usage = body.get("usage")?;
+    let cached_input_tokens = usage_count(usage, "/total_cached_tokens");
+    let thought_tokens = usage_count(usage, "/total_thought_tokens");
+    let web_searches = usage
+        .get("grounding_tool_count")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|entry| usage_count(entry, "/count"))
+        .fold(0_u64, u64::saturating_add);
+
+    Some(Usage {
+        input_tokens: usage_count(usage, "/total_input_tokens").saturating_sub(cached_input_tokens),
+        cached_input_tokens,
+        cache_write_tokens: 0,
+        output_tokens: usage_count(usage, "/total_output_tokens").saturating_add(thought_tokens),
+        reasoning_tokens: thought_tokens,
+        web_searches,
+        reported_cost_usd: None,
+    })
 }
 
 impl Gemini {
