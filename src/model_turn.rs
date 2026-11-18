@@ -11,6 +11,7 @@ use tellm_openai::Responses;
 use tellm_telegram::{Document, IncomingMessage, PhotoSize, Telegram, TelegramError};
 use tokio::task::spawn_blocking;
 
+use crate::memory::{self, ConversationMemory};
 use crate::ollama;
 use crate::rooms::{ChatMode, FailedTurnRollback, HistoryReset, RoomState};
 
@@ -22,16 +23,30 @@ pub(crate) struct PreparedChatRequest {
     pub(crate) rollback: Option<FailedTurnRollback>,
     pub(crate) generation: u64,
     pub(crate) reset_notice: Option<String>,
+    /// The memory block this request's conversation uses; the room keeps it
+    /// once the turn commits.
+    pub(crate) memory: Option<String>,
+    pub(crate) memory_notice: Option<String>,
 }
 
+/// `fresh_memory` is what a conversation starting now would get. It is used
+/// only when this request sends no history; a running conversation keeps the
+/// memory it started with.
 pub(crate) fn prepare_chat_request(
     room: &mut RoomState,
     model_config: ModelConfig,
     input: Vec<ContentPart>,
+    fresh_memory: ConversationMemory,
 ) -> PreparedChatRequest {
     let start = room.begin_turn(model_config.wire_format);
     let reset_notice = reset_notice(start.reset);
-    let request = chat_request_from_room(room, &model_config, input);
+    let mut request = chat_request_from_room(room, &model_config, input);
+    let (memory, memory_notice) = if request.history.is_empty() {
+        (fresh_memory.prompt, fresh_memory.notice)
+    } else {
+        (room.memory.clone(), None)
+    };
+    request.system = memory::system_prompt(request.system.as_deref(), memory.as_deref());
     let generation = room.generation();
 
     PreparedChatRequest {
@@ -40,6 +55,8 @@ pub(crate) fn prepare_chat_request(
         rollback: start.rollback,
         generation,
         reset_notice,
+        memory,
+        memory_notice,
     }
 }
 
@@ -683,6 +700,98 @@ mod tests {
             }],
         );
         assert_eq!(chat_request.history.len(), 1);
+    }
+
+    fn fresh(prompt: &str, notice: Option<&str>) -> ConversationMemory {
+        ConversationMemory {
+            prompt: Some(prompt.to_string()),
+            notice: notice.map(str::to_string),
+        }
+    }
+
+    fn text(text: &str) -> Vec<ContentPart> {
+        vec![ContentPart::Text {
+            text: text.to_string(),
+        }]
+    }
+
+    #[test]
+    fn a_new_conversation_starts_with_the_current_memory_after_the_role() {
+        let mut room = RoomState::new(RoomSettings {
+            role: Some("Be brief.".to_string()),
+            ..RoomSettings::default()
+        });
+
+        let prepared = prepare_chat_request(
+            &mut room,
+            model(WireFormat::Responses),
+            text("hi"),
+            fresh("Facts v1", Some("note")),
+        );
+
+        assert_eq!(
+            prepared.request.system.as_deref(),
+            Some("Be brief.\n\nFacts v1")
+        );
+        assert_eq!(prepared.memory.as_deref(), Some("Facts v1"));
+        assert_eq!(prepared.memory_notice.as_deref(), Some("note"));
+    }
+
+    #[test]
+    fn a_running_conversation_keeps_the_memory_it_started_with() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.begin_turn(WireFormat::Responses);
+        room.append_turn(WireFormat::Responses, vec![serde_json::json!({"turn": 1})]);
+        room.memory = Some("Facts v1".to_string());
+
+        let prepared = prepare_chat_request(
+            &mut room,
+            model(WireFormat::Responses),
+            text("and then?"),
+            fresh("Facts v2", Some("note")),
+        );
+
+        assert_eq!(prepared.request.system.as_deref(), Some("Facts v1"));
+        assert_eq!(prepared.memory.as_deref(), Some("Facts v1"));
+        assert_eq!(prepared.memory_notice, None);
+    }
+
+    #[test]
+    fn message_mode_takes_the_current_memory_every_time() {
+        let mut room = RoomState::new(RoomSettings {
+            mode: ChatMode::Message,
+            ..RoomSettings::default()
+        });
+        room.begin_turn(WireFormat::Responses);
+        room.append_turn(WireFormat::Responses, vec![serde_json::json!({"turn": 1})]);
+        room.memory = Some("Facts v1".to_string());
+
+        let prepared = prepare_chat_request(
+            &mut room,
+            model(WireFormat::Responses),
+            text("one-off"),
+            fresh("Facts v2", None),
+        );
+
+        assert_eq!(prepared.request.system.as_deref(), Some("Facts v2"));
+    }
+
+    #[test]
+    fn a_room_without_memory_sends_only_its_role() {
+        let mut room = RoomState::new(RoomSettings {
+            role: Some("Be brief.".to_string()),
+            ..RoomSettings::default()
+        });
+
+        let prepared = prepare_chat_request(
+            &mut room,
+            model(WireFormat::Anthropic),
+            text("hi"),
+            ConversationMemory::default(),
+        );
+
+        assert_eq!(prepared.request.system.as_deref(), Some("Be brief."));
+        assert_eq!(prepared.memory, None);
     }
 
     #[test]

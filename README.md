@@ -135,7 +135,7 @@ and rebuilds from scratch, downloading any missing locked crates automatically.
 Run the resulting executable using the path in the clean installation section.
 
 Preserve `Cargo.lock`, source, configuration, any `.env` files, and user data.
-tellm's `config.toml`, `rooms.toml`, and `credentials.toml` live under the OS
+tellm's `config.toml`, `rooms.toml`, `credentials.toml`, and `memory.md` live under the OS
 configuration directory's `tellm/` folder and are not build output. Leave that
 folder, keychain entries, global Cargo caches, rustup toolchains, installed
 targets, and installed executables in place.
@@ -172,6 +172,8 @@ Send these to the bot in any allowed chat. Owner-only commands are marked.
 | `/websearch on\|off\|status` | Provider-native web search |
 | `/imagegen on\|off\|status` | Image generation (capable models only) |
 | `/cost` · `/cost on\|off` | This chat's running cost, or show/hide the cost line under each reply |
+| `/memory` · `/memory on\|off` | List your saved facts, or use them in this chat or not (owner) |
+| `/remember TEXT` · `/forget N` | Save a fact for new chats, or remove fact N (owner) |
 | `/pair CODE` | Claim an unpaired chat with the code from the terminal |
 | `/allow CHAT_ID` · `/deny CHAT_ID` | Approve or revoke a chat (owner) |
 | `/ollama unload` | Unload this session's local Ollama models (owner) |
@@ -348,6 +350,31 @@ known cost. `/cost` shows the totals with a token breakdown, and `/cost off`
 hides the line in that room. Failed replies are not counted, although a
 provider may still bill them; the provider's own billing page stays the
 source of truth.
+
+## Memory
+
+tellm can remember a few facts about you, such as your age, your family,
+where you live or how you like answers, and add them to every new
+conversation so you don't have to repeat them.
+
+```text
+/remember I'm 41 and live in Sofia.
+/remember Two kids, aged 7 and 10.
+/memory
+/forget 2
+```
+
+- The facts live in `memory.md`, next to `config.toml`, readable only by your
+  user account. You can also edit it by hand: one fact per line, and lines
+  starting with `#` are comments.
+- Memory is on by default only in your direct chat with the bot. In groups
+  and other people's chats it stays off until you send `/memory on` there.
+- A conversation keeps the memory it started with: changes take effect in
+  your next chat (`/new` starts one).
+- Facts are limited to 2,000 characters, about 500 tokens per message.
+- Only owners can use the memory commands. The facts go to the room's
+  provider with every message in a chat where memory is on, so save only what
+  you're happy to tell it.
 
 ## Setting Up Model Rooms
 

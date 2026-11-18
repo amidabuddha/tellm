@@ -401,6 +401,32 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     write_atomic_with_mode(path, contents, None)
 }
 
+/// [`write_atomic`] for a file only the user's account may read: the new
+/// file is created `0600` on Unix before any content is written to it.
+pub fn write_atomic_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_atomic_with_mode(path, contents, Some(0o600))?;
+    restrict_to_owner(path)
+}
+
+/// Tighten a private file to `0600` on Unix. A file the user saved by hand
+/// can come back from an editor with the default `0644`. Other platforms
+/// keep the per-user profile directory's access rules.
+#[cfg(unix)]
+pub fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn write_atomic_with_mode(path: &Path, contents: &str, mode: Option<u32>) -> std::io::Result<()> {
     let (tmp, mut file) = create_unique_temp(path, mode)?;
     let result = (|| {
@@ -1745,6 +1771,27 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_written_0600_and_tightened_when_loosened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_temp_config_dir(|dir| {
+            let path = dir.join("private.md");
+            let mode = |path: &std::path::Path| {
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            };
+
+            write_atomic_private(&path, "- fact\n").unwrap();
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "- fact\n");
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            restrict_to_owner(&path).unwrap();
+            assert_eq!(mode(&path), 0o600);
         });
     }
 
