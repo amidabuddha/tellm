@@ -11,3 +11,10 @@ ci = "github"
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
+# GitHub retired the macos-14 runner image, dist 0.33.0's default for
+# aarch64-apple-darwin, on 2026-11-02; macos-15 is one of the arm64 labels it
+# names as the replacement (checked 2026-11-18 against the GitHub changelog,
+# "macOS 14 runner image retirement").
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
