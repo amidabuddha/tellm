@@ -15,6 +15,7 @@ use tokio::time::{sleep, timeout};
 use crate::access::{AccessConfig, AccessControl, AccessTime, ChatAccess, PairingAttempt};
 use crate::commands::{self, CommandAction, CommandContext, CommandReject, KnownCommand, Route};
 use crate::cost;
+use crate::memory::{self, ConversationMemory};
 use crate::model_turn::{self, PreparedChatRequest};
 use crate::ollama;
 use crate::persistence::{self, Persistence};
@@ -1144,6 +1145,46 @@ async fn handle_command(
             let state = if enabled { "on" } else { "off" };
             send_command_reply(handles, chat_id, &format!("Cost line set to {state}.")).await
         }
+        CommandAction::ShowMemory => {
+            let enabled = memory_enabled_in(chat_id, handles).await;
+            let loaded = memory::load().await;
+            let path = match memory::path() {
+                Ok(path) => path.display().to_string(),
+                Err(error) => error,
+            };
+            send_command_reply(
+                handles,
+                chat_id,
+                &memory::status_reply(&loaded, enabled, &path),
+            )
+            .await
+        }
+        CommandAction::SetMemory { enabled } => {
+            handles
+                .persistence
+                .mutate_room(&handles.rooms, chat_id, |room| {
+                    room.settings.memory = Some(enabled);
+                })
+                .await?;
+            send_command_reply(handles, chat_id, &memory::toggle_reply(enabled)).await
+        }
+        CommandAction::Remember { fact } => {
+            let reply = match memory::edit(move |memory| memory.remember(&fact)).await {
+                Ok(outcome) => {
+                    let enabled = memory_enabled_in(chat_id, handles).await;
+                    memory::remember_reply(&outcome, enabled)
+                }
+                Err(error) => format!("Not saved: {error}"),
+            };
+            send_command_reply(handles, chat_id, &reply).await
+        }
+        CommandAction::Forget { number } => {
+            let reply = match memory::edit(move |memory| memory.forget(number)).await {
+                Ok(outcome) => memory::forget_reply(number, &outcome),
+                Err(error) => format!("Memory not changed: {error}"),
+            };
+            send_command_reply(handles, chat_id, &reply).await
+        }
         CommandAction::AllowChat {
             chat_id: target_chat_id,
         } => handle_allow_chat(chat_id, target_chat_id, handles).await,
@@ -1194,10 +1235,13 @@ async fn handle_model_message(
     }
 
     let prepared = build_chat_request(chat_id, input, handles).await?;
-    if let Some(notice) = prepared.reset_notice.as_deref()
-        && worker_can_reply(chat_id, handles, cancelled).await
+    for notice in [&prepared.reset_notice, &prepared.memory_notice]
+        .into_iter()
+        .flatten()
     {
-        let _ = handles.telegram.send_message(chat_id, notice).await;
+        if worker_can_reply(chat_id, handles, cancelled).await {
+            let _ = handles.telegram.send_message(chat_id, notice).await;
+        }
     }
 
     let typing = AbortOnDrop(spawn_typing_indicator(handles.telegram.clone(), chat_id));
@@ -1226,6 +1270,7 @@ async fn handle_model_message(
                     )
                     .then(|| {
                         room.cost.record(&reply_cost);
+                        room.memory = prepared.memory.clone();
                         room.settings
                             .show_cost
                             .then(|| cost::cost_line(&reply_cost, &room.cost))
@@ -1274,6 +1319,13 @@ async fn build_chat_request(
     if !chat_is_allowed(chat_id, handles).await {
         return Err("chat access was revoked".to_string());
     }
+    // Read before taking the room locks. Commands and turns for this chat
+    // share its queue, so the room's memory setting can't change meanwhile.
+    let fresh_memory = if memory_enabled_in(chat_id, handles).await {
+        memory::for_new_conversation(Some(memory::load().await))
+    } else {
+        ConversationMemory::default()
+    };
     let config = handles.config.lock().await;
     let mut rooms = handles.rooms.lock().await;
     let room = rooms.get_or_default(chat_id);
@@ -1283,7 +1335,19 @@ async fn build_chat_request(
         .get(&model_key)
         .cloned()
         .ok_or_else(|| format!("configured model \"{model_key}\" was not found"))?;
-    Ok(model_turn::prepare_chat_request(room, model_config, input))
+    Ok(model_turn::prepare_chat_request(
+        room,
+        model_config,
+        input,
+        fresh_memory,
+    ))
+}
+
+async fn memory_enabled_in(chat_id: i64, handles: &RuntimeHandles) -> bool {
+    let config = handles.config.lock().await;
+    let rooms = handles.rooms.lock().await;
+    let setting = rooms.get(chat_id).and_then(|room| room.settings.memory);
+    memory::enabled_in(setting, chat_id, &config.telegram.owner_user_ids)
 }
 
 #[cfg(unix)]
@@ -2244,6 +2308,16 @@ fn format_deny_chat_reply(chat_id: i64, result: &DenyChatConfigResult) -> String
 fn format_reject(reason: CommandReject) -> String {
     match reason {
         CommandReject::MissingPairingCode => "Usage: /pair CODE.".to_string(),
+        CommandReject::MissingMemoryFact => {
+            "Usage: /remember TEXT, for example /remember I have two kids, aged 7 and 10."
+                .to_string()
+        }
+        CommandReject::InvalidMemoryNumber { value } => match value {
+            Some(value) => {
+                format!("\"{value}\" isn't a fact number. Usage: /forget N; /memory lists them.")
+            }
+            None => "Usage: /forget N; /memory lists the numbers.".to_string(),
+        },
         CommandReject::UnknownMode { value } => {
             format!("Unknown mode \"{value}\". Use chat or message.")
         }
@@ -2302,6 +2376,9 @@ fn command_name(command: KnownCommand) -> &'static str {
         KnownCommand::WebSearch => "websearch",
         KnownCommand::ImageGeneration => "imagegen",
         KnownCommand::Cost => "cost",
+        KnownCommand::Memory => "memory",
+        KnownCommand::Remember => "remember",
+        KnownCommand::Forget => "forget",
         KnownCommand::Allow => "allow",
         KnownCommand::Deny => "deny",
         KnownCommand::Pair => "pair",
@@ -2333,6 +2410,9 @@ const HELP_TEXT: &str = "\
 - /websearch on|off|status - toggle, set, or show web search
 - /imagegen on|off|status - toggle, set, or show image generation
 - /cost on|off - show this chat's cost, or show or hide the cost line under each reply
+- /memory on|off - list your saved facts, or use them in this chat or not (owner)
+- /remember TEXT - save a fact for new chats (owner)
+- /forget N - remove saved fact N (owner)
 - /allow CHAT_ID - allow a chat (owner)
 - /deny CHAT_ID - deny a chat and clear its room state (owner)
 - /pair CODE - pair a new chat

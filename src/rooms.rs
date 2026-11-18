@@ -42,6 +42,10 @@ pub struct RoomSettings {
     /// file only records rooms that turned it off.
     #[serde(default = "default_show_cost", skip_serializing_if = "is_true")]
     pub show_cost: bool,
+    /// Whether new conversations get the owner's memory. `None` follows the
+    /// default: on in an owner's direct chat, off elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<bool>,
 }
 
 fn default_show_cost() -> bool {
@@ -62,6 +66,7 @@ impl Default for RoomSettings {
             web_search: false,
             image_generation: false,
             show_cost: true,
+            memory: None,
         }
     }
 }
@@ -74,6 +79,10 @@ pub struct RoomState {
     /// Running cost of the current conversation; in memory only, like the
     /// conversation itself.
     pub cost: ChatCost,
+    /// The memory block the current conversation started with. It stays
+    /// until the conversation ends, so the system prompt never changes under
+    /// replayed provider state and prompt caching keeps working.
+    pub memory: Option<String>,
     history_turns: VecDeque<HistoryTurn>,
     generation: u64,
 }
@@ -111,6 +120,7 @@ impl RoomState {
             wire_format: None,
             history: Vec::new(),
             cost: ChatCost::default(),
+            memory: None,
             history_turns: VecDeque::new(),
             generation: 0,
         }
@@ -163,10 +173,12 @@ impl RoomState {
         }
     }
 
-    /// Starts a new conversation: the history and its running cost.
+    /// Starts a new conversation: the history, its running cost and the
+    /// memory it started with.
     pub fn reset_history(&mut self) {
         self.invalidate_history();
         self.cost = ChatCost::default();
+        self.memory = None;
     }
 
     /// Apply a `/websearch` change. The tool list precedes the whole
@@ -448,6 +460,7 @@ mod tests {
                     web_search: true,
                     image_generation: true,
                     show_cost: true,
+                    memory: Some(true),
                 },
             );
             settings.insert(
@@ -460,6 +473,7 @@ mod tests {
                     web_search: false,
                     image_generation: false,
                     show_cost: false,
+                    memory: None,
                 },
             );
 
@@ -869,6 +883,34 @@ mod tests {
         let file: RoomsToml = toml::from_str("[rooms.5]\nweb_search = true\n").unwrap();
         assert!(file.rooms["5"].show_cost);
         assert!(file.rooms["5"].web_search);
+        assert_eq!(file.rooms["5"].memory, None);
+    }
+
+    #[test]
+    fn rooms_toml_records_memory_only_when_a_room_chose_it() {
+        let mut settings = RoomSettings::default();
+        let file = |settings: &RoomSettings| {
+            toml::to_string(&RoomsToml {
+                rooms: BTreeMap::from([("5".to_string(), settings.clone())]),
+            })
+            .unwrap()
+        };
+
+        assert!(!file(&settings).contains("memory"));
+        settings.memory = Some(false);
+        assert!(file(&settings).contains("memory = false"));
+    }
+
+    #[test]
+    fn reset_history_forgets_the_conversation_memory() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.memory = Some("Facts".to_string());
+        room.append_turn(WireFormat::Responses, vec![serde_json::json!({"turn": 1})]);
+
+        room.reset_history();
+
+        assert_eq!(room.memory, None);
+        assert!(room.history.is_empty());
     }
 
     #[test]

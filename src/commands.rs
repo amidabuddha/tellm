@@ -115,6 +115,16 @@ pub enum CommandAction {
     SetCostLine {
         enabled: bool,
     },
+    ShowMemory,
+    SetMemory {
+        enabled: bool,
+    },
+    Remember {
+        fact: String,
+    },
+    Forget {
+        number: usize,
+    },
     AllowChat {
         chat_id: i64,
     },
@@ -145,6 +155,9 @@ pub enum KnownCommand {
     WebSearch,
     ImageGeneration,
     Cost,
+    Memory,
+    Remember,
+    Forget,
     Allow,
     Deny,
     Pair,
@@ -156,6 +169,10 @@ pub enum KnownCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandReject {
     MissingPairingCode,
+    MissingMemoryFact,
+    InvalidMemoryNumber {
+        value: Option<String>,
+    },
     UnknownMode {
         value: String,
     },
@@ -221,6 +238,9 @@ pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) 
             route_image_generation(args, context.settings, &context.capabilities)
         }
         KnownCommand::Cost => route_cost(args),
+        KnownCommand::Memory => route_memory(args, context.privileged_access),
+        KnownCommand::Remember => route_remember(args, context.privileged_access),
+        KnownCommand::Forget => route_forget(args, context.privileged_access),
         KnownCommand::Allow => route_chat_approval(command, args, context.privileged_access),
         KnownCommand::Deny => route_chat_approval(command, args, context.privileged_access),
         KnownCommand::Pair => route_pair(args),
@@ -457,6 +477,59 @@ fn route_cost(args: &str) -> CommandAction {
     }
 }
 
+/// The memory commands are owner-only: the facts are the owner's, and
+/// listing them in a shared room would show them to everyone there.
+fn route_memory(args: &str, access: access::PrivilegedAccess) -> CommandAction {
+    if let Some(reject) = owner_gate(access) {
+        return reject;
+    }
+    let Some(value) = first_arg(args) else {
+        return CommandAction::ShowMemory;
+    };
+    if value.eq_ignore_ascii_case("status") {
+        return CommandAction::ShowMemory;
+    }
+    match parse_bool(value) {
+        Some(enabled) => CommandAction::SetMemory { enabled },
+        None => CommandAction::Reject {
+            reason: CommandReject::UnknownBoolean {
+                value: value.to_string(),
+            },
+        },
+    }
+}
+
+fn route_remember(args: &str, access: access::PrivilegedAccess) -> CommandAction {
+    if let Some(reject) = owner_gate(access) {
+        return reject;
+    }
+    let fact = crate::memory::normalize_fact(args);
+    if fact.is_empty() {
+        return CommandAction::Reject {
+            reason: CommandReject::MissingMemoryFact,
+        };
+    }
+    CommandAction::Remember { fact }
+}
+
+fn route_forget(args: &str, access: access::PrivilegedAccess) -> CommandAction {
+    if let Some(reject) = owner_gate(access) {
+        return reject;
+    }
+    let value = first_arg(args);
+    match value
+        .map(|value| value.trim_start_matches('#'))
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        Some(number) if number > 0 => CommandAction::Forget { number },
+        _ => CommandAction::Reject {
+            reason: CommandReject::InvalidMemoryNumber {
+                value: value.map(str::to_string),
+            },
+        },
+    }
+}
+
 fn capability_reject(feature: &str, capabilities: &RoomCapabilities) -> CommandAction {
     CommandAction::Reject {
         reason: CommandReject::CapabilityUnsupported {
@@ -625,6 +698,9 @@ fn parse_known_command(name: &str) -> Option<KnownCommand> {
         "websearch" => Some(KnownCommand::WebSearch),
         "imagegen" => Some(KnownCommand::ImageGeneration),
         "cost" => Some(KnownCommand::Cost),
+        "memory" => Some(KnownCommand::Memory),
+        "remember" => Some(KnownCommand::Remember),
+        "forget" => Some(KnownCommand::Forget),
         "allow" => Some(KnownCommand::Allow),
         "deny" => Some(KnownCommand::Deny),
         "pair" => Some(KnownCommand::Pair),
@@ -1017,6 +1093,92 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn memory_commands_show_toggle_add_and_remove_facts() {
+        assert_eq!(
+            route_command("/memory"),
+            Route::Command(CommandAction::ShowMemory)
+        );
+        assert_eq!(
+            route_command("/memory status"),
+            Route::Command(CommandAction::ShowMemory)
+        );
+        assert_eq!(
+            route_command("/memory OFF"),
+            Route::Command(CommandAction::SetMemory { enabled: false })
+        );
+        assert_eq!(
+            route_command("/memory sometimes"),
+            Route::Command(CommandAction::Reject {
+                reason: CommandReject::UnknownBoolean {
+                    value: "sometimes".to_string()
+                }
+            })
+        );
+        assert_eq!(
+            route_command("/remember I have two kids,\n  aged 7 and 10"),
+            Route::Command(CommandAction::Remember {
+                fact: "I have two kids, aged 7 and 10".to_string()
+            })
+        );
+        assert_eq!(
+            route_command("/remember   "),
+            Route::Command(CommandAction::Reject {
+                reason: CommandReject::MissingMemoryFact
+            })
+        );
+        assert_eq!(
+            route_command("/forget 3"),
+            Route::Command(CommandAction::Forget { number: 3 })
+        );
+        assert_eq!(
+            route_command("/forget #2"),
+            Route::Command(CommandAction::Forget { number: 2 })
+        );
+        for (text, value) in [
+            ("/forget", None),
+            ("/forget 0", Some("0")),
+            ("/forget kids", Some("kids")),
+        ] {
+            assert_eq!(
+                route_command(text),
+                Route::Command(CommandAction::Reject {
+                    reason: CommandReject::InvalidMemoryNumber {
+                        value: value.map(str::to_string)
+                    }
+                }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_commands_are_owner_only() {
+        for text in ["/memory", "/memory on", "/remember I am 41", "/forget 1"] {
+            for (access, reason) in [
+                (
+                    access::PrivilegedAccess::NotOwner,
+                    CommandReject::OwnerNotAllowed,
+                ),
+                (access::PrivilegedAccess::Stale, CommandReject::OwnerStale),
+            ] {
+                assert_eq!(
+                    route_command_with(
+                        text,
+                        rooms::RoomSettings::default(),
+                        None,
+                        access,
+                        &["claude"],
+                    ),
+                    Route::Command(CommandAction::Reject {
+                        reason: reason.clone()
+                    }),
+                    "{text}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -53,7 +53,7 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | root binary | Runtime loop, command router, sessions, pairing, wizard, local Ollama lifecycle |
 
 Inside the root binary, runtime-owned concerns are split into
-`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama,cost}.rs`.
+`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama,cost,memory}.rs`.
 The private `model_turn` module owns Telegram input/attachment normalization,
 provider-neutral request construction, provider dispatch and secret lookup,
 and model-response delivery. `runtime` retains access checks, cancellation,
@@ -63,7 +63,8 @@ and their rollback semantics. The private `ollama` module owns recognition and
 lifecycle management for the narrowly supported local endpoint; `tellm-config`
 deliberately keeps only nonsecret config, secret storage, and validation. The
 private `cost` module turns a reply's usage into its cost line and keeps each
-room's running total.
+room's running total. The private `memory` module owns the owner's memory file
+and the memory block it adds to the system prompt (see § Memory).
 
 ## Unified parameter set
 
@@ -358,6 +359,47 @@ calls a billing API and never fetches prices.
   counted even though the provider may have billed it, so the provider's own
   billing stays the source of truth.
 
+## Memory
+
+- A short list of facts the owner curates (age, family, where they live,
+  standing preferences) that tellm adds to the system prompt, so they don't
+  have to be repeated in every new conversation. It holds facts, not
+  conversations; conversations still don't persist.
+- File: `config_dir()/memory.md`, next to `config.toml`. One fact per line,
+  with an optional `- ` or `* ` bullet; lines starting with `#` are comments.
+  tellm edits it line by line, so the owner's comments and layout survive.
+  It is written atomically with mode `0600` and tightened to `0600` whenever
+  it is read, since an editor can save it as `0644`; a file that can't be made
+  private is not used. A missing file is an empty memory. Edits from
+  different chats are serialized.
+- Only the owner writes it, with `/remember` and `/forget` or by hand. Models
+  get no tool to write it (see Non-goals), so it never collects a model's
+  guesses.
+- Size limit: 2,000 characters of facts (bullets and comments don't count),
+  about 500 tokens per request. `/remember` refuses to go over it. A
+  hand-edited file over the limit, or one that can't be read, is not used: the
+  conversation starts without memory and the chat gets a notice saying why.
+- Where it applies: the room setting `memory` in `rooms.toml`. Unset, it is on
+  only in an owner's direct chat with the bot, recognized by its chat id being
+  an owner's user id (Bot API user dialog ids equal user ids; checked
+  2026-11-18 against core.telegram.org/api/bots/ids). It is off in groups and
+  in other people's chats unless the owner runs `/memory on` there, so the
+  owner's facts reach no one else by default.
+- System prompt: the room's role, a blank line, then a header line and the
+  facts as a bullet list.
+- A conversation keeps the memory it started with. The runtime reads the file
+  whenever it builds a request in a room with memory on, but uses it only for
+  a request that sends no history: the first turn of a conversation and every
+  message-mode request. Later turns reuse the block the room stored when an
+  earlier turn committed. The system prompt therefore stays byte-stable for
+  prompt caching, provider state is never replayed under a changed system
+  prompt, and editing memory never resets a conversation the way `/role`
+  does. Changes take effect in the next conversation. The stored block is
+  cleared with the conversation (`/new`, `/model`, `/role`, `/mode message`,
+  terminal `reset`).
+- Privacy: in a room with memory on, every request carries the facts to that
+  room's provider. tellm does not log them.
+
 ## Runtime model (ported from console-chat-gpt)
 
 - Long polling (`getUpdates`, modest timeout so terminal controls stay responsive).
@@ -370,7 +412,7 @@ calls a billing API and never fetches prices.
   busy-notice send may be outstanding per room.
 - In-memory conversations; **room settings persist** across restarts
   (model pin, mode, role, optional thinking override, web-search toggle,
-  image-generation toggle, cost-line toggle) in `config_dir()/rooms.toml` — runtime state
+  image-generation toggle, cost-line toggle, memory toggle) in `config_dir()/rooms.toml` — runtime state
   deliberately separate from the user-owned config.toml. If a room has no
   `thinking` entry, it uses the selected model's `config.toml` thinking value;
   `/reasoning default` clears the room override. Conversations don't persist.
@@ -411,7 +453,8 @@ calls a billing API and never fetches prices.
 ### Telegram commands (v1)
 
 `/new`, `/id`, `/mode`, `/model` (incl. `pin`/`unpin`/`add`, owner-gated), `/role`,
-`/reasoning`, `/websearch`, `/imagegen`, `/cost`, `/allow`, `/deny`, `/pair`,
+`/reasoning`, `/websearch`, `/imagegen`, `/cost`, `/memory`, `/remember`,
+`/forget` (the three memory commands owner-gated), `/allow`, `/deny`, `/pair`,
 `/ollama unload` (owner-gated), `/shutdown` (owner-gated), `/help`.
 Dropped as waste:
 `/webfetch` (fold into websearch decision later), assistants, AI-managed mode,
@@ -426,7 +469,12 @@ with `clear|off|none|reset` clearing the role, `/reasoning
 toggles), `/imagegen [on|off|status]` (no argument toggles), `/cost
 [on|off|status]` (no argument or `status` shows the conversation's running
 cost and token breakdown; `on`/`off` shows or hides the cost line under each
-reply, on by default),
+reply, on by default), `/memory [on|off|status]` (no argument or `status`
+lists the saved facts with numbers, the characters used, whether memory is on
+in this room, and the file's path; `on`/`off` sets the room's memory setting),
+`/remember TEXT` (whitespace and line breaks collapse to one line; a fact
+already saved, ignoring case, is not added twice), `/forget N` (`#N` also
+accepted),
 `/ollama unload` to unload local Ollama models invoked by this tellm process,
 and `/allow CHAT_ID` / `/deny CHAT_ID` from any owner, and `/pair CODE`.
 If a chat id appears in a model's `telegram_chat_ids`, that model is the
@@ -554,7 +602,7 @@ restart and local room-setting changes.
   never auto-started or unloaded. Owners can also send `/ollama unload` to
   unload local Ollama models invoked by the current tellm process without
   stopping tellm or `ollama serve`.
-- `config.toml`, `rooms.toml`, and `credentials.toml` use collision-safe unique
+- `config.toml`, `rooms.toml`, `credentials.toml`, and `memory.md` use collision-safe unique
   same-directory temp files, file sync, and rename, so a crash or concurrent
   writer cannot expose a partial file. Unix parent-directory sync is attempted
   after commit; failure is a durability warning, not a false failed-commit
@@ -628,7 +676,8 @@ are written. Network fallback chains get a small mocked-Telegram harness.
 ## Non-goals (v1)
 
 - No MCP, no tools beyond provider-native web search / image generation.
-- No streaming. No conversation persistence. No multi-messenger.
+- No streaming. No conversation persistence (the curated memory in § Memory
+  holds facts, not conversations). No multi-messenger.
 - No OpenAI Assistants, no AI-managed model routing.
 - No PDF text extraction (native provider passthrough instead).
 
