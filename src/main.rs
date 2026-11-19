@@ -10,6 +10,7 @@ mod ollama;
 mod persistence;
 mod rooms;
 mod runtime;
+mod summary;
 mod wizard;
 
 #[tokio::main]

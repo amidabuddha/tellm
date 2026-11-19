@@ -83,6 +83,11 @@ pub struct RoomState {
     /// until the conversation ends, so the system prompt never changes under
     /// replayed provider state and prompt caching keeps working.
     pub memory: Option<String>,
+    /// The summary of an earlier conversation that the current one carries
+    /// (`/new summary`). It is set when that conversation ends and stays
+    /// until this one does, so it keeps the system prompt byte-stable the
+    /// same way `memory` does.
+    pub summary: Option<String>,
     history_turns: VecDeque<HistoryTurn>,
     generation: u64,
 }
@@ -121,6 +126,7 @@ impl RoomState {
             history: Vec::new(),
             cost: ChatCost::default(),
             memory: None,
+            summary: None,
             history_turns: VecDeque::new(),
             generation: 0,
         }
@@ -173,12 +179,21 @@ impl RoomState {
         }
     }
 
-    /// Starts a new conversation: the history, its running cost and the
-    /// memory it started with.
+    /// Starts a new conversation: the history, its running cost, and the
+    /// memory and summary it started with.
     pub fn reset_history(&mut self) {
         self.invalidate_history();
         self.cost = ChatCost::default();
         self.memory = None;
+        self.summary = None;
+    }
+
+    /// Starts a new conversation that carries `summary` of the one ending
+    /// now. Like [`Self::reset_history`], it drops the history, its cost and
+    /// its memory.
+    pub fn continue_from_summary(&mut self, summary: String) {
+        self.reset_history();
+        self.summary = Some(summary);
     }
 
     /// Apply a `/websearch` change. The tool list precedes the whole
@@ -911,6 +926,37 @@ mod tests {
 
         assert_eq!(room.memory, None);
         assert!(room.history.is_empty());
+    }
+
+    #[test]
+    fn a_summary_starts_a_new_conversation_and_lasts_until_the_next_one() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.memory = Some("Facts".to_string());
+        room.append_turn(WireFormat::Responses, vec![serde_json::json!({"turn": 1})]);
+        room.cost.record(&crate::cost::ReplyCost::new(
+            Some(tellm_core::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                reported_cost_usd: Some(0.01),
+                ..Default::default()
+            }),
+            None,
+        ));
+        let generation = room.generation();
+
+        room.continue_from_summary("Notes.".to_string());
+
+        assert_eq!(room.summary.as_deref(), Some("Notes."));
+        assert!(room.history.is_empty());
+        assert_eq!(room.memory, None);
+        assert_eq!(room.cost, crate::cost::ChatCost::default());
+        assert_ne!(room.generation(), generation);
+
+        room.append_turn(WireFormat::Responses, vec![serde_json::json!({"turn": 2})]);
+        assert_eq!(room.summary.as_deref(), Some("Notes."));
+
+        room.reset_history();
+        assert_eq!(room.summary, None);
     }
 
     #[test]

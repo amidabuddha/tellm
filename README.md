@@ -84,7 +84,7 @@ All direct, with no middleware.
 | Command | Does |
 |---|---|
 | `/help` | List commands |
-| `/new` | Start a new conversation in this chat |
+| `/new` · `/new summary` | Start a new conversation, or carry a summary of this one into it |
 | `/id` | Show this chat's Telegram id |
 | `/mode chat\|message` | Multi-turn conversation, or one question per message |
 | `/model [KEY]` | Show or switch this chat's model |

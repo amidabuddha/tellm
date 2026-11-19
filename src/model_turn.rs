@@ -11,9 +11,10 @@ use tellm_openai::Responses;
 use tellm_telegram::{Document, IncomingMessage, PhotoSize, Telegram, TelegramError};
 use tokio::task::spawn_blocking;
 
-use crate::memory::{self, ConversationMemory};
+use crate::memory::ConversationMemory;
 use crate::ollama;
 use crate::rooms::{ChatMode, FailedTurnRollback, HistoryReset, RoomState};
+use crate::summary;
 
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
@@ -46,7 +47,12 @@ pub(crate) fn prepare_chat_request(
     } else {
         (room.memory.clone(), None)
     };
-    request.system = memory::system_prompt(request.system.as_deref(), memory.as_deref());
+    let summary = room.summary.as_deref().map(summary::prompt_block);
+    request.system = system_prompt(
+        request.system.as_deref(),
+        memory.as_deref(),
+        summary.as_deref(),
+    );
     let generation = room.generation();
 
     PreparedChatRequest {
@@ -58,6 +64,21 @@ pub(crate) fn prepare_chat_request(
         memory,
         memory_notice,
     }
+}
+
+/// The role comes first, then the memory block, then the summary the
+/// conversation continues from, each after a blank line. Every part is fixed
+/// for the whole conversation, so the prompt stays byte-stable.
+fn system_prompt(
+    role: Option<&str>,
+    memory: Option<&str>,
+    summary: Option<&str>,
+) -> Option<String> {
+    let blocks = [role, memory, summary]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
 fn chat_request_from_room(
@@ -323,7 +344,7 @@ pub(crate) async fn send_response(
 /// The reply text with its cost line below a blank line. Only the delivered
 /// copy carries it: the stored turn keeps the model's own content, so the
 /// model never sees its own bill.
-fn with_cost_line(text: &str, line: &str) -> String {
+pub(crate) fn with_cost_line(text: &str, line: &str) -> String {
     format!("{}\n\n{line}", text.trim_end())
 }
 
@@ -774,6 +795,56 @@ mod tests {
         );
 
         assert_eq!(prepared.request.system.as_deref(), Some("Facts v2"));
+    }
+
+    #[test]
+    fn system_prompt_puts_the_role_first_then_memory_then_the_summary() {
+        assert_eq!(
+            system_prompt(Some("Be brief."), Some("Facts"), Some("Summary")).as_deref(),
+            Some("Be brief.\n\nFacts\n\nSummary")
+        );
+        assert_eq!(
+            system_prompt(Some("Be brief."), None, None).as_deref(),
+            Some("Be brief.")
+        );
+        assert_eq!(
+            system_prompt(None, Some("Facts"), None).as_deref(),
+            Some("Facts")
+        );
+        assert_eq!(
+            system_prompt(None, None, Some("Summary")).as_deref(),
+            Some("Summary")
+        );
+        assert_eq!(system_prompt(None, None, None), None);
+    }
+
+    #[test]
+    fn a_conversation_from_a_summary_carries_it_on_every_turn() {
+        let mut room = RoomState::new(RoomSettings {
+            role: Some("Be brief.".to_string()),
+            ..RoomSettings::default()
+        });
+        room.continue_from_summary("Moving in May.".to_string());
+        let expected = "Be brief.\n\nFacts v1\n\n\
+            Summary of the earlier part of this conversation:\nMoving in May.";
+
+        let first = prepare_chat_request(
+            &mut room,
+            model(WireFormat::Responses),
+            text("hi"),
+            fresh("Facts v1", None),
+        );
+        assert_eq!(first.request.system.as_deref(), Some(expected));
+        room.append_turn(WireFormat::Responses, vec![serde_json::json!({"turn": 1})]);
+        room.memory = first.memory;
+
+        let later = prepare_chat_request(
+            &mut room,
+            model(WireFormat::Responses),
+            text("and then?"),
+            fresh("Facts v2", None),
+        );
+        assert_eq!(later.request.system.as_deref(), Some(expected));
     }
 
     #[test]

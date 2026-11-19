@@ -53,7 +53,7 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | root binary | Runtime loop, command router, sessions, pairing, wizard, local Ollama lifecycle |
 
 Inside the root binary, runtime-owned concerns are split into
-`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama,cost,memory}.rs`.
+`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama,cost,memory,summary}.rs`.
 The private `model_turn` module owns Telegram input/attachment normalization,
 provider-neutral request construction, provider dispatch and secret lookup,
 and model-response delivery. `runtime` retains access checks, cancellation,
@@ -64,7 +64,9 @@ lifecycle management for the narrowly supported local endpoint; `tellm-config`
 deliberately keeps only nonsecret config, secret storage, and validation. The
 private `cost` module turns a reply's usage into its cost line and keeps each
 room's running total. The private `memory` module owns the owner's memory file
-and the memory block it adds to the system prompt (see § Memory).
+and the memory block it adds to the system prompt (see § Memory). The private
+`summary` module owns the summary request and the summary block a new
+conversation carries (see § Summaries).
 
 ## Unified parameter set
 
@@ -354,7 +356,8 @@ calls a billing API and never fetches prices.
 - Each room keeps the running total of its current conversation in memory,
   like the conversation itself. A reply's cost joins the total only when its
   turn is committed, so a reply dropped by a reset never counts toward the
-  new chat. The total starts over with the conversation: `/new`, `/model`,
+  new chat. A summary reply (§ Summaries) counts toward the conversation it
+  summarizes, and the conversation that carries it starts at zero. The total starts over with the conversation: `/new`, `/model`,
   `/role`, `/mode message`, and the terminal `reset`. A failed reply is not
   counted even though the provider may have billed it, so the provider's own
   billing stays the source of truth.
@@ -386,7 +389,8 @@ calls a billing API and never fetches prices.
   in other people's chats unless the owner runs `/memory on` there, so the
   owner's facts reach no one else by default.
 - System prompt: the room's role, a blank line, then a header line and the
-  facts as a bullet list.
+  facts as a bullet list. A carried summary follows the memory block
+  (§ Summaries).
 - A conversation keeps the memory it started with. The runtime reads the file
   whenever it builds a request in a room with memory on, but uses it only for
   a request that sends no history: the first turn of a conversation and every
@@ -399,6 +403,32 @@ calls a billing API and never fetches prices.
   terminal `reset`).
 - Privacy: in a room with memory on, every request carries the facts to that
   room's provider. tellm does not log them.
+
+## Summaries
+
+- `/new summary` asks the room's current model to summarize the
+  conversation, sends the summary to the chat, and starts a new conversation
+  that carries it. Like `/new`, it is not owner-gated.
+- The summary request is an ordinary turn of the conversation: the same
+  model, system prompt, full history, tools, web-search and image settings,
+  and effort as any turn in the room, built by the same request path. Only
+  the user message differs: a fixed instruction in `summary.rs` asking for
+  compact notes (facts, decisions and why, open questions, next steps) in
+  the conversation's language, without web search. The request prefix is
+  therefore the one the provider has cached.
+- Its reply is the old conversation's last reply: its cost joins that
+  conversation's total and gets the usual cost line, but its turn is not
+  stored. The conversation then resets, and the room keeps the summary text,
+  in memory only like the conversation.
+- The new conversation's system prompt is the role, the memory block, and
+  then "Summary of the earlier part of this conversation:" with the summary,
+  each separated by a blank line. The summary is fixed from the reset until
+  the conversation ends, so the system prompt stays byte-stable like the
+  memory block. `/new`, `/model`, `/role`, `/mode message` and the terminal
+  `reset` clear it with the conversation.
+- A chat without history, or in message mode, has nothing to summarize and
+  is told so. A failed summary request, or a reply without text, leaves the
+  conversation unchanged, and the chat says so.
 
 ## Runtime model (ported from console-chat-gpt)
 
@@ -452,7 +482,7 @@ calls a billing API and never fetches prices.
 
 ### Telegram commands (v1)
 
-`/new`, `/id`, `/mode`, `/model` (incl. `pin`/`unpin`/`add`, owner-gated), `/role`,
+`/new` (incl. `summary`), `/id`, `/mode`, `/model` (incl. `pin`/`unpin`/`add`, owner-gated), `/role`,
 `/reasoning`, `/websearch`, `/imagegen`, `/cost`, `/memory`, `/remember`,
 `/forget` (the three memory commands owner-gated), `/allow`, `/deny`, `/pair`,
 `/ollama unload` (owner-gated), `/shutdown` (owner-gated), `/help`.
@@ -462,7 +492,10 @@ MCP tooling.
 Known commands accept Telegram's group form (`/cmd@BotName`); commands
 addressed to a different bot are ignored, and unknown slash commands pass
 through as normal model input rather than producing "command not found" noise.
-Argument semantics: `/id` replies with the current Telegram chat id,
+Argument semantics: `/new [summary]` starts a new conversation, and with
+`summary` carries a summary of this one into it (§ Summaries); any other
+argument is refused, so a mistyped `summary` never ends a conversation. `/id`
+replies with the current Telegram chat id,
 `/mode [chat|message]`, `/model [key]`, `/role [text]`
 with `clear|off|none|reset` clearing the role, `/reasoning
 [default|off|low|medium|high|max]`, `/websearch [on|off|status]` (no argument
@@ -676,7 +709,8 @@ are written. Network fallback chains get a small mocked-Telegram harness.
 
 - No MCP, no tools beyond provider-native web search / image generation.
 - No streaming. No conversation persistence (the curated memory in § Memory
-  holds facts, not conversations). No multi-messenger.
+  holds facts, not conversations, and a carried summary lives in memory
+  only, like the conversation). No multi-messenger.
 - No OpenAI Assistants, no AI-managed model routing.
 - No PDF text extraction (native provider passthrough instead).
 

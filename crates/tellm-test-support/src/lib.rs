@@ -80,16 +80,23 @@ impl MockHttpServer {
         let thread_requests = Arc::clone(&requests);
 
         thread::spawn(move || {
-            for response in responses {
+            let mut responses = responses.into_iter().peekable();
+            while responses.peek().is_some() {
                 let (mut stream, _) = listener.accept().expect("mock server accept failed");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .expect("mock server read timeout failed");
-                let request = read_request(&mut stream);
+                // A client may drop a request it no longer needs, such as a
+                // typing indicator aborted mid-send. That connection gets no
+                // response; the next one does.
+                let Some(request) = read_request(&mut stream) else {
+                    continue;
+                };
                 thread_requests
                     .lock()
                     .expect("mock request lock poisoned")
                     .push(request);
+                let response = responses.next().expect("peeked response");
                 write_response(&mut stream, response);
             }
         });
@@ -111,11 +118,12 @@ impl MockHttpServer {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("mock server read timeout failed");
-            let request = read_request(&mut stream);
-            thread_requests
-                .lock()
-                .expect("mock request lock poisoned")
-                .push(request);
+            if let Some(request) = read_request(&mut stream) {
+                thread_requests
+                    .lock()
+                    .expect("mock request lock poisoned")
+                    .push(request);
+            }
             thread::sleep(Duration::from_secs(5));
         });
 
@@ -137,14 +145,18 @@ impl MockHttpServer {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> RecordedRequest {
+/// Reads one request, or `None` when the client closed the connection
+/// before sending all of it.
+fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
     let mut buffer = Vec::new();
     let mut chunk = [0; 1024];
     let mut header_end = None;
 
     while header_end.is_none() {
-        let read = stream.read(&mut chunk).expect("mock server read failed");
-        assert!(read > 0, "client closed connection before headers");
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
         buffer.extend_from_slice(&chunk[..read]);
         header_end = find_header_end(&buffer);
     }
@@ -180,19 +192,19 @@ fn read_request(stream: &mut TcpStream) -> RecordedRequest {
         .unwrap_or(0);
     let body_start = header_end + 4;
     while buffer.len() < body_start + content_length {
-        let read = stream
-            .read(&mut chunk)
-            .expect("mock server body read failed");
-        assert!(read > 0, "client closed connection before body");
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
         buffer.extend_from_slice(&chunk[..read]);
     }
 
-    RecordedRequest {
+    Some(RecordedRequest {
         method,
         path,
         headers,
         body: buffer[body_start..body_start + content_length].to_vec(),
-    }
+    })
 }
 
 fn write_response(stream: &mut TcpStream, response: MockResponse) {
@@ -210,12 +222,10 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{content_length}Connection: close\r\n\r\n",
         response.status, reason, response.content_type
     );
-    stream
+    // A client that has gone away meanwhile simply misses its response.
+    let _ = stream
         .write_all(headers.as_bytes())
-        .expect("mock response headers write failed");
-    stream
-        .write_all(&response.body)
-        .expect("mock response body write failed");
+        .and_then(|()| stream.write_all(&response.body));
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {

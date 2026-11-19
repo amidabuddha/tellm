@@ -177,16 +177,6 @@ pub fn enabled_in(setting: Option<bool>, chat_id: i64, owner_user_ids: &[i64]) -
     setting.unwrap_or_else(|| owner_user_ids.contains(&chat_id))
 }
 
-/// The role comes first; the memory block follows it after a blank line.
-pub fn system_prompt(role: Option<&str>, memory: Option<&str>) -> Option<String> {
-    match (role, memory) {
-        (Some(role), Some(memory)) => Some(format!("{role}\n\n{memory}")),
-        (Some(role), None) => Some(role.to_string()),
-        (None, Some(memory)) => Some(memory.to_string()),
-        (None, None) => None,
-    }
-}
-
 /// `loaded` is `None` when memory is off in the room.
 pub fn for_new_conversation(loaded: Option<Result<Memory, String>>) -> ConversationMemory {
     match loaded {
@@ -472,20 +462,6 @@ mod tests {
             )
         );
         assert_eq!(Memory::parse("# only a comment\n").prompt_block(), None);
-    }
-
-    #[test]
-    fn system_prompt_puts_the_role_before_the_memory() {
-        assert_eq!(
-            system_prompt(Some("Be brief."), Some("Facts")).as_deref(),
-            Some("Be brief.\n\nFacts")
-        );
-        assert_eq!(
-            system_prompt(Some("Be brief."), None).as_deref(),
-            Some("Be brief.")
-        );
-        assert_eq!(system_prompt(None, Some("Facts")).as_deref(), Some("Facts"));
-        assert_eq!(system_prompt(None, None), None);
     }
 
     #[test]
