@@ -59,14 +59,18 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 }
 
 // Each preset is its lab's most capable model that an ordinary API key can
-// call; that is what tellm is for. All checked 2026-11-16:
+// call; that is what tellm is for. All checked 2026-11-16 and rechecked
+// 2026-11-19, when only OpenAI's had changed:
 // - platform.claude.com model docs: Claude Fable 5.2 uses ID claude-fable-5-2
 //   and is Anthropic's most capable generally available model (Claude Mythos
 //   5.2 is limited to verified organizations). Thinking is always adaptive,
 //   and effort accepts low/medium/high/xhigh/max.
-// - developers.openai.com API model docs: GPT-6 Astra uses ID gpt-6-astra, is
-//   OpenAI's most capable model, supports Responses with web search and
-//   image generation, and accepts reasoning effort low/medium/high/xhigh/max.
+// - developers.openai.com API model docs (2026-11-19): GPT-6.2 Astra uses ID
+//   gpt-6.2-astra, is "our most capable model for your hardest projects",
+//   supports Responses with web search and image generation, and rejects
+//   reasoning effort "none". The page lists no other values; Artificial
+//   Analysis benchmarks it at low/medium/high/xhigh/max, the same tiers as
+//   GPT-6 Astra, whose page lists them.
 // - docs.x.ai model docs: Grok 4.7 uses ID grok-4.7 and is the flagship; it
 //   accepts reasoning effort low/medium/high/xhigh and never max.
 // - dev.meta.ai Model API docs: Muse Wonder uses ID muse-wonder-1.0, is
@@ -100,9 +104,9 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 // - platform.claude.com pricing: Claude Fable 5.2 is $8 input, $10 5-minute
 //   cache writes (tellm's `ephemeral` cache uses the 5-minute TTL), $0.20
 //   cache hits and $40 output per MTok; web search is $10 per 1,000.
-// - developers.openai.com pricing: gpt-6-astra is $10 input, $1 cached input,
-//   $12.50 30-minute cache writes (the default TTL, which tellm keeps) and $50
-//   output per MTok; web search is $10 per 1,000 calls.
+// - developers.openai.com model page (2026-11-19): gpt-6.2-astra is $8 input,
+//   $0.40 cached input, $10 30-minute cache writes (the default TTL, which
+//   tellm keeps) and $40 output per MTok; web search is $10 per 1,000 calls.
 // - xAI reports each response's billed cost, so the Grok preset needs none.
 // - Meta's and Google's pricing pages could not be checked from the
 //   implementation environment, so those presets ship without a price and
@@ -128,19 +132,19 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         key: "openai",
-        label: "OpenAI GPT-6 Astra",
+        label: "OpenAI GPT-6.2 Astra",
         wire_format: WireFormat::Responses,
-        model_name: "gpt-6-astra",
+        model_name: "gpt-6.2-astra",
         base_url: None,
         api_key_secret: secrets::OPENAI_API_KEY,
         max_effort: Some("max"),
         off_effort: Some("low"),
         max_output_tokens: None,
         price: Some(ModelPrice {
-            input: 10.0,
-            cached_input: Some(1.0),
-            cache_write: Some(12.50),
-            output: 50.0,
+            input: 8.0,
+            cached_input: Some(0.40),
+            cache_write: Some(10.0),
+            output: 40.0,
             web_search: Some(10.0),
         }),
     },
@@ -396,7 +400,16 @@ mod tests {
             })
         );
         let openai = model_config_from_preset(preset_by_key("openai").unwrap());
-        assert_eq!(openai.price.map(|price| price.output), Some(50.0));
+        assert_eq!(
+            openai.price,
+            Some(ModelPrice {
+                input: 8.0,
+                cached_input: Some(0.40),
+                cache_write: Some(10.0),
+                output: 40.0,
+                web_search: Some(10.0),
+            })
+        );
 
         // xAI reports its own billed cost; Meta and Google prices were not
         // checked against their pricing pages.
@@ -441,8 +454,8 @@ mod tests {
             ),
             (
                 "openai",
-                "OpenAI GPT-6 Astra",
-                "gpt-6-astra",
+                "OpenAI GPT-6.2 Astra",
+                "gpt-6.2-astra",
                 WireFormat::Responses,
             ),
             ("xai", "xAI Grok 4.7", "grok-4.7", WireFormat::Responses),

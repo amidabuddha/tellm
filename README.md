@@ -206,7 +206,7 @@ max_output_tokens = 64000
 
 [models.gpt]
 wire_format = "responses"
-model_name = "gpt-6-astra"
+model_name = "gpt-6.2-astra"
 api_key_secret = "openai_api_key"
 telegram_chat_ids = []
 thinking = "high"
