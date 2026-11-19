@@ -100,6 +100,16 @@ impl ChatCost {
             .saturating_add(self.cached_input_tokens)
             .saturating_add(self.cache_write_tokens)
     }
+
+    /// The percentage of input tokens read from the provider's cache, rounded
+    /// to a whole number, or `None` before any reply reported input.
+    fn cache_hit_percent(&self) -> Option<u64> {
+        let total = u128::from(self.input_total());
+        (total > 0).then(|| {
+            let cached = u128::from(self.cached_input_tokens);
+            ((cached * 100 + total / 2) / total) as u64
+        })
+    }
 }
 
 /// The line appended under a reply. `chat` already includes `reply`, and
@@ -201,6 +211,12 @@ pub(crate) fn summary(
             tokens.push_str(&format!(" · {}", searches(chat.web_searches)));
         }
         lines.push(tokens);
+
+        if let Some(percent) = chat.cache_hit_percent() {
+            lines.push(format!(
+                "Cache: {percent}% of input tokens came from the cache."
+            ));
+        }
 
         if let Some(tokens) = context_tokens {
             lines.push(format!(
@@ -415,12 +431,18 @@ mod tests {
             text.contains("1 reply had no cost: add a [models.gpt.price] table"),
             "{text}"
         );
+        // 98k of 101.1k input tokens.
+        assert!(
+            text.contains("Cache: 97% of input tokens came from the cache."),
+            "{text}"
+        );
         assert!(
             text.contains(
                 "Chat size: 48k of 150k tokens; at 150k tellm summarizes it into a new chat."
             ),
             "{text}"
         );
+        assert!(!empty.contains("Cache:"), "{empty}");
         assert!(text.contains("/cost on shows it"), "{text}");
 
         let priced = summary(&chat, true, "gpt", true, None);
@@ -429,6 +451,28 @@ mod tests {
             "{priced}"
         );
         assert!(!priced.contains("Chat size"), "{priced}");
+    }
+
+    #[test]
+    fn the_cache_share_counts_reads_against_every_input_token() {
+        let mut chat = ChatCost::default();
+        chat.record(&ReplyCost::new(None, None));
+        assert_eq!(chat.cache_hit_percent(), None, "no reported usage");
+
+        chat.record(&ReplyCost::new(Some(usage(0, 0, 10, 0)), None));
+        assert_eq!(chat.cache_hit_percent(), None, "no input yet");
+
+        let mut writes = usage(1_000, 0, 10, 0);
+        writes.cache_write_tokens = 9_000;
+        chat.record(&ReplyCost::new(Some(writes), None));
+        assert_eq!(chat.cache_hit_percent(), Some(0));
+
+        chat.record(&ReplyCost::new(Some(usage(1_000, 9_000, 10, 0)), None));
+        assert_eq!(chat.cache_hit_percent(), Some(45));
+        assert!(
+            summary(&chat, true, "gpt", false, None)
+                .contains("Cache: 45% of input tokens came from the cache.")
+        );
     }
 
     #[test]

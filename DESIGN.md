@@ -387,6 +387,9 @@ calls a billing API and never fetches prices.
   the same token format, for example `· 48k of 150k tokens` (§ Summaries).
   It is left out when the size is unknown: the provider reported no usage,
   or the room is in message mode. `/cost` shows the size too.
+- `/cost` also shows the conversation's cache hit rate: cache reads as a
+  share of all input tokens (ordinary, cache reads and cache writes), summed
+  over its replies. It appears once a reply has reported nonzero input.
 - Each room keeps the running total of its current conversation in memory,
   like the conversation itself. A reply's cost joins the total only when its
   turn is committed, so a reply dropped by a reset never counts toward the
@@ -563,10 +566,11 @@ with `clear|off|none|reset` clearing the role, `/reasoning
 [default|off|low|medium|high|max]`, `/websearch [on|off|status]` (no argument
 toggles), `/imagegen [on|off|status]` (no argument toggles), `/cost
 [on|off|status]` (no argument or `status` shows the conversation's running
-cost and token breakdown; `on`/`off` shows or hides the cost line under each
-reply, on by default), `/memory [on|off|status]` (no argument or `status`
-lists the saved facts with numbers, the characters used, whether memory is on
-in this room, and the file's path; `on`/`off` sets the room's memory setting),
+cost, token breakdown, cache hit rate and size; `on`/`off` shows or hides
+the cost line under each reply, on by default), `/memory [on|off|status]` (no
+argument or `status` lists the saved facts with numbers, the characters used,
+whether memory is on in this room, and the file's path; `on`/`off` sets the
+room's memory setting),
 `/remember TEXT` (whitespace and line breaks collapse to one line; a fact
 already saved, ignoring case, is not added twice), `/forget N` (`#N` also
 accepted),
