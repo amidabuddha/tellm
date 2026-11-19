@@ -187,7 +187,10 @@ thinking = "off"
 
 ### Reply costs
 
-Each reply ends with a line such as `Cost ≈ $0.031 (2 searches) · this chat ≈ $0.42`.
+Each reply ends with a line such as
+`Cost ≈ $0.031 (2 searches) · this chat ≈ $0.42 · 48k of 150k tokens`. The
+last part is the chat's size: at 150k tokens tellm summarizes it into a fresh
+chat. `/cost` shows the same totals in more detail.
 xAI and OpenRouter report what they charged. For other providers tellm
 multiplies the reported tokens by the model's price table; the built-in Claude
 and OpenAI entries include one. Add one for any other model:

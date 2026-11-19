@@ -375,6 +375,10 @@ calls a billing API and never fetches prices.
   carries it; the stored turn keeps the model's own content, so the model
   never sees its bill. An estimate is marked `≈`; a chat total that includes
   replies with no known cost is marked `≥`.
+- The line ends with the conversation's size against its token budget, in
+  the same token format, for example `· 48k of 150k tokens` (§ Summaries).
+  It is left out when the size is unknown: the provider reported no usage,
+  or the room is in message mode. `/cost` shows the size too.
 - Each room keeps the running total of its current conversation in memory,
   like the conversation itself. A reply's cost joins the total only when its
   turn is committed, so a reply dropped by a reset never counts toward the

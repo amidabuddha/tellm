@@ -4,10 +4,13 @@
 //!
 //! A cost the provider reports (xAI, OpenRouter) is what was billed and wins.
 //! Otherwise the model's `price` table from config.toml gives an estimate,
-//! marked with "≈". Without either, the line shows token counts.
+//! marked with "≈". Without either, the line shows token counts. Both end
+//! with the chat's size against its token budget, when the size is known.
 
 use tellm_config::ModelPrice;
 use tellm_core::Usage;
+
+use crate::summary::CONTEXT_SUMMARY_TOKENS;
 
 /// Where a reply's cost came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,38 +102,55 @@ impl ChatCost {
     }
 }
 
-/// The line appended under a reply. `chat` already includes `reply`.
-pub(crate) fn cost_line(reply: &ReplyCost, chat: &ChatCost) -> String {
+/// The line appended under a reply. `chat` already includes `reply`, and
+/// `context_tokens` is the chat's size as of this reply, when known.
+pub(crate) fn cost_line(reply: &ReplyCost, chat: &ChatCost, context_tokens: Option<u64>) -> String {
     let Some(usage) = reply.usage else {
         return "Cost unknown: the provider reported no usage".to_string();
     };
-    let Some((usd, source)) = reply.cost else {
-        return format!(
+    let mut line = match reply.cost {
+        None => format!(
             "Tokens {} in · {} out · no price set",
             format_tokens(usage.total_input_tokens()),
             format_tokens(usage.output_tokens),
-        );
+        ),
+        Some((usd, source)) => {
+            let mut line = format!("Cost {}{}", marker(source), format_usd(usd));
+            if usage.web_searches > 0 {
+                line.push_str(&format!(" ({})", searches(usage.web_searches)));
+            }
+            line.push_str(&format!(
+                " · this chat {}{}",
+                chat_marker(chat),
+                format_usd(chat.usd())
+            ));
+            line
+        }
     };
-
-    let mut line = format!("Cost {}{}", marker(source), format_usd(usd));
-    if usage.web_searches > 0 {
-        line.push_str(&format!(" ({})", searches(usage.web_searches)));
+    if let Some(tokens) = context_tokens {
+        line.push_str(&format!(" · {}", chat_size(tokens)));
     }
-    line.push_str(&format!(
-        " · this chat {}{}",
-        chat_marker(chat),
-        format_usd(chat.usd())
-    ));
     line
 }
 
+/// The chat's size against the token budget it is summarized at.
+fn chat_size(tokens: u64) -> String {
+    format!(
+        "{} of {} tokens",
+        format_tokens(tokens),
+        format_tokens(CONTEXT_SUMMARY_TOKENS)
+    )
+}
+
 /// The `/cost` reply. `has_price` says whether the room's model has a price
-/// table, which decides the hint for replies whose cost is unknown.
+/// table, which decides the hint for replies whose cost is unknown;
+/// `context_tokens` is the chat's size, when known.
 pub(crate) fn summary(
     chat: &ChatCost,
     show_cost: bool,
     model_key: &str,
     has_price: bool,
+    context_tokens: Option<u64>,
 ) -> String {
     let mut lines = Vec::new();
     if chat.replies == 0 {
@@ -181,6 +201,14 @@ pub(crate) fn summary(
             tokens.push_str(&format!(" · {}", searches(chat.web_searches)));
         }
         lines.push(tokens);
+
+        if let Some(tokens) = context_tokens {
+            lines.push(format!(
+                "Chat size: {}; at {} tellm summarizes it into a new chat.",
+                chat_size(tokens),
+                format_tokens(CONTEXT_SUMMARY_TOKENS)
+            ));
+        }
 
         let uncosted = chat.replies - chat.costed_replies;
         if uncosted > 0 {
@@ -308,15 +336,23 @@ mod tests {
         chat.record(&first);
         // 0.08 + 0.02 + 0.04 + 0.02
         assert_eq!(
-            cost_line(&first, &chat),
+            cost_line(&first, &chat, None),
             "Cost ≈ $0.160 (2 searches) · this chat ≈ $0.160"
+        );
+        assert_eq!(
+            cost_line(&first, &chat, Some(61_000)),
+            "Cost ≈ $0.160 (2 searches) · this chat ≈ $0.160 · 61k of 150k tokens"
         );
 
         let unpriced = ReplyCost::new(Some(usage(12_300, 0, 1_240, 0)), None);
         chat.record(&unpriced);
         assert_eq!(
-            cost_line(&unpriced, &chat),
+            cost_line(&unpriced, &chat, None),
             "Tokens 12.3k in · 1.2k out · no price set"
+        );
+        assert_eq!(
+            cost_line(&unpriced, &chat, Some(13_540)),
+            "Tokens 12.3k in · 1.2k out · no price set · 13.5k of 150k tokens"
         );
 
         let mut billed = usage(1_000, 0, 100, 1);
@@ -324,13 +360,13 @@ mod tests {
         let reported = ReplyCost::new(Some(billed), None);
         chat.record(&reported);
         assert_eq!(
-            cost_line(&reported, &chat),
-            "Cost $0.0042 (1 search) · this chat ≥ $0.164"
+            cost_line(&reported, &chat, Some(151_200)),
+            "Cost $0.0042 (1 search) · this chat ≥ $0.164 · 151.2k of 150k tokens"
         );
 
         let silent = ReplyCost::new(None, Some(&price()));
         assert_eq!(
-            cost_line(&silent, &chat),
+            cost_line(&silent, &chat, None),
             "Cost unknown: the provider reported no usage"
         );
     }
@@ -343,13 +379,16 @@ mod tests {
         let reply = ReplyCost::new(Some(billed), None);
         chat.record(&reply);
         chat.record(&reply);
-        assert_eq!(cost_line(&reply, &chat), "Cost $1.50 · this chat $3.00");
+        assert_eq!(
+            cost_line(&reply, &chat, None),
+            "Cost $1.50 · this chat $3.00"
+        );
         assert!(!chat.estimated);
     }
 
     #[test]
     fn summary_reports_totals_tokens_and_the_line_setting() {
-        let empty = summary(&ChatCost::default(), true, "gpt", false);
+        let empty = summary(&ChatCost::default(), true, "gpt", false, None);
         assert!(empty.starts_with("No replies in this chat yet."), "{empty}");
         assert!(empty.contains("/cost off hides it"), "{empty}");
 
@@ -359,7 +398,7 @@ mod tests {
         reply_usage.reasoning_tokens = 6_100;
         chat.record(&ReplyCost::new(Some(reply_usage), Some(&price())));
         chat.record(&ReplyCost::new(Some(usage(100, 0, 10, 0)), None));
-        let text = summary(&chat, false, "gpt", false);
+        let text = summary(&chat, false, "gpt", false, Some(48_000));
         assert!(
             text.contains(
                 "This chat: ≥ $0.487 over 2 replies (estimated from config.toml prices)."
@@ -376,13 +415,20 @@ mod tests {
             text.contains("1 reply had no cost: add a [models.gpt.price] table"),
             "{text}"
         );
+        assert!(
+            text.contains(
+                "Chat size: 48k of 150k tokens; at 150k tellm summarizes it into a new chat."
+            ),
+            "{text}"
+        );
         assert!(text.contains("/cost on shows it"), "{text}");
 
-        let priced = summary(&chat, true, "gpt", true);
+        let priced = summary(&chat, true, "gpt", true, None);
         assert!(
             priced.contains("1 reply had no cost: the provider reported no usage."),
             "{priced}"
         );
+        assert!(!priced.contains("Chat size"), "{priced}");
     }
 
     #[test]

@@ -1138,7 +1138,13 @@ async fn handle_command(
                     .models
                     .get(&model_key)
                     .is_some_and(|model| model.price.is_some());
-                cost::summary(&room.cost, room.settings.show_cost, &model_key, has_price)
+                cost::summary(
+                    &room.cost,
+                    room.settings.show_cost,
+                    &model_key,
+                    has_price,
+                    room.context_tokens,
+                )
             };
             send_command_reply(handles, chat_id, &summary).await
         }
@@ -1281,7 +1287,7 @@ async fn handle_model_message(
                         room.memory = prepared.memory.clone();
                         room.settings
                             .show_cost
-                            .then(|| cost::cost_line(&reply_cost, &room.cost))
+                            .then(|| cost::cost_line(&reply_cost, &room.cost, room.context_tokens))
                     })
                 })
             };
@@ -1464,10 +1470,11 @@ async fn summarize_into_new_chat(
         rooms.get_mut(chat_id).and_then(|room| {
             (room.generation() == prepared.generation).then(|| {
                 room.cost.record(&reply_cost);
+                room.record_context(reply_cost.usage.as_ref());
                 let cost_line = room
                     .settings
                     .show_cost
-                    .then(|| cost::cost_line(&reply_cost, &room.cost));
+                    .then(|| cost::cost_line(&reply_cost, &room.cost, room.context_tokens));
                 room.continue_from_summary(summary.clone());
                 cost_line
             })
@@ -3415,7 +3422,7 @@ mod tests {
             sent,
             vec![
                 "Summary carried into a new chat:\n\n- Moving to Sofia in May.\n\n\
-                 Tokens 1.2k in · 80 out · no price set"
+                 Tokens 1.2k in · 80 out · no price set · 1.3k of 150k tokens"
                     .to_string()
             ]
         );
@@ -3651,10 +3658,10 @@ mod tests {
         assert_eq!(
             sent_texts(&telegram),
             vec![
-                "Sure.\n\nTokens 149k in · 2k out · no price set".to_string(),
+                "Sure.\n\nTokens 149k in · 2k out · no price set · 151k of 150k tokens".to_string(),
                 summary::Trigger::TokenBudget.notice().unwrap(),
                 "Summary carried into a new chat:\n\n- Notes.\n\n\
-                 Tokens 151.5k in · 300 out · no price set"
+                 Tokens 151.5k in · 300 out · no price set · 151.8k of 150k tokens"
                     .to_string(),
             ]
         );
