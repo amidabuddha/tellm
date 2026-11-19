@@ -14,8 +14,10 @@
 //!   docs.x.ai and dev.meta.ai).
 //! - State: `store: false`; history is carried by raw input/output items in
 //!   `ChatRequest::history` / `ChatResponse::turn_items`.
-//! - System prompts: OpenAI uses top-level `instructions`; xAI currently
-//!   rejects `instructions`, so system prompts are sent as input message items.
+//! - System prompts: the first item of `input` on every provider, never
+//!   top-level `instructions`, so the prompt is part of the cached prefix.
+//!   The role is `developer` on OpenAI and Meta and `system` on xAI (checked
+//!   2026-11-19, see `system_message`).
 //! - Web search: OpenAI and Meta Model API use `{"type": "web_search"}`;
 //!   xAI uses `web_search` plus `x_search` for tellm's search toggle.
 //! - Image generation: `{"type": "image_generation"}` tool (OpenAI only);
@@ -277,13 +279,8 @@ fn request_body(
     max_effort: Option<&str>,
 ) -> Value {
     let mut input = Vec::new();
-    if is_xai && let Some(system) = &request.system {
-        // Checked 2026-07-04 against xAI Responses docs: `instructions` is
-        // rejected, so system prompts must ride as compatible input messages.
-        input.push(json!({
-            "role": "system",
-            "content": [{ "type": "input_text", "text": system }],
-        }));
+    if let Some(system) = &request.system {
+        input.push(system_message(system, is_xai));
     }
     input.extend(request.history.clone());
     input.push(user_message);
@@ -293,12 +290,6 @@ fn request_body(
         "input": input,
         "store": false,
     });
-
-    if !is_xai && let Some(system) = &request.system {
-        // Checked 2026-07-04 against OpenAI Responses docs: top-level
-        // `instructions` is the native system/developer guidance field.
-        body["instructions"] = json!(system);
-    }
 
     let effort = responses_effort(request.thinking, off_effort, max_effort);
     if let Some(effort) = effort {
@@ -322,6 +313,29 @@ fn request_body(
     }
 
     body
+}
+
+/// The system prompt as the first item of `input`, on every Responses
+/// provider. Top-level `instructions` is never sent, so the prompt is part of
+/// the prefix the provider caches. Checked 2026-11-19:
+/// - OpenAI (developers.openai.com, latest model and keep the prefix
+///   unchanged): models starting with GPT-6.2 append top-level
+///   `instructions` after `input` and bill them at the uncached input rate;
+///   reusable instructions belong in a `developer` message as the first item
+///   in `input`. Input messages take the roles user, assistant, system and
+///   developer, with `input_text` content parts (Responses reference).
+/// - Meta (dev.meta.ai, Responses API): input messages take the roles
+///   developer, system, user and assistant; `developer` is recommended for
+///   behavior instructions, and `system` content applies at the same level.
+/// - xAI (docs.x.ai, Responses reference and prompt caching): its examples
+///   put the system prompt first with the `system` role and never mention
+///   `developer`, so xAI keeps `system`.
+fn system_message(system: &str, is_xai: bool) -> Value {
+    let role = if is_xai { "system" } else { "developer" };
+    json!({
+        "role": role,
+        "content": [{ "type": "input_text", "text": system }],
+    })
 }
 
 fn tools(request: &ChatRequest, is_xai: bool) -> Vec<Value> {

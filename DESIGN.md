@@ -255,10 +255,18 @@ Notes:
   encrypted reasoning only on request (grok-4.7 always does), and Meta answers
   a replayed reasoning item without it with HTTP 400 (checked 2026-11-16
   against docs.x.ai and dev.meta.ai). OpenAI returns it by default and still
-  accepts the flag. OpenAI system prompts use
-  top-level `instructions`; xAI currently rejects `instructions`, so xAI
-  system prompts are sent as compatible input message items instead (checked
-  2026-07-04; still shown as input messages in 2026-07-09 Grok 4.5 docs).
+  accepts the flag.
+- Every Responses provider gets the system prompt as the first item of
+  `input`, never as top-level `instructions` (checked 2026-11-19). Models
+  starting with GPT-6.2 append `instructions` after `input` and bill them at
+  the uncached rate, and OpenAI says to put reusable instructions in a
+  `developer` message as the first input item (developers.openai.com, latest
+  model and keep the prefix unchanged). The role is `developer` for OpenAI
+  and Meta, whose Responses docs accept it and recommend it for behavior
+  instructions (dev.meta.ai), and `system` for xAI, whose docs put the
+  system prompt first with that role and never mention `developer`
+  (docs.x.ai). The role follows the provider detection in the next note,
+  not a per-model list.
 - A Responses request gets xAI or Meta handling when its base URL names the
   provider (`api.x.ai`, `api.meta.ai`) or, behind a proxy, when its model id
   starts with `grok-` or `muse-`; every Meta Model API id starts with `muse-`
