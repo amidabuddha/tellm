@@ -13,6 +13,9 @@
 //! - Web search / image generation: not part of this dialect —
 //!   `ProviderError::Unsupported` so the user gets told instead of guessing.
 //! - Images: `image_url` content parts (data URLs); documents: unsupported.
+//! - Context window: only OpenRouter documents an error for it, so only its
+//!   `error.metadata.error_type` becomes `ProviderError::ContextWindowExceeded`
+//!   (checked 2026-11-19, see [`OPENROUTER_CONTEXT_LENGTH_EXCEEDED`]).
 //! - Usage: `usage.prompt_tokens` includes cached input;
 //!   `prompt_tokens_details.cached_tokens` counts cache reads and
 //!   `prompt_tokens_details.cache_write_tokens` cache writes where the endpoint
@@ -195,10 +198,11 @@ impl Compat {
         let status = response.status();
         let response_body: Value = response.json().await?;
         if !status.is_success() {
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: api_error_message(&response_body),
-            });
+            return Err(api_error(
+                status.as_u16(),
+                &response_body,
+                is_openrouter_url(&self.chat_completions_url),
+            ));
         }
 
         Ok(response_body)
@@ -336,6 +340,29 @@ fn extract_text(message: &Value) -> String {
     }
 }
 
+/// OpenRouter's typed error for a request over the model's context window:
+/// HTTP 400 with `error.metadata.error_type` set to this value on chat
+/// completions (checked 2026-11-19 against openrouter.ai, errors and
+/// debugging). The chat-completions dialect has no shared code for it, and
+/// DeepSeek's error codes name none (checked 2026-11-19 against
+/// api-docs.deepseek.com), so only an openrouter.ai URL is read this way.
+pub const OPENROUTER_CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
+
+/// Turns an error response into a [`ProviderError`], telling a request over
+/// the context window apart from other API errors where the endpoint
+/// documents a code for it.
+fn api_error(status: u16, body: &Value, is_openrouter: bool) -> ProviderError {
+    let message = api_error_message(body);
+    let error_type = body
+        .pointer("/error/metadata/error_type")
+        .and_then(Value::as_str);
+    if is_openrouter && error_type == Some(OPENROUTER_CONTEXT_LENGTH_EXCEEDED) {
+        ProviderError::ContextWindowExceeded { status, message }
+    } else {
+        ProviderError::Api { status, message }
+    }
+}
+
 fn api_error_message(value: &Value) -> String {
     value
         .pointer("/error/message")
@@ -377,4 +404,33 @@ fn build_http_client(request_timeout: Duration) -> reqwest::Client {
         .timeout(request_timeout)
         .build()
         .expect("valid reqwest client configuration")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_openrouter_context_errors_are_read_as_the_context_window() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "message": "This endpoint's maximum context length is 131072 tokens.",
+                "metadata": { "error_type": "context_length_exceeded" }
+            }
+        });
+
+        assert!(matches!(
+            api_error(400, &body, true),
+            ProviderError::ContextWindowExceeded { status: 400, .. }
+        ));
+        assert!(matches!(
+            api_error(400, &body, false),
+            ProviderError::Api { status: 400, .. }
+        ));
+        assert!(matches!(
+            api_error(400, &json!({ "error": { "message": "bad" } }), true),
+            ProviderError::Api { status: 400, .. }
+        ));
+    }
 }

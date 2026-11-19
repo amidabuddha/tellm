@@ -87,7 +87,7 @@ pub struct ChatRequest {
     /// [`ChatResponse`]s of the **same wire format** (and normally the same
     /// model). Opaque to the runtime; interpreted only by the provider crate,
     /// which is also the only one to rewrite a kept turn after the runtime
-    /// pruned earlier turns or changed the tool list.
+    /// pruned or left out earlier turns or changed the tool list.
     pub history: Vec<serde_json::Value>,
     /// The new user turn, unified.
     pub input: Vec<ContentPart>,
@@ -181,6 +181,11 @@ pub enum ProviderError {
     Http(#[from] reqwest::Error),
     #[error("api error {status}: {message}")]
     Api { status: u16, message: String },
+    /// The provider said the request does not fit the model's context
+    /// window. A wire-format crate returns this only for the error its
+    /// provider documents for that; anything else stays [`Self::Api`].
+    #[error("the request exceeds the model's context window (api error {status}: {message})")]
+    ContextWindowExceeded { status: u16, message: String },
     #[error("model refused the request: {0}")]
     Refusal(String),
     #[error("not supported by this provider: {0}")]

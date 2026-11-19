@@ -62,6 +62,9 @@ pub enum ParsedRoute<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandAction {
     ResetHistory,
+    /// `/new summary`: summarize the conversation and carry the summary into
+    /// a new one.
+    SummarizeChat,
     ShowChatId,
     ShowMode {
         current: rooms::ChatMode,
@@ -168,6 +171,9 @@ pub enum KnownCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandReject {
+    UnknownNewOption {
+        value: String,
+    },
     MissingPairingCode,
     MissingMemoryFact,
     InvalidMemoryNumber {
@@ -227,7 +233,7 @@ pub fn parse<'a>(text: &'a str, bot_username: Option<&str>) -> ParsedRoute<'a> {
 
 pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) -> CommandAction {
     match command {
-        KnownCommand::New => CommandAction::ResetHistory,
+        KnownCommand::New => route_new(args),
         KnownCommand::Id => CommandAction::ShowChatId,
         KnownCommand::Mode => route_mode(args, context.settings),
         KnownCommand::Model => route_model(args, context),
@@ -268,6 +274,21 @@ pub fn pair_code<'a>(text: &'a str, bot_username: Option<&str>) -> Option<&'a st
             args,
         } => first_arg(args),
         _ => None,
+    }
+}
+
+/// `/new` starts over and `/new summary` carries a summary along. Anything
+/// else is refused rather than read as a plain `/new`, so a mistyped
+/// `summary` never throws the conversation away.
+fn route_new(args: &str) -> CommandAction {
+    match first_arg(args) {
+        None => CommandAction::ResetHistory,
+        Some(value) if value.eq_ignore_ascii_case("summary") => CommandAction::SummarizeChat,
+        Some(value) => CommandAction::Reject {
+            reason: CommandReject::UnknownNewOption {
+                value: value.to_string(),
+            },
+        },
     }
 }
 
@@ -783,6 +804,29 @@ mod tests {
         assert_eq!(
             route_command("/new"),
             Route::Command(CommandAction::ResetHistory)
+        );
+        assert_eq!(
+            route_command("/new Summary"),
+            Route::Command(CommandAction::SummarizeChat)
+        );
+        // Like /new, it is not owner-gated.
+        assert_eq!(
+            route_command_with(
+                "/new summary",
+                rooms::RoomSettings::default(),
+                None,
+                access::PrivilegedAccess::NotOwner,
+                &["claude"],
+            ),
+            Route::Command(CommandAction::SummarizeChat)
+        );
+        assert_eq!(
+            route_command("/new summery"),
+            Route::Command(CommandAction::Reject {
+                reason: CommandReject::UnknownNewOption {
+                    value: "summery".to_string(),
+                },
+            })
         );
         assert_eq!(
             route_command("/id"),

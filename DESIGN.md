@@ -53,7 +53,7 @@ equivalent, no router layer. Dispatch is a plain enum match in the binary.
 | root binary | Runtime loop, command router, sessions, pairing, wizard, local Ollama lifecycle |
 
 Inside the root binary, runtime-owned concerns are split into
-`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama,cost,memory}.rs`.
+`src/{runtime,model_turn,persistence,wizard,rooms,access,commands,ollama,cost,memory,summary}.rs`.
 The private `model_turn` module owns Telegram input/attachment normalization,
 provider-neutral request construction, provider dispatch and secret lookup,
 and model-response delivery. `runtime` retains access checks, cancellation,
@@ -64,7 +64,9 @@ lifecycle management for the narrowly supported local endpoint; `tellm-config`
 deliberately keeps only nonsecret config, secret storage, and validation. The
 private `cost` module turns a reply's usage into its cost line and keeps each
 room's running total. The private `memory` module owns the owner's memory file
-and the memory block it adds to the system prompt (see § Memory).
+and the memory block it adds to the system prompt (see § Memory). The private
+`summary` module owns the summary request and the summary block a new
+conversation carries (see § Summaries).
 
 ## Unified parameter set
 
@@ -95,16 +97,23 @@ state, so:
   provider's own history shape); the runtime appends them verbatim.
 - Switching a room's wire format resets the opaque history (announced to the
   user).
-- History stays memory-bounded: retain at most 32 complete provider-native
-  turns and approximately 4 MiB per room, pruning oldest whole turns so a
-  request/response pair is never split.
+- History is append-only within a conversation. Dropping its oldest turns
+  would change the prefix every provider caches, so a conversation that
+  grows too large is summarized into a new one instead (§ Summaries). About
+  4 MiB of history per room is a memory safety net: passing it also triggers
+  the summary. Only when summarizing fails, or a message-mode exchange alone
+  is over it, does tellm prune the oldest whole turns down to the cap, so a
+  request/response pair is never split, and it says in the chat how many
+  turns it dropped.
 - Verbatim replay holds only while history is append-only. When the runtime
-  itself changes what precedes the kept turns — pruning for the bound above,
-  or a `/websearch` toggle, which changes the tool list — it hands each kept
-  turn back to the wire-format crate that produced it and stores what that
-  crate says is still replayable; a turn returned empty is dropped whole. The
-  runtime still never inspects the items. Anthropic removes thinking blocks
-  (see Notes); the other wire formats keep their turns unchanged.
+  itself changes what precedes the kept turns (the last-resort pruning
+  above, a summary request that leaves the oldest turns out, or a
+  `/websearch` toggle, which changes the tool list), it hands each kept turn
+  back to the wire-format crate that produced it and sends or stores what
+  that crate says is still replayable; a turn returned empty is dropped
+  whole. The runtime still never inspects the items. Anthropic removes
+  thinking blocks (see Notes); the other wire formats keep their turns
+  unchanged.
 
 Thinking-level translation (verified against live provider docs 2026-07-05;
 Gemini 3.6 Flash refreshed 2026-07-26;
@@ -204,6 +213,20 @@ Notes:
   so, while the stored turn keeps the model's own content. A reply cut off
   before any text is a provider error, and the error reply suggests
   `/reasoning low` or a higher `max_output_tokens`.
+- A request over the model's context window is told apart from other API
+  errors only where the provider documents an error for it (checked
+  2026-11-19): Anthropic's HTTP 400 `invalid_request_error` "prompt is too
+  long" (platform.claude.com, context windows); OpenAI's `error.code`
+  `context_length_exceeded` (developers.openai.com: the Responses reference
+  says only that such a request fails with a 400, and OpenAI's Agents API
+  error table defines this code as "Input exceeds the model's context
+  window"); and OpenRouter's `error.metadata.error_type`
+  `context_length_exceeded` on chat completions (openrouter.ai, errors).
+  xAI, Meta, Gemini, DeepSeek and the rest of the chat-completions dialect
+  document none, so theirs stay ordinary API errors. A recognized one
+  becomes `ProviderError::ContextWindowExceeded`: the chat's error reply
+  suggests `/new summary`, and a summary request is retried with fewer
+  turns (§ Summaries).
 - A reply with neither text nor an image is a failed turn in every wire
   format: nothing is stored and the chat gets an error. Stored, it would be
   replayed as a question without a visible answer, and a reasoning-only turn
@@ -215,8 +238,9 @@ Notes:
   platform.claude.com, preserved thinking / prefix checks). Replaying one
   after any of that changed is a 400 on Claude Fable 5.2 and can be one on the
   other models with preserved thinking. `system` cannot change under a kept
-  history (`/role` resets it), so the edits tellm makes are pruning and the
-  web-search tool toggle. After either, `tellm-anthropic` removes every
+  history (`/role` resets it), so the edits tellm makes are the last-resort
+  pruning, a summary request that leaves older turns out, and the
+  web-search tool toggle. After any of them, `tellm-anthropic` removes every
   `thinking` and `redacted_thinking` block from the kept turns — all of them,
   because a block may not be left out from between two that stay — and the
   model continues without that earlier reasoning. An assistant message that
@@ -231,10 +255,18 @@ Notes:
   encrypted reasoning only on request (grok-4.7 always does), and Meta answers
   a replayed reasoning item without it with HTTP 400 (checked 2026-11-16
   against docs.x.ai and dev.meta.ai). OpenAI returns it by default and still
-  accepts the flag. OpenAI system prompts use
-  top-level `instructions`; xAI currently rejects `instructions`, so xAI
-  system prompts are sent as compatible input message items instead (checked
-  2026-07-04; still shown as input messages in 2026-07-09 Grok 4.5 docs).
+  accepts the flag.
+- Every Responses provider gets the system prompt as the first item of
+  `input`, never as top-level `instructions` (checked 2026-11-19). Models
+  starting with GPT-6.2 append `instructions` after `input` and bill them at
+  the uncached rate, and OpenAI says to put reusable instructions in a
+  `developer` message as the first input item (developers.openai.com, latest
+  model and keep the prefix unchanged). The role is `developer` for OpenAI
+  and Meta, whose Responses docs accept it and recommend it for behavior
+  instructions (dev.meta.ai), and `system` for xAI, whose docs put the
+  system prompt first with that role and never mention `developer`
+  (docs.x.ai). The role follows the provider detection in the next note,
+  not a per-model list.
 - A Responses request gets xAI or Meta handling when its base URL names the
   provider (`api.x.ai`, `api.meta.ai`) or, behind a proxy, when its model id
   starts with `grok-` or `muse-`; every Meta Model API id starts with `muse-`
@@ -351,10 +383,18 @@ calls a billing API and never fetches prices.
   carries it; the stored turn keeps the model's own content, so the model
   never sees its bill. An estimate is marked `≈`; a chat total that includes
   replies with no known cost is marked `≥`.
+- The line ends with the conversation's size against its token budget, in
+  the same token format, for example `· 48k of 150k tokens` (§ Summaries).
+  It is left out when the size is unknown: the provider reported no usage,
+  or the room is in message mode. `/cost` shows the size too.
+- `/cost` also shows the conversation's cache hit rate: cache reads as a
+  share of all input tokens (ordinary, cache reads and cache writes), summed
+  over its replies. It appears once a reply has reported nonzero input.
 - Each room keeps the running total of its current conversation in memory,
   like the conversation itself. A reply's cost joins the total only when its
   turn is committed, so a reply dropped by a reset never counts toward the
-  new chat. The total starts over with the conversation: `/new`, `/model`,
+  new chat. A summary reply (§ Summaries) counts toward the conversation it
+  summarizes, and the conversation that carries it starts at zero. The total starts over with the conversation: `/new`, `/model`,
   `/role`, `/mode message`, and the terminal `reset`. A failed reply is not
   counted even though the provider may have billed it, so the provider's own
   billing stays the source of truth.
@@ -386,7 +426,8 @@ calls a billing API and never fetches prices.
   in other people's chats unless the owner runs `/memory on` there, so the
   owner's facts reach no one else by default.
 - System prompt: the room's role, a blank line, then a header line and the
-  facts as a bullet list.
+  facts as a bullet list. A carried summary follows the memory block
+  (§ Summaries).
 - A conversation keeps the memory it started with. The runtime reads the file
   whenever it builds a request in a room with memory on, but uses it only for
   a request that sends no history: the first turn of a conversation and every
@@ -400,6 +441,57 @@ calls a billing API and never fetches prices.
 - Privacy: in a room with memory on, every request carries the facts to that
   room's provider. tellm does not log them.
 
+## Summaries
+
+- `/new summary`, or tellm on its own when a chat reaches its budget, asks
+  the room's current model to summarize the conversation, sends the summary
+  to the chat, and starts a new conversation that carries it. Like `/new`,
+  `/new summary` is not owner-gated.
+- The summary request is an ordinary turn of the conversation: the same
+  model, system prompt, full history, tools, web-search and image settings,
+  and effort as any turn in the room, built by the same request path. Only
+  the user message differs: a fixed instruction in `summary.rs` asking for
+  compact notes (facts, decisions and why, open questions, next steps) in
+  the conversation's language, without web search. The request prefix is
+  therefore the one the provider has cached.
+- Its reply is the old conversation's last reply: its cost joins that
+  conversation's total and gets the usual cost line, but its turn is not
+  stored. The conversation then resets, and the room keeps the summary text,
+  in memory only like the conversation.
+- The new conversation's system prompt is the role, the memory block, and
+  then "Summary of the earlier part of this conversation:" with the summary,
+  each separated by a blank line. The summary is fixed from the reset until
+  the conversation ends, so the system prompt stays byte-stable like the
+  memory block. `/new`, `/model`, `/role`, `/mode message` and the terminal
+  `reset` clear it with the conversation.
+- A chat without history, or in message mode, has nothing to summarize and
+  is told so. A failed summary request, or a reply without text, leaves the
+  conversation unchanged, and the chat says so.
+- Budget: after each committed chat-mode reply the room records the
+  conversation's size, that reply's input tokens in every bucket (ordinary,
+  cache reads, cache writes) plus its output tokens, as the provider
+  reported them. Unknown usage records no size, and message mode records
+  none. When the size reaches `CONTEXT_SUMMARY_TOKENS` (150,000), or the
+  history passes the 4 MiB cap, tellm sends a short notice and runs the
+  summary right after delivering that reply, while the provider's cache
+  still holds the conversation. It runs in the chat's worker, so the next
+  message waits for it. If it fails, the history stays, and the check runs
+  again after the next reply.
+- The budget is one constant for every provider, with no per-model or
+  config setting (checked 2026-11-19). Anthropic's server-side compaction
+  starts at 150,000 input tokens by default, and OpenAI's compaction
+  examples use `compact_threshold: 200000`. The lowest long-context price
+  step among the presets is Grok 4.7's: a prompt of 200K tokens or more
+  bills the whole request at the higher rate. GPT-6.2 Astra's step is above
+  272K input tokens, and Claude Fable 5.2 has none. Gemini 4 Carbon and Muse
+  Wonder have windows of about 1M tokens, Grok 4.7 500K.
+- When the provider says a summary request is over the model's context
+  window (see Notes in § Unified parameter set), the request is sent again
+  with the older half of the turns left out, until it fits or a single turn
+  was too much. The kept turns go through their wire-format crate as after
+  any history edit (§ Opaque provider state), and the summary message says
+  how many of the oldest turns it leaves out.
+
 ## Runtime model (ported from console-chat-gpt)
 
 - Long polling (`getUpdates`, modest timeout so terminal controls stay responsive).
@@ -410,6 +502,9 @@ calls a billing API and never fetches prices.
   backs up behind a slow turn, further messages are dropped with a busy
   notice instead of blocking the poll loop for every other chat. At most one
   busy-notice send may be outstanding per room.
+- After each committed reply, the chat's worker checks the conversation's
+  budget (§ Summaries) before it takes the next message, and summarizes the
+  chat into a new one when it is due.
 - In-memory conversations; **room settings persist** across restarts
   (model pin, mode, role, optional thinking override, web-search toggle,
   image-generation toggle, cost-line toggle, memory toggle) in `config_dir()/rooms.toml` — runtime state
@@ -452,7 +547,7 @@ calls a billing API and never fetches prices.
 
 ### Telegram commands (v1)
 
-`/new`, `/id`, `/mode`, `/model` (incl. `pin`/`unpin`/`add`, owner-gated), `/role`,
+`/new` (incl. `summary`), `/id`, `/mode`, `/model` (incl. `pin`/`unpin`/`add`, owner-gated), `/role`,
 `/reasoning`, `/websearch`, `/imagegen`, `/cost`, `/memory`, `/remember`,
 `/forget` (the three memory commands owner-gated), `/allow`, `/deny`, `/pair`,
 `/ollama unload` (owner-gated), `/shutdown` (owner-gated), `/help`.
@@ -462,16 +557,20 @@ MCP tooling.
 Known commands accept Telegram's group form (`/cmd@BotName`); commands
 addressed to a different bot are ignored, and unknown slash commands pass
 through as normal model input rather than producing "command not found" noise.
-Argument semantics: `/id` replies with the current Telegram chat id,
+Argument semantics: `/new [summary]` starts a new conversation, and with
+`summary` carries a summary of this one into it (§ Summaries); any other
+argument is refused, so a mistyped `summary` never ends a conversation. `/id`
+replies with the current Telegram chat id,
 `/mode [chat|message]`, `/model [key]`, `/role [text]`
 with `clear|off|none|reset` clearing the role, `/reasoning
 [default|off|low|medium|high|max]`, `/websearch [on|off|status]` (no argument
 toggles), `/imagegen [on|off|status]` (no argument toggles), `/cost
 [on|off|status]` (no argument or `status` shows the conversation's running
-cost and token breakdown; `on`/`off` shows or hides the cost line under each
-reply, on by default), `/memory [on|off|status]` (no argument or `status`
-lists the saved facts with numbers, the characters used, whether memory is on
-in this room, and the file's path; `on`/`off` sets the room's memory setting),
+cost, token breakdown, cache hit rate and size; `on`/`off` shows or hides
+the cost line under each reply, on by default), `/memory [on|off|status]` (no
+argument or `status` lists the saved facts with numbers, the characters used,
+whether memory is on in this room, and the file's path; `on`/`off` sets the
+room's memory setting),
 `/remember TEXT` (whitespace and line breaks collapse to one line; a fact
 already saved, ignoring case, is not added twice), `/forget N` (`#N` also
 accepted),
@@ -676,7 +775,8 @@ are written. Network fallback chains get a small mocked-Telegram harness.
 
 - No MCP, no tools beyond provider-native web search / image generation.
 - No streaming. No conversation persistence (the curated memory in § Memory
-  holds facts, not conversations). No multi-messenger.
+  holds facts, not conversations, and a carried summary lives in memory
+  only, like the conversation). No multi-messenger.
 - No OpenAI Assistants, no AI-managed model routing.
 - No PDF text extraction (native provider passthrough instead).
 

@@ -84,7 +84,7 @@ All direct, with no middleware.
 | Command | Does |
 |---|---|
 | `/help` | List commands |
-| `/new` | Start a new conversation in this chat |
+| `/new` · `/new summary` | Start a new conversation, or carry a summary of this one into it |
 | `/id` | Show this chat's Telegram id |
 | `/mode chat\|message` | Multi-turn conversation, or one question per message |
 | `/model [KEY]` | Show or switch this chat's model |
@@ -187,7 +187,11 @@ thinking = "off"
 
 ### Reply costs
 
-Each reply ends with a line such as `Cost ≈ $0.031 (2 searches) · this chat ≈ $0.42`.
+Each reply ends with a line such as
+`Cost ≈ $0.031 (2 searches) · this chat ≈ $0.42 · 48k of 150k tokens`. The
+last part is the chat's size: at 150k tokens tellm summarizes it into a fresh
+chat. `/cost` shows the same totals in more detail, including how much of the
+input came from the provider's cache.
 xAI and OpenRouter report what they charged. For other providers tellm
 multiplies the reported tokens by the model's price table; the built-in Claude
 and OpenAI entries include one. Add one for any other model:
@@ -242,8 +246,10 @@ On shutdown it unloads the models this session used and stops the server again
 if it started it. Images are sent only to models whose `ollama show` lists
 `vision`. Other ports and hosts are treated as ordinary endpoints.
 
-**Limits:** each chat keeps at most 32 turns or about 4 MiB of history, and
-attachments can be up to 20 MiB. Edited messages are ignored, so an edit never triggers a
+**Limits:** when a chat reaches 150k tokens (or 4 MiB of history), tellm
+summarizes it right after that reply and continues in a fresh chat that
+carries the summary. `/new summary` does the same at any time. Attachments can
+be up to 20 MiB. Edited messages are ignored, so an edit never triggers a
 second paid request.
 
 ## Troubleshooting

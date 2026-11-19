@@ -391,6 +391,10 @@ fn extract_images(steps: &[Value]) -> Vec<GeneratedImage> {
         .collect()
 }
 
+/// Error messages pass through as [`ProviderError::Api`]. Google's API
+/// error codes include none for input over the model's context window
+/// (checked 2026-11-19 against ai.google.dev, API errors), so tellm does not
+/// guess one from the message.
 fn api_error_message(body: &Value) -> String {
     body.get("error")
         .and_then(|error| error.get("message"))

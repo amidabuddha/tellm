@@ -124,7 +124,7 @@ async fn chat_maps_request_and_preserves_output_items_verbatim() {
 
     let body = requests[0].json_body();
     assert_eq!(body["model"], "gpt-5.5");
-    assert_eq!(body["instructions"], "Be concise.");
+    assert_missing(&body, "instructions");
     assert_eq!(body["store"], false);
     assert_missing(&body, "max_output_tokens");
     assert_eq!(body["reasoning"], json!({ "effort": "high" }));
@@ -138,13 +138,21 @@ async fn chat_maps_request_and_preserves_output_items_verbatim() {
     );
 
     let input = body["input"].as_array().unwrap();
-    assert_eq!(input.len(), 5);
+    assert_eq!(input.len(), 6);
     assert_eq!(
-        input[1]["encrypted_content"], "previous-opaque-reasoning",
+        input[0],
+        json!({
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": "Be concise." }]
+        }),
+        "the system prompt leads the cacheable prefix"
+    );
+    assert_eq!(
+        input[2]["encrypted_content"], "previous-opaque-reasoning",
         "history must be sent back verbatim"
     );
     assert_eq!(
-        input[4],
+        input[5],
         json!({
             "role": "user",
             "content": [
@@ -167,7 +175,7 @@ async fn chat_maps_request_and_preserves_output_items_verbatim() {
 }
 
 #[tokio::test]
-async fn xai_uses_input_system_message_and_search_tools_without_instructions() {
+async fn xai_uses_a_system_role_input_message_and_search_tools() {
     let mock = MockOpenAi::start(vec![MockResponse::json(
         200,
         json!({
@@ -246,13 +254,17 @@ async fn meta_model_api_uses_responses_with_xhigh_search_and_no_generation() {
 
     assert_eq!(response.text, "ok");
     let body = mock.requests()[0].json_body();
-    assert_eq!(body["instructions"], "Be concise.");
+    assert_missing(&body, "instructions");
     assert_eq!(body["reasoning"], json!({ "effort": "xhigh" }));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["tools"], json!([{ "type": "web_search" }]));
     assert_eq!(
         body["input"],
         json!([
+            {
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "Be concise." }]
+            },
             {
                 "role": "user",
                 "content": [{ "type": "input_text", "text": "Search the web." }]
@@ -357,6 +369,11 @@ async fn off_reasoning_and_no_options_omit_optional_fields() {
     let body = mock.requests()[0].json_body();
     assert_eq!(body["store"], false);
     assert_missing(&body, "instructions");
+    assert_eq!(
+        body["input"],
+        json!([{ "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] }]),
+        "no system prompt, no system message"
+    );
     assert_missing(&body, "max_output_tokens");
     assert_missing(&body, "reasoning");
     assert_missing(&body, "include");
@@ -449,6 +466,54 @@ async fn api_error_uses_responses_error_message() {
     assert!(
         matches!(error, ProviderError::Api { status: 400, message } if message == "invalid encrypted_content")
     );
+}
+
+fn context_length_error() -> MockResponse {
+    MockResponse::json(
+        400,
+        json!({
+            "error": {
+                "message": "Your input exceeds the context window of this model.",
+                "type": "invalid_request_error",
+                "param": "input",
+                "code": "context_length_exceeded"
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn openai_context_length_error_is_its_own_error() {
+    let mock = MockOpenAi::start(vec![context_length_error()]);
+    let mut req = request();
+    req.image_generation = false;
+
+    let error = client(&mock).chat(&req).await.unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ProviderError::ContextWindowExceeded { status: 400, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn xai_and_meta_errors_are_not_read_with_openai_codes() {
+    for model in ["grok-4.7", "muse-wonder-1.0"] {
+        let mock = MockOpenAi::start(vec![context_length_error()]);
+        let mut req = request();
+        req.model = model.to_string();
+        req.image_generation = false;
+
+        let error = client(&mock).chat(&req).await.unwrap_err();
+
+        assert!(
+            matches!(&error, ProviderError::Api { status: 400, .. }),
+            "{model}: {error:?}"
+        );
+    }
 }
 
 #[tokio::test]

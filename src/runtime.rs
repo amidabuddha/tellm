@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use tellm_config::{Config, WireFormat, secrets};
-use tellm_core::ContentPart;
+use tellm_core::{ChatRequest, ChatResponse, ContentPart};
 use tellm_telegram::{IncomingMessage, Telegram, TelegramError};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc};
@@ -20,6 +20,7 @@ use crate::model_turn::{self, PreparedChatRequest};
 use crate::ollama;
 use crate::persistence::{self, Persistence};
 use crate::rooms::{self, ChatMode, RoomState, RoomStates};
+use crate::summary;
 
 const LONG_POLL_TIMEOUT_S: u32 = 20;
 const GET_UPDATES_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -803,7 +804,7 @@ async fn handle_allowed_message(
         {
             Route::Command(action) => {
                 log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Command);
-                return handle_command(chat_id, action, handles).await;
+                return handle_command(chat_id, action, handles, cancelled).await;
             }
             Route::Ignore => {
                 log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
@@ -874,6 +875,7 @@ async fn handle_command(
     chat_id: i64,
     action: CommandAction,
     handles: &RuntimeHandles,
+    cancelled: &AtomicBool,
 ) -> Result<(), String> {
     match action {
         CommandAction::ResetHistory => {
@@ -884,6 +886,11 @@ async fn handle_command(
                 .send_message(chat_id, "Started a new chat.")
                 .await
                 .map_err(|error| error.to_string())
+        }
+        CommandAction::SummarizeChat => {
+            summarize_into_new_chat(chat_id, handles, cancelled, summary::Trigger::Command)
+                .await
+                .map(|_| ())
         }
         CommandAction::ShowChatId => {
             send_command_reply(handles, chat_id, &chat_id_reply(chat_id)).await
@@ -1131,7 +1138,13 @@ async fn handle_command(
                     .models
                     .get(&model_key)
                     .is_some_and(|model| model.price.is_some());
-                cost::summary(&room.cost, room.settings.show_cost, &model_key, has_price)
+                cost::summary(
+                    &room.cost,
+                    room.settings.show_cost,
+                    &model_key,
+                    has_price,
+                    room.context_tokens,
+                )
             };
             send_command_reply(handles, chat_id, &summary).await
         }
@@ -1270,16 +1283,23 @@ async fn handle_model_message(
                     )
                     .then(|| {
                         room.cost.record(&reply_cost);
+                        room.record_context(reply_cost.usage.as_ref());
                         room.memory = prepared.memory.clone();
                         room.settings
                             .show_cost
-                            .then(|| cost::cost_line(&reply_cost, &room.cost))
+                            .then(|| cost::cost_line(&reply_cost, &room.cost, room.context_tokens))
                     })
                 })
             };
             match committed {
                 Some(cost_line) if worker_can_reply(chat_id, handles, cancelled).await => {
-                    model_turn::send_response(&handles.telegram, chat_id, response, cost_line).await
+                    let delivered =
+                        model_turn::send_response(&handles.telegram, chat_id, response, cost_line)
+                            .await;
+                    // Even an undelivered reply was committed, so the bound
+                    // applies either way.
+                    let bounded = keep_chat_within_budget(chat_id, handles, cancelled).await;
+                    delivered.and(bounded)
                 }
                 _ => Ok(()),
             }
@@ -1298,7 +1318,9 @@ async fn handle_model_message(
             // the same failure.
             log::warn!(
                 target: "tellm::model",
-                "call failed chat_id={chat_id} error={error:?}"
+                "call failed chat_id={chat_id} context_window={} error={:?}",
+                error.context_window,
+                error.message
             );
             if restored && worker_can_reply(chat_id, handles, cancelled).await {
                 let _ = handles
@@ -1307,6 +1329,205 @@ async fn handle_model_message(
                     .await;
             }
             Ok(())
+        }
+    }
+}
+
+/// Runs after each committed reply. A chat whose context reached its token
+/// budget, or whose history passed the byte cap, is summarized into a new
+/// one right away: the provider's cache still holds the conversation, and
+/// this runs in the chat's worker, so the next message waits for it. When
+/// summarizing fails (or a message-mode exchange alone is over the cap), the
+/// oldest whole turns are dropped to the cap instead, and the chat is told.
+async fn keep_chat_within_budget(
+    chat_id: i64,
+    handles: &RuntimeHandles,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let due = {
+        let rooms = handles.rooms.lock().await;
+        rooms.get(chat_id).and_then(RoomState::summary_due)
+    };
+    if let Some(trigger) = due {
+        if !worker_can_reply(chat_id, handles, cancelled).await {
+            return Ok(());
+        }
+        if let Some(notice) = trigger.notice() {
+            send_command_reply(handles, chat_id, &notice).await?;
+        }
+        if summarize_into_new_chat(chat_id, handles, cancelled, trigger).await? {
+            return Ok(());
+        }
+    }
+
+    let dropped = {
+        let mut rooms = handles.rooms.lock().await;
+        rooms
+            .get_mut(chat_id)
+            .map_or(0, RoomState::prune_to_byte_cap)
+    };
+    if dropped > 0 {
+        log::warn!(
+            target: "tellm::history",
+            "history over the byte cap; oldest turns dropped chat_id={chat_id} turns={dropped}"
+        );
+        if worker_can_reply(chat_id, handles, cancelled).await {
+            send_command_reply(handles, chat_id, &summary::pruned_notice(dropped)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Asks the room's model to summarize the conversation and starts a new
+/// conversation that carries the summary (`/new summary`, or a chat that
+/// reached its budget). The request is built exactly like a turn in the room
+/// (model, system prompt, history, tools and effort), so only its user
+/// message differs from what the provider has cached. The summary is the old
+/// conversation's last reply: its cost joins that conversation's total. A
+/// failed request leaves the conversation as it was. Returns whether the
+/// conversation now continues from a summary.
+async fn summarize_into_new_chat(
+    chat_id: i64,
+    handles: &RuntimeHandles,
+    cancelled: &AtomicBool,
+    trigger: summary::Trigger,
+) -> Result<bool, String> {
+    let nothing_to_summarize = {
+        let mut rooms = handles.rooms.lock().await;
+        let room = rooms.get_or_default(chat_id);
+        match room.settings.mode {
+            ChatMode::Message => Some(summary::NOTHING_TO_SUMMARIZE_IN_MESSAGE_MODE),
+            ChatMode::Chat if room.history.is_empty() => Some(summary::NOTHING_TO_SUMMARIZE),
+            ChatMode::Chat => None,
+        }
+    };
+    if let Some(reply) = nothing_to_summarize {
+        send_command_reply(handles, chat_id, reply).await?;
+        return Ok(false);
+    }
+
+    let input = vec![ContentPart::Text {
+        text: summary::SUMMARY_REQUEST.to_string(),
+    }];
+    let prepared = build_chat_request(chat_id, input, handles).await?;
+    let turns = {
+        let rooms = handles.rooms.lock().await;
+        rooms
+            .get(chat_id)
+            .filter(|room| room.generation() == prepared.generation)
+            .map(RoomState::turn_history)
+    };
+    let Some(turns) = turns.filter(|_| !prepared.request.history.is_empty()) else {
+        // The room's model now uses another wire format than the history
+        // was written in, so there is nothing this model can replay. Put the
+        // history back; the next ordinary turn announces the reset.
+        let mut rooms = handles.rooms.lock().await;
+        if let Some(room) = rooms.get_mut(chat_id) {
+            room.restore_failed_turn(prepared.generation, prepared.rollback);
+        }
+        drop(rooms);
+        send_command_reply(handles, chat_id, summary::NOTHING_TO_SUMMARIZE).await?;
+        return Ok(false);
+    };
+
+    let typing = AbortOnDrop(spawn_typing_indicator(handles.telegram.clone(), chat_id));
+    let (response, left_out) = send_summary_request(prepared.request, &turns, |request| {
+        let model_config = prepared.model_config.clone();
+        async move { model_turn::dispatch_provider(&model_config, &request).await }
+    })
+    .await;
+    typing.abort();
+
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            log::warn!(
+                target: "tellm::model",
+                "summary failed chat_id={chat_id} error={:?}",
+                error.message
+            );
+            let restored = {
+                let mut rooms = handles.rooms.lock().await;
+                rooms.get_mut(chat_id).is_some_and(|room| {
+                    room.restore_failed_turn(prepared.generation, prepared.rollback)
+                })
+            };
+            if restored && worker_can_reply(chat_id, handles, cancelled).await {
+                let reply = summary::failed_reply(trigger, &error.message);
+                send_command_reply(handles, chat_id, &reply).await?;
+            }
+            return Ok(false);
+        }
+    };
+    if !worker_can_reply(chat_id, handles, cancelled).await {
+        return Ok(false);
+    }
+
+    let summary = response.text.trim().to_string();
+    let reply_cost = cost::ReplyCost::new(response.usage, prepared.model_config.price.as_ref());
+    let committed = {
+        let mut rooms = handles.rooms.lock().await;
+        rooms.get_mut(chat_id).and_then(|room| {
+            (room.generation() == prepared.generation).then(|| {
+                room.cost.record(&reply_cost);
+                room.record_context(reply_cost.usage.as_ref());
+                let cost_line = room
+                    .settings
+                    .show_cost
+                    .then(|| cost::cost_line(&reply_cost, &room.cost, room.context_tokens));
+                room.continue_from_summary(summary.clone());
+                cost_line
+            })
+        })
+    };
+    let Some(cost_line) = committed else {
+        return Ok(false);
+    };
+    if worker_can_reply(chat_id, handles, cancelled).await {
+        let mut reply = summary::carried_reply(&summary, left_out);
+        if let Some(line) = cost_line {
+            reply = model_turn::with_cost_line(&reply, &line);
+        }
+        send_command_reply(handles, chat_id, &reply).await?;
+    }
+    Ok(true)
+}
+
+/// Sends a summary request. When the provider says it is over the model's
+/// context window, the request is sent again with the older half of the
+/// turns left out, until it fits or a single turn was too much. Returns the
+/// outcome and how many of the oldest turns the summary had to leave out.
+async fn send_summary_request<F, Sent>(
+    mut request: ChatRequest,
+    turns: &rooms::TurnHistory,
+    mut send: F,
+) -> (Result<ChatResponse, model_turn::TurnError>, usize)
+where
+    F: FnMut(ChatRequest) -> Sent,
+    Sent: std::future::Future<Output = Result<ChatResponse, model_turn::TurnError>>,
+{
+    let mut sent = turns.len();
+    loop {
+        let result = send(request.clone()).await.and_then(|response| {
+            if response.text.trim().is_empty() {
+                Err(summary::EMPTY_SUMMARY_ERROR.to_string().into())
+            } else {
+                Ok(response)
+            }
+        });
+        match result {
+            Err(error) if error.context_window => match summary::fewer_turns(sent) {
+                Some(keep) => {
+                    log::info!(
+                        target: "tellm::model",
+                        "summary request over the context window; retrying with fewer turns sent={sent} keep={keep}"
+                    );
+                    sent = keep;
+                    request.history = turns.newest(keep);
+                }
+                None => return (Err(error), turns.len() - sent),
+            },
+            result => return (result, turns.len() - sent),
         }
     }
 }
@@ -2307,6 +2528,9 @@ fn format_deny_chat_reply(chat_id: i64, result: &DenyChatConfigResult) -> String
 
 fn format_reject(reason: CommandReject) -> String {
     match reason {
+        CommandReject::UnknownNewOption { value } => format!(
+            "Unknown /new option \"{value}\". Use /new to start over, or /new summary to carry a summary of this chat into the new one."
+        ),
         CommandReject::MissingPairingCode => "Usage: /pair CODE.".to_string(),
         CommandReject::MissingMemoryFact => {
             "Usage: /remember TEXT, for example /remember I have two kids, aged 7 and 10."
@@ -2399,7 +2623,7 @@ fn help_text(pinned_model_key: Option<&str>) -> String {
 }
 
 const HELP_TEXT: &str = "\
-- /new - reset this chat
+- /new [summary] - start a new chat, or carry a summary of this one into it
 - /id - show this Telegram chat id
 - /mode chat|message - show or set conversation mode
 - /model KEY - show or set model
@@ -2425,6 +2649,7 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
 
     use tellm_config::ModelConfig;
+    use tellm_test_support::{MockHttpServer, MockResponse};
 
     use super::*;
     use crate::rooms::HistoryReset;
@@ -3057,6 +3282,464 @@ mod tests {
         assert_eq!(capabilities.endpoint, "Meta Model API Responses");
     }
 
+    /// Runtime handles for chat 42 with a keyless compat model, where both
+    /// Telegram and the provider are local mock servers.
+    fn mock_handles(telegram: &MockHttpServer, provider: &MockHttpServer) -> RuntimeHandles {
+        let mut model = test_model(WireFormat::Compat, &[]);
+        model.model_name = "local-model".to_string();
+        model.base_url = Some(format!("{}/v1", provider.base_url()));
+        model.api_key_secret = None;
+        let config = Config {
+            default_model: "local".to_string(),
+            models: BTreeMap::from([("local".to_string(), model)]),
+            telegram: tellm_config::TelegramConfig {
+                allowed_chat_ids: vec![42],
+                owner_user_ids: Vec::new(),
+            },
+        };
+        let access = AccessControl::new(AccessConfig::from_config(&config));
+        let (persistence, _writer) =
+            persistence::spawn_with(|_config: Config| Ok(()), |_settings| Ok(()))
+                .expect("spawn persistence writer");
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        RuntimeHandles {
+            telegram: Telegram::with_base_urls(
+                "test-token",
+                telegram.base_url(),
+                telegram.base_url(),
+            ),
+            config: Arc::new(Mutex::new(config)),
+            rooms: Arc::new(Mutex::new(RoomStates::default())),
+            access: Arc::new(Mutex::new(access)),
+            terminal_prompts: Arc::new(StdMutex::new(None)),
+            bot_username: None,
+            shutdown_tx,
+            persistence,
+            workers: Arc::new(StdMutex::new(BTreeMap::new())),
+            queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
+        }
+    }
+
+    fn telegram_mock() -> MockHttpServer {
+        MockHttpServer::start(
+            (0..12)
+                .map(|_| MockResponse::json(200, serde_json::json!({ "ok": true, "result": true })))
+                .collect(),
+        )
+    }
+
+    fn completion(text: &str, prompt_tokens: u64, completion_tokens: u64) -> MockResponse {
+        MockResponse::json(
+            200,
+            serde_json::json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": text },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens
+                }
+            }),
+        )
+    }
+
+    fn compat_turn(question: &str, answer: &str) -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "role": "user", "content": question }),
+            serde_json::json!({ "role": "assistant", "content": answer }),
+        ]
+    }
+
+    /// The text of every message tellm sent to the chat.
+    fn sent_texts(telegram: &MockHttpServer) -> Vec<String> {
+        telegram
+            .requests()
+            .iter()
+            .filter(|request| request.path.ends_with("/sendRichMessage"))
+            .map(|request| {
+                request.json_body()["rich_message"]["markdown"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn new_summary_sends_an_ordinary_turn_and_carries_the_reply_into_a_new_chat() {
+        let telegram = telegram_mock();
+        let provider =
+            MockHttpServer::start(vec![completion("- Moving to Sofia in May.", 1_200, 80)]);
+        let handles = mock_handles(&telegram, &provider);
+        {
+            let mut rooms = handles.rooms.lock().await;
+            let room = rooms.get_or_default(42);
+            room.settings.role = Some("Be brief.".to_string());
+            room.append_turn(WireFormat::Compat, compat_turn("I move in May.", "Noted."));
+            room.cost.record(&cost::ReplyCost::new(
+                Some(tellm_core::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                None,
+            ));
+        }
+
+        summarize_into_new_chat(
+            42,
+            &handles,
+            &AtomicBool::new(false),
+            summary::Trigger::Command,
+        )
+        .await
+        .unwrap();
+
+        // Same system prompt and history as an ordinary turn; only the user
+        // message is the summary instruction.
+        let body = provider.requests()[0].json_body();
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": "I move in May." },
+                { "role": "assistant", "content": "Noted." },
+                { "role": "user", "content": summary::SUMMARY_REQUEST }
+            ])
+        );
+
+        let rooms = handles.rooms.lock().await;
+        let room = rooms.get(42).unwrap();
+        assert!(room.history.is_empty());
+        assert_eq!(room.summary.as_deref(), Some("- Moving to Sofia in May."));
+        assert_eq!(room.cost, cost::ChatCost::default());
+        drop(rooms);
+
+        let sent = sent_texts(&telegram);
+        assert_eq!(
+            sent,
+            vec![
+                "Summary carried into a new chat:\n\n- Moving to Sofia in May.\n\n\
+                 Tokens 1.2k in · 80 out · no price set · 1.3k of 150k tokens"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_keeps_the_conversation() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(vec![MockResponse::json(
+            500,
+            serde_json::json!({ "error": { "message": "boom" } }),
+        )]);
+        let handles = mock_handles(&telegram, &provider);
+        let turn = compat_turn("I move in May.", "Noted.");
+        handles
+            .rooms
+            .lock()
+            .await
+            .get_or_default(42)
+            .append_turn(WireFormat::Compat, turn.clone());
+
+        summarize_into_new_chat(
+            42,
+            &handles,
+            &AtomicBool::new(false),
+            summary::Trigger::Command,
+        )
+        .await
+        .unwrap();
+
+        let rooms = handles.rooms.lock().await;
+        let room = rooms.get(42).unwrap();
+        assert_eq!(room.history, turn);
+        assert_eq!(room.summary, None);
+        drop(rooms);
+        let sent = sent_texts(&telegram);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("continues unchanged"), "{sent:?}");
+        assert!(sent[0].contains("boom"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn new_summary_has_nothing_to_do_without_a_conversation_or_in_message_mode() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = mock_handles(&telegram, &provider);
+
+        summarize_into_new_chat(
+            42,
+            &handles,
+            &AtomicBool::new(false),
+            summary::Trigger::Command,
+        )
+        .await
+        .unwrap();
+        {
+            let mut rooms = handles.rooms.lock().await;
+            let room = rooms.get_or_default(42);
+            room.settings.mode = ChatMode::Message;
+            room.append_turn(WireFormat::Compat, compat_turn("One-off?", "Yes."));
+        }
+        summarize_into_new_chat(
+            42,
+            &handles,
+            &AtomicBool::new(false),
+            summary::Trigger::Command,
+        )
+        .await
+        .unwrap();
+
+        assert!(provider.requests().is_empty());
+        assert_eq!(
+            sent_texts(&telegram),
+            vec![
+                summary::NOTHING_TO_SUMMARIZE.to_string(),
+                summary::NOTHING_TO_SUMMARIZE_IN_MESSAGE_MODE.to_string()
+            ]
+        );
+    }
+
+    fn text_message(text: &str) -> IncomingMessage {
+        IncomingMessage {
+            chat: tellm_telegram::Chat {
+                id: 42,
+                title: None,
+            },
+            from: None,
+            date: 1000,
+            text: Some(text.to_string()),
+            caption: None,
+            photo: None,
+            document: None,
+        }
+    }
+
+    fn summary_request_for(turns: &rooms::TurnHistory) -> ChatRequest {
+        ChatRequest {
+            model: "model".to_string(),
+            system: None,
+            history: turns.newest(turns.len()),
+            input: Vec::new(),
+            thinking: tellm_core::ThinkingLevel::Low,
+            web_search: false,
+            image_generation: false,
+        }
+    }
+
+    fn five_turns() -> rooms::TurnHistory {
+        let mut room = RoomState::new(crate::rooms::RoomSettings::default());
+        for turn in 0..5 {
+            room.append_turn(
+                WireFormat::Compat,
+                compat_turn(&format!("q{turn}"), &format!("a{turn}")),
+            );
+        }
+        room.turn_history()
+    }
+
+    fn too_long() -> model_turn::TurnError {
+        model_turn::TurnError {
+            message: "too long".to_string(),
+            context_window: true,
+        }
+    }
+
+    fn summary_reply(text: &str) -> ChatResponse {
+        ChatResponse {
+            text: text.to_string(),
+            images: Vec::new(),
+            turn_items: Vec::new(),
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_summary_over_the_context_window_is_retried_with_the_older_half_left_out() {
+        let turns = five_turns();
+        let mut sent = Vec::new();
+
+        let (result, left_out) =
+            send_summary_request(summary_request_for(&turns), &turns, |request| {
+                sent.push(request.history.clone());
+                let fits = request.history.len() <= 4;
+                async move {
+                    if fits {
+                        Ok(summary_reply("Notes."))
+                    } else {
+                        Err(too_long())
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(result.unwrap().text, "Notes.");
+        assert_eq!(left_out, 3);
+        assert_eq!(
+            sent.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![10, 6, 4]
+        );
+        assert_eq!(sent[2][0]["content"], "q3", "the newest turns are kept");
+    }
+
+    #[tokio::test]
+    async fn a_summary_retry_stops_at_one_turn_and_other_errors_are_not_retried() {
+        let turns = five_turns();
+        let mut sent = Vec::new();
+        let (result, left_out) =
+            send_summary_request(summary_request_for(&turns), &turns, |request| {
+                sent.push(request.history.len());
+                async { Err(too_long()) }
+            })
+            .await;
+        assert!(result.unwrap_err().context_window);
+        assert_eq!(left_out, 4);
+        assert_eq!(sent, vec![10, 6, 4, 2]);
+
+        let mut attempts = 0;
+        let (result, left_out) =
+            send_summary_request(summary_request_for(&turns), &turns, |_request| {
+                attempts += 1;
+                async { Err(model_turn::TurnError::from("boom".to_string())) }
+            })
+            .await;
+        assert_eq!(result.unwrap_err().message, "boom");
+        assert_eq!((attempts, left_out), (1, 0));
+
+        let (result, _) =
+            send_summary_request(summary_request_for(&turns), &turns, |_request| async {
+                Ok(summary_reply(" \n"))
+            })
+            .await;
+        assert_eq!(result.unwrap_err().message, summary::EMPTY_SUMMARY_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_reaches_the_token_budget_is_followed_by_a_summary() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(vec![
+            completion("Sure.", 149_000, 2_000),
+            completion("- Notes.", 151_500, 300),
+        ]);
+        let handles = mock_handles(&telegram, &provider);
+        handles
+            .rooms
+            .lock()
+            .await
+            .get_or_default(42)
+            .append_turn(WireFormat::Compat, compat_turn("I move in May.", "Noted."));
+
+        handle_model_message(
+            42,
+            text_message("And then?"),
+            &handles,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let messages = requests[1].json_body()["messages"].clone();
+        assert_eq!(messages.as_array().unwrap().len(), 5);
+        assert_eq!(messages[3]["content"], "Sure.");
+        assert_eq!(messages[4]["content"], summary::SUMMARY_REQUEST);
+
+        let rooms = handles.rooms.lock().await;
+        let room = rooms.get(42).unwrap();
+        assert!(room.history.is_empty());
+        assert_eq!(room.summary.as_deref(), Some("- Notes."));
+        assert_eq!(room.context_tokens, None);
+        drop(rooms);
+
+        assert_eq!(
+            sent_texts(&telegram),
+            vec![
+                "Sure.\n\nTokens 149k in · 2k out · no price set · 151k of 150k tokens".to_string(),
+                summary::Trigger::TokenBudget.notice().unwrap(),
+                "Summary carried into a new chat:\n\n- Notes.\n\n\
+                 Tokens 151.5k in · 300 out · no price set · 151.8k of 150k tokens"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_automatic_summary_keeps_the_chat_and_tries_again_later() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(vec![
+            completion("Sure.", 149_000, 2_000),
+            MockResponse::json(500, serde_json::json!({ "error": { "message": "boom" } })),
+        ]);
+        let handles = mock_handles(&telegram, &provider);
+
+        handle_model_message(
+            42,
+            text_message("And then?"),
+            &handles,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        let rooms = handles.rooms.lock().await;
+        let room = rooms.get(42).unwrap();
+        assert_eq!(room.history.len(), 2);
+        assert_eq!(room.summary, None);
+        assert_eq!(room.context_tokens, Some(151_000));
+        assert_eq!(room.summary_due(), Some(summary::Trigger::TokenBudget));
+        drop(rooms);
+
+        let sent = sent_texts(&telegram);
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert!(
+            sent[2].contains("try again after the next reply"),
+            "{sent:?}"
+        );
+        assert!(sent[2].contains("boom"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn history_over_the_byte_cap_is_pruned_and_announced_when_summarizing_fails() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(vec![
+            completion("Sure.", 1_000, 10),
+            MockResponse::json(500, serde_json::json!({ "error": { "message": "boom" } })),
+        ]);
+        let handles = mock_handles(&telegram, &provider);
+        handles.rooms.lock().await.get_or_default(42).append_turn(
+            WireFormat::Compat,
+            compat_turn(&"x".repeat(rooms::MAX_HISTORY_BYTES), "Long."),
+        );
+
+        handle_model_message(
+            42,
+            text_message("And then?"),
+            &handles,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        let rooms = handles.rooms.lock().await;
+        let room = rooms.get(42).unwrap();
+        assert_eq!(
+            room.history,
+            compat_turn("And then?", "Sure."),
+            "only the turn that fits is kept"
+        );
+        drop(rooms);
+
+        let sent = sent_texts(&telegram);
+        assert_eq!(sent.len(), 4, "{sent:?}");
+        assert_eq!(sent[1], summary::Trigger::HistoryBytes.notice().unwrap());
+        assert!(sent[2].contains("Couldn't summarize"), "{sent:?}");
+        assert_eq!(sent[3], summary::pruned_notice(1));
+    }
+
     fn test_model(wire_format: WireFormat, chat_ids: &[i64]) -> ModelConfig {
         ModelConfig {
             wire_format,
@@ -3076,6 +3759,7 @@ mod tests {
     #[test]
     fn help_text_is_markdown_bullets_without_raw_angle_placeholders() {
         assert!(HELP_TEXT.lines().all(|line| line.starts_with("- /")));
+        assert!(HELP_TEXT.contains("- /new [summary] - start a new chat"));
         assert!(HELP_TEXT.contains("- /id - show this Telegram chat id"));
         assert!(HELP_TEXT.contains("- /allow CHAT_ID - allow a chat (owner)"));
         assert!(
