@@ -123,7 +123,7 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
 - **"off" is configuration, like the top tier.** `/reasoning off` sends the
   model's optional `off_effort` value from `config.toml`. When that is unset
   tellm sends no reasoning setting and the provider default applies, which is
-  not "no thinking": Claude Fable 5.2 defaults to `high`; gpt-6-astra reasons
+  not "no thinking": Claude Fable 5.2 defaults to `high`; gpt-6.2-astra reasons
   at its own default and rejects `none`; grok-4.7 defaults to `high`;
   muse-wonder-1.0 defaults to `max`; Gemini 4 Carbon defaults to `medium`. None
   of the preset models can turn thinking off, so each preset writes its
@@ -141,7 +141,7 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   treats it as `high`; an older OpenAI model that stops at `high` needs
   `max_effort = "high"`), and `"high"` for chat completions and Gemini. Models
   that list a higher tier opt in with `max_effort = "max"`: OpenAI's GPT-5.6,
-  GPT-6, and GPT-6.1 families, Meta's muse-wonder-1.0, muse-spark-1.3, and
+  GPT-6, GPT-6.1, and GPT-6.2 families, Meta's muse-wonder-1.0, muse-spark-1.3, and
   muse-ember-1.0, and DeepSeek over chat completions. No Grok model lists
   `max`. Built-in presets write the value their model needs. tellm checks only
   that the value is one token; an unsupported value errors explicitly at the
@@ -643,11 +643,10 @@ restart and local room-setting changes.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
   from the built-in list, which is each lab's most capable model that an
-  ordinary API key can call (checked 2026-11-16, Google on 2026-11-17: Claude
-  Fable 5.2, GPT-6 Astra, Grok 4.7, Muse Wonder 1.0 in preview, Gemini 4
-  Carbon), each with the list prices that could be checked against the
-  provider's pricing page (checked 2026-11-18: Claude Fable 5.2 and GPT-6
-  Astra; Grok needs none because xAI reports its billed cost; Muse Wonder and
+  ordinary API key can call (rechecked 2026-11-19: Claude Fable 5.2, GPT-6.2
+  Astra, Grok 4.7, Muse Wonder 1.0 in preview, Gemini 4 Carbon), each with the
+  list prices that could be checked against the provider's pricing page
+  (Claude Fable 5.2 checked 2026-11-18, GPT-6.2 Astra 2026-11-19; Grok needs none because xAI reports its billed cost; Muse Wonder and
   Gemini 4 Carbon ship without a price, so their replies show token counts
   until the user adds one), stores
   Telegram/provider
