@@ -23,13 +23,17 @@
 //!   after any of that changed is a 400 on Claude Fable 5.2 ("The block is
 //!   bound to a different conversation") and can be one on the other models
 //!   with preserved thinking. Verbatim, append-only history keeps them valid;
-//!   once the runtime prunes earlier turns or the tool list changes, every
-//!   kept turn must go through [`without_thinking_blocks`] before it is sent
-//!   again.
+//!   once the runtime prunes earlier turns, leaves them out of a request, or
+//!   the tool list changes, every kept turn must go through
+//!   [`without_thinking_blocks`] before it is sent again.
 //! - Documents/images: native `document` / `image` content blocks (base64) —
 //!   PDFs pass through without client-side extraction.
 //! - Handle `stop_reason: "refusal"` before reading content
 //!   (`ProviderError::Refusal`).
+//! - A request whose input exceeds the context window is a 400
+//!   `invalid_request_error` "prompt is too long"; it becomes
+//!   `ProviderError::ContextWindowExceeded` (checked 2026-11-19 against
+//!   platform.claude.com, context windows and API errors).
 //! - Handle `stop_reason: "max_tokens"`: thinking counts toward the limit, so
 //!   a reply can stop mid-answer or before any text. A cut-off answer gets
 //!   [`CUT_OFF_NOTE`]; one without text is an error instead of an empty turn.
@@ -329,19 +333,37 @@ impl Anthropic {
         let status = response.status();
         let response_body: Value = response.json().await?;
         if !status.is_success() {
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: api_error_message(&response_body),
-            });
+            return Err(api_error(status.as_u16(), &response_body));
         }
 
         Ok(response_body)
     }
 }
 
+/// The message Anthropic gives a request whose input alone exceeds the
+/// model's context window: HTTP 400 `invalid_request_error` "prompt is too
+/// long", on every model (checked 2026-11-19 against platform.claude.com,
+/// context windows). The errors page defines no error type of its own for
+/// it, so the type, status and this message together identify it.
+pub const PROMPT_TOO_LONG: &str = "prompt is too long";
+
+/// Turns an error response into a [`ProviderError`], telling a request over
+/// the context window apart from other API errors.
+fn api_error(status: u16, body: &Value) -> ProviderError {
+    let message = api_error_message(body);
+    let invalid_request =
+        body.pointer("/error/type").and_then(Value::as_str) == Some("invalid_request_error");
+    if status == 400 && invalid_request && message.to_ascii_lowercase().contains(PROMPT_TOO_LONG) {
+        ProviderError::ContextWindowExceeded { status, message }
+    } else {
+        ProviderError::Api { status, message }
+    }
+}
+
 /// Rewrites one stored turn (the `turn_items` of an earlier
 /// [`ChatResponse`]) so it can still be replayed after the runtime changed
-/// what precedes it: earlier turns were pruned, or the tool list changed.
+/// what precedes it: earlier turns were pruned or left out of the request,
+/// or the tool list changed.
 ///
 /// Checked 2026-11-16 against platform.claude.com (preserved thinking:
 /// prefix checks, change tools or instructions). Such a change invalidates

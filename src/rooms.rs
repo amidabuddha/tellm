@@ -4,16 +4,19 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tellm_core::ThinkingLevel;
+use tellm_core::{ThinkingLevel, Usage};
 
 use tellm_config::{ConfigError, WireFormat};
 
 use crate::cost::ChatCost;
+use crate::summary;
 
 const ROOMS_FILE: &str = "rooms.toml";
-/// Keep enough context for long conversations without allowing opaque provider
-/// state to grow without bound. Pruning always removes complete provider turns.
-pub const MAX_HISTORY_TURNS: usize = 32;
+/// A memory safety net for the opaque history, not its usual bound. History
+/// is append-only within a conversation, and a chat is summarized into a new
+/// one when its context reaches [`summary::CONTEXT_SUMMARY_TOKENS`] or its
+/// history passes this size. Only when summarizing fails does
+/// [`RoomState::prune_to_byte_cap`] drop the oldest whole turns.
 pub const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -88,6 +91,11 @@ pub struct RoomState {
     /// until this one does, so it keeps the system prompt byte-stable the
     /// same way `memory` does.
     pub summary: Option<String>,
+    /// The conversation's size in tokens as of its latest committed reply:
+    /// everything that reply's request sent, plus what it wrote, as the
+    /// provider reported it. `None` when the provider reported no usage, in
+    /// message mode, and before the first reply.
+    pub context_tokens: Option<u64>,
     history_turns: VecDeque<HistoryTurn>,
     generation: u64,
 }
@@ -127,6 +135,7 @@ impl RoomState {
             cost: ChatCost::default(),
             memory: None,
             summary: None,
+            context_tokens: None,
             history_turns: VecDeque::new(),
             generation: 0,
         }
@@ -179,13 +188,82 @@ impl RoomState {
         }
     }
 
-    /// Starts a new conversation: the history, its running cost, and the
-    /// memory and summary it started with.
+    /// Starts a new conversation: the history, its running cost and size,
+    /// and the memory and summary it started with.
     pub fn reset_history(&mut self) {
         self.invalidate_history();
         self.cost = ChatCost::default();
         self.memory = None;
         self.summary = None;
+        self.context_tokens = None;
+    }
+
+    /// Records the conversation's size after a committed reply, from the
+    /// usage the provider reported for it. A message-mode request carries no
+    /// conversation, so it has no size to record.
+    pub fn record_context(&mut self, usage: Option<&Usage>) {
+        self.context_tokens = match self.settings.mode {
+            ChatMode::Chat => usage.map(|usage| {
+                usage
+                    .total_input_tokens()
+                    .saturating_add(usage.output_tokens)
+            }),
+            ChatMode::Message => None,
+        };
+    }
+
+    /// Whether the conversation has grown enough to be summarized into a new
+    /// one, and why: its context reached the token budget, or its history
+    /// passed the byte cap. Only a chat-mode conversation is summarized.
+    pub fn summary_due(&self) -> Option<summary::Trigger> {
+        if self.settings.mode != ChatMode::Chat || self.history.is_empty() {
+            return None;
+        }
+        if self
+            .context_tokens
+            .is_some_and(|tokens| tokens >= summary::CONTEXT_SUMMARY_TOKENS)
+        {
+            Some(summary::Trigger::TokenBudget)
+        } else if self.history_bytes() > MAX_HISTORY_BYTES {
+            Some(summary::Trigger::HistoryBytes)
+        } else {
+            None
+        }
+    }
+
+    /// The last-resort bound, for when summarizing failed or isn't possible:
+    /// drops the oldest whole turns until the history fits in
+    /// [`MAX_HISTORY_BYTES`] and returns how many turns are gone, so the
+    /// caller can say so in the chat. The kept turns then follow a different
+    /// history, so their wire-format crate decides what is still replayable.
+    pub fn prune_to_byte_cap(&mut self) -> usize {
+        let turns_before = self.history_turns.len();
+        let mut pruned = false;
+        while self.history_bytes() > MAX_HISTORY_BYTES {
+            let Some(oldest) = self.history_turns.pop_front() else {
+                break;
+            };
+            self.history.drain(..oldest.item_count);
+            pruned = true;
+        }
+        if pruned {
+            self.history_prefix_changed();
+        }
+        turns_before - self.history_turns.len()
+    }
+
+    /// A copy of the conversation's turns, for a request that may have to
+    /// leave the oldest ones out.
+    pub fn turn_history(&self) -> TurnHistory {
+        let mut items = self.history.iter();
+        TurnHistory {
+            wire_format: self.wire_format,
+            turns: self
+                .history_turns
+                .iter()
+                .map(|turn| items.by_ref().take(turn.item_count).cloned().collect())
+                .collect(),
+        }
     }
 
     /// Starts a new conversation that carries `summary` of the one ending
@@ -256,22 +334,11 @@ impl RoomState {
         self.history_turns.clear();
     }
 
+    /// History is append-only: a conversation that grows too large is
+    /// summarized into a new one instead of losing its beginning, which would
+    /// change the prefix every provider caches.
     fn push_turn(&mut self, turn_items: Vec<Value>) {
         self.store_turn(turn_items);
-
-        let mut pruned = false;
-        while self.history_turns.len() > MAX_HISTORY_TURNS
-            || self.history_bytes() > MAX_HISTORY_BYTES
-        {
-            let Some(oldest) = self.history_turns.pop_front() else {
-                break;
-            };
-            self.history.drain(..oldest.item_count);
-            pruned = true;
-        }
-        if pruned {
-            self.history_prefix_changed();
-        }
     }
 
     fn store_turn(&mut self, turn_items: Vec<Value>) {
@@ -290,9 +357,8 @@ impl RoomState {
     /// wire-format crate that produced them, so that crate decides what is
     /// still replayable. A turn it returns empty is dropped whole.
     fn history_prefix_changed(&mut self) {
-        let replayable: fn(Vec<Value>) -> Vec<Value> = match self.wire_format {
-            Some(WireFormat::Anthropic) => tellm_anthropic::without_thinking_blocks,
-            Some(WireFormat::Responses | WireFormat::Compat | WireFormat::Gemini) | None => return,
+        let Some(replayable) = replayable_after_prefix_change(self.wire_format) else {
+            return;
         };
 
         let mut items = std::mem::take(&mut self.history).into_iter();
@@ -304,10 +370,50 @@ impl RoomState {
         }
     }
 
-    fn history_bytes(&self) -> usize {
+    pub fn history_bytes(&self) -> usize {
         self.history_turns.iter().fold(0_usize, |total, turn| {
             total.saturating_add(turn.approx_bytes)
         })
+    }
+}
+
+/// How a wire format's crate rewrites a kept turn once what precedes it
+/// changed, or `None` when its turns replay unchanged. Anthropic removes
+/// thinking blocks; the other formats keep their turns as they are.
+fn replayable_after_prefix_change(
+    wire_format: Option<WireFormat>,
+) -> Option<fn(Vec<Value>) -> Vec<Value>> {
+    match wire_format {
+        Some(WireFormat::Anthropic) => Some(tellm_anthropic::without_thinking_blocks),
+        Some(WireFormat::Responses | WireFormat::Compat | WireFormat::Gemini) | None => None,
+    }
+}
+
+/// A copy of a conversation's turns, each a complete provider-native
+/// request/response exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnHistory {
+    wire_format: Option<WireFormat>,
+    turns: Vec<Vec<Value>>,
+}
+
+impl TurnHistory {
+    pub fn len(&self) -> usize {
+        self.turns.len()
+    }
+
+    /// The newest `keep` turns, as a request sends them. All of them is the
+    /// stored history unchanged. Leaving older turns out changes what
+    /// precedes the kept ones, so each kept turn then goes through its
+    /// wire-format crate the way pruning does, and a turn that comes back
+    /// empty is left out too.
+    pub fn newest(&self, keep: usize) -> Vec<Value> {
+        let skip = self.turns.len().saturating_sub(keep);
+        let kept = self.turns[skip..].iter().cloned();
+        match replayable_after_prefix_change(self.wire_format).filter(|_| skip > 0) {
+            Some(replayable) => kept.flat_map(replayable).collect(),
+            None => kept.flatten().collect(),
+        }
     }
 }
 
@@ -608,9 +714,9 @@ mod tests {
     }
 
     #[test]
-    fn history_limit_prunes_complete_provider_turns() {
+    fn history_is_append_only_however_many_turns_it_holds() {
         let mut room = RoomState::new(RoomSettings::default());
-        for turn in 0..=MAX_HISTORY_TURNS {
+        for turn in 0..100 {
             room.append_turn(
                 WireFormat::Responses,
                 vec![
@@ -620,14 +726,14 @@ mod tests {
             );
         }
 
-        assert_eq!(room.history.len(), MAX_HISTORY_TURNS * 2);
-        assert_eq!(room.history[0]["turn"], 1);
-        assert_eq!(room.history[1]["turn"], 1);
-        assert_eq!(room.history.last().unwrap()["turn"], MAX_HISTORY_TURNS);
+        assert_eq!(room.history.len(), 200);
+        assert_eq!(room.history[0]["turn"], 0);
+        assert_eq!(room.history.last().unwrap()["turn"], 99);
+        assert_eq!(room.prune_to_byte_cap(), 0);
     }
 
     #[test]
-    fn history_byte_limit_never_keeps_half_a_provider_turn() {
+    fn the_byte_cap_backstop_never_keeps_half_a_provider_turn() {
         let mut room = RoomState::new(RoomSettings::default());
         let payload = "x".repeat(MAX_HISTORY_BYTES / 2);
         room.append_turn(
@@ -644,38 +750,149 @@ mod tests {
                 serde_json::json!({ "turn": 2, "marker": "complete" }),
             ],
         );
+        // Appending never drops anything; the runtime summarizes instead.
+        assert_eq!(room.history.len(), 4);
+        assert!(room.history_bytes() > MAX_HISTORY_BYTES);
+
+        assert_eq!(room.prune_to_byte_cap(), 1);
 
         assert_eq!(room.history.len(), 2);
         assert!(room.history.iter().all(|item| item["turn"] == 2));
+        assert!(room.history_bytes() <= MAX_HISTORY_BYTES);
+
+        // A single turn over the cap goes too: the bound is on memory.
+        room.append_turn(
+            WireFormat::Anthropic,
+            vec![serde_json::json!({ "turn": 3, "content": "z".repeat(MAX_HISTORY_BYTES) })],
+        );
+        assert_eq!(room.prune_to_byte_cap(), 2);
+        assert!(room.history.is_empty());
     }
 
     #[test]
-    fn anthropic_thinking_is_replayed_verbatim_until_a_turn_is_pruned() {
+    fn anthropic_thinking_is_replayed_verbatim_until_the_backstop_prunes() {
         let mut room = RoomState::new(RoomSettings::default());
-        for turn in 0..MAX_HISTORY_TURNS {
+        let mut big_first_turn = anthropic_turn(0);
+        with_text(&mut big_first_turn, "z".repeat(MAX_HISTORY_BYTES / 2));
+        room.append_turn(WireFormat::Anthropic, big_first_turn);
+        for turn in 1..40 {
             room.append_turn(WireFormat::Anthropic, anthropic_turn(turn));
         }
+        assert_eq!(thinking_blocks(&room.history), 40);
+        assert_eq!(room.history[2..4], anthropic_turn(1)[..]);
 
-        assert_eq!(thinking_blocks(&room.history), MAX_HISTORY_TURNS);
-        assert_eq!(room.history[..2], anthropic_turn(0)[..]);
+        let mut big_last_turn = anthropic_turn(40);
+        with_text(&mut big_last_turn, "z".repeat(MAX_HISTORY_BYTES / 2));
+        room.append_turn(WireFormat::Anthropic, big_last_turn);
+        assert_eq!(thinking_blocks(&room.history), 41);
 
-        room.append_turn(WireFormat::Anthropic, anthropic_turn(MAX_HISTORY_TURNS));
+        assert_eq!(room.prune_to_byte_cap(), 1);
 
         // The kept turns now follow a different history than the one their
         // thinking was produced after, so none of it may be replayed.
-        assert_eq!(room.history.len(), MAX_HISTORY_TURNS * 2);
+        assert_eq!(room.history.len(), 80);
         assert_eq!(room.history[0]["content"][0]["text"], "question 1");
         assert_eq!(thinking_blocks(&room.history), 0);
         assert_eq!(
-            room.history.last().unwrap()["content"],
-            serde_json::json!([
-                { "type": "text", "text": format!("answer {MAX_HISTORY_TURNS}") }
-            ])
+            room.history[1]["content"],
+            serde_json::json!([{ "type": "text", "text": "answer 1" }])
         );
         assert_eq!(
             room.history_bytes(),
             room.history.iter().map(approx_json_bytes).sum::<usize>()
         );
+    }
+
+    #[test]
+    fn a_summary_request_leaving_turns_out_strips_anthropic_thinking_from_the_rest() {
+        let mut room = RoomState::new(RoomSettings::default());
+        for turn in 0..3 {
+            room.append_turn(WireFormat::Anthropic, anthropic_turn(turn));
+        }
+        let turns = room.turn_history();
+        assert_eq!(turns.len(), 3);
+
+        // All turns: the stored history, verbatim.
+        assert_eq!(turns.newest(3), room.history);
+        assert_eq!(turns.newest(10), room.history);
+
+        let newest = turns.newest(2);
+        assert_eq!(newest.len(), 4);
+        assert_eq!(newest[0]["content"][0]["text"], "question 1");
+        assert_eq!(thinking_blocks(&newest), 0);
+        // The room itself is untouched.
+        assert_eq!(thinking_blocks(&room.history), 3);
+    }
+
+    #[test]
+    fn other_wire_formats_leave_turns_out_without_rewriting_the_rest() {
+        let mut room = RoomState::new(RoomSettings::default());
+        let reasoning = |turn: usize| {
+            vec![
+                serde_json::json!({ "role": "user", "content": format!("q{turn}") }),
+                serde_json::json!({ "type": "reasoning", "encrypted_content": format!("r{turn}") }),
+            ]
+        };
+        for turn in 0..3 {
+            room.append_turn(WireFormat::Responses, reasoning(turn));
+        }
+
+        assert_eq!(room.turn_history().newest(1), reasoning(2));
+    }
+
+    #[test]
+    fn the_context_size_is_the_last_replys_input_and_output() {
+        let mut room = RoomState::new(RoomSettings::default());
+        let usage = Usage {
+            input_tokens: 1_000,
+            cached_input_tokens: 120_000,
+            cache_write_tokens: 4_000,
+            output_tokens: 2_500,
+            reasoning_tokens: 2_000,
+            ..Usage::default()
+        };
+
+        room.record_context(Some(&usage));
+        assert_eq!(room.context_tokens, Some(127_500));
+
+        room.record_context(None);
+        assert_eq!(
+            room.context_tokens, None,
+            "unknown usage means unknown size"
+        );
+
+        room.record_context(Some(&usage));
+        room.reset_history();
+        assert_eq!(room.context_tokens, None);
+
+        room.settings.mode = ChatMode::Message;
+        room.record_context(Some(&usage));
+        assert_eq!(room.context_tokens, None);
+    }
+
+    #[test]
+    fn a_chat_is_due_for_a_summary_at_the_token_budget_or_the_byte_cap() {
+        let mut room = RoomState::new(RoomSettings::default());
+        room.context_tokens = Some(summary::CONTEXT_SUMMARY_TOKENS);
+        assert_eq!(room.summary_due(), None, "nothing to summarize yet");
+
+        room.append_turn(WireFormat::Responses, vec![serde_json::json!({"turn": 1})]);
+        room.context_tokens = Some(summary::CONTEXT_SUMMARY_TOKENS - 1);
+        assert_eq!(room.summary_due(), None);
+        room.context_tokens = None;
+        assert_eq!(room.summary_due(), None);
+        room.context_tokens = Some(summary::CONTEXT_SUMMARY_TOKENS);
+        assert_eq!(room.summary_due(), Some(summary::Trigger::TokenBudget));
+
+        room.context_tokens = None;
+        room.append_turn(
+            WireFormat::Responses,
+            vec![serde_json::json!({ "content": "x".repeat(MAX_HISTORY_BYTES) })],
+        );
+        assert_eq!(room.summary_due(), Some(summary::Trigger::HistoryBytes));
+
+        room.settings.mode = ChatMode::Message;
+        assert_eq!(room.summary_due(), None, "message mode is never summarized");
     }
 
     #[test]
@@ -752,14 +969,34 @@ mod tests {
         assert_eq!(room.history.len(), 4);
         assert_eq!(room.history[2]["content"][0]["text"], "question 2");
 
-        // Two turns are left; one more than the limit prunes exactly turn 0.
-        for turn in 3..=MAX_HISTORY_TURNS + 1 {
-            room.append_turn(WireFormat::Anthropic, anthropic_turn(turn));
-        }
+        // Two turns are left. A turn that fills the byte cap together with
+        // the newer of them makes the backstop drop exactly the older one.
+        let kept_bytes = room.history[2..]
+            .iter()
+            .map(approx_json_bytes)
+            .sum::<usize>();
+        let mut big_turn = anthropic_turn(3);
+        with_text(&mut big_turn, String::new());
+        let overhead = big_turn.iter().map(approx_json_bytes).sum::<usize>();
+        big_turn[0]["content"][1]["text"] =
+            serde_json::json!("z".repeat(MAX_HISTORY_BYTES - kept_bytes - overhead));
+        room.append_turn(WireFormat::Anthropic, big_turn);
+        assert_eq!(
+            room.history_bytes(),
+            MAX_HISTORY_BYTES
+                + room.history[..2]
+                    .iter()
+                    .map(approx_json_bytes)
+                    .sum::<usize>()
+        );
 
-        assert_eq!(room.history.len(), MAX_HISTORY_TURNS * 2);
+        assert_eq!(room.prune_to_byte_cap(), 1);
+
+        assert_eq!(room.history.len(), 4);
         assert_eq!(room.history[0]["role"], "user");
         assert_eq!(room.history[0]["content"][0]["text"], "question 2");
+        assert_eq!(room.history[2]["content"][0]["text"], "question 3");
+        assert_eq!(thinking_blocks(&room.history), 0);
         assert_eq!(
             room.history_bytes(),
             room.history.iter().map(approx_json_bytes).sum::<usize>()
@@ -1012,6 +1249,14 @@ mod tests {
                 ]
             }),
         ]
+    }
+
+    /// Adds a text block to a turn's user message.
+    fn with_text(turn: &mut [Value], text: String) {
+        turn[0]["content"]
+            .as_array_mut()
+            .expect("user content blocks")
+            .push(serde_json::json!({ "type": "text", "text": text }));
     }
 
     fn thinking_blocks(history: &[Value]) -> usize {

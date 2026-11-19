@@ -97,16 +97,23 @@ state, so:
   provider's own history shape); the runtime appends them verbatim.
 - Switching a room's wire format resets the opaque history (announced to the
   user).
-- History stays memory-bounded: retain at most 32 complete provider-native
-  turns and approximately 4 MiB per room, pruning oldest whole turns so a
-  request/response pair is never split.
+- History is append-only within a conversation. Dropping its oldest turns
+  would change the prefix every provider caches, so a conversation that
+  grows too large is summarized into a new one instead (§ Summaries). About
+  4 MiB of history per room is a memory safety net: passing it also triggers
+  the summary. Only when summarizing fails, or a message-mode exchange alone
+  is over it, does tellm prune the oldest whole turns down to the cap, so a
+  request/response pair is never split, and it says in the chat how many
+  turns it dropped.
 - Verbatim replay holds only while history is append-only. When the runtime
-  itself changes what precedes the kept turns — pruning for the bound above,
-  or a `/websearch` toggle, which changes the tool list — it hands each kept
-  turn back to the wire-format crate that produced it and stores what that
-  crate says is still replayable; a turn returned empty is dropped whole. The
-  runtime still never inspects the items. Anthropic removes thinking blocks
-  (see Notes); the other wire formats keep their turns unchanged.
+  itself changes what precedes the kept turns (the last-resort pruning
+  above, a summary request that leaves the oldest turns out, or a
+  `/websearch` toggle, which changes the tool list), it hands each kept turn
+  back to the wire-format crate that produced it and sends or stores what
+  that crate says is still replayable; a turn returned empty is dropped
+  whole. The runtime still never inspects the items. Anthropic removes
+  thinking blocks (see Notes); the other wire formats keep their turns
+  unchanged.
 
 Thinking-level translation (verified against live provider docs 2026-07-05;
 Gemini 3.6 Flash refreshed 2026-07-26;
@@ -206,6 +213,20 @@ Notes:
   so, while the stored turn keeps the model's own content. A reply cut off
   before any text is a provider error, and the error reply suggests
   `/reasoning low` or a higher `max_output_tokens`.
+- A request over the model's context window is told apart from other API
+  errors only where the provider documents an error for it (checked
+  2026-11-19): Anthropic's HTTP 400 `invalid_request_error` "prompt is too
+  long" (platform.claude.com, context windows); OpenAI's `error.code`
+  `context_length_exceeded` (developers.openai.com: the Responses reference
+  says only that such a request fails with a 400, and OpenAI's Agents API
+  error table defines this code as "Input exceeds the model's context
+  window"); and OpenRouter's `error.metadata.error_type`
+  `context_length_exceeded` on chat completions (openrouter.ai, errors).
+  xAI, Meta, Gemini, DeepSeek and the rest of the chat-completions dialect
+  document none, so theirs stay ordinary API errors. A recognized one
+  becomes `ProviderError::ContextWindowExceeded`: the chat's error reply
+  suggests `/new summary`, and a summary request is retried with fewer
+  turns (§ Summaries).
 - A reply with neither text nor an image is a failed turn in every wire
   format: nothing is stored and the chat gets an error. Stored, it would be
   replayed as a question without a visible answer, and a reasoning-only turn
@@ -217,8 +238,9 @@ Notes:
   platform.claude.com, preserved thinking / prefix checks). Replaying one
   after any of that changed is a 400 on Claude Fable 5.2 and can be one on the
   other models with preserved thinking. `system` cannot change under a kept
-  history (`/role` resets it), so the edits tellm makes are pruning and the
-  web-search tool toggle. After either, `tellm-anthropic` removes every
+  history (`/role` resets it), so the edits tellm makes are the last-resort
+  pruning, a summary request that leaves older turns out, and the
+  web-search tool toggle. After any of them, `tellm-anthropic` removes every
   `thinking` and `redacted_thinking` block from the kept turns — all of them,
   because a block may not be left out from between two that stay — and the
   model continues without that earlier reasoning. An assistant message that
@@ -406,9 +428,10 @@ calls a billing API and never fetches prices.
 
 ## Summaries
 
-- `/new summary` asks the room's current model to summarize the
-  conversation, sends the summary to the chat, and starts a new conversation
-  that carries it. Like `/new`, it is not owner-gated.
+- `/new summary`, or tellm on its own when a chat reaches its budget, asks
+  the room's current model to summarize the conversation, sends the summary
+  to the chat, and starts a new conversation that carries it. Like `/new`,
+  `/new summary` is not owner-gated.
 - The summary request is an ordinary turn of the conversation: the same
   model, system prompt, full history, tools, web-search and image settings,
   and effort as any turn in the room, built by the same request path. Only
@@ -429,6 +452,30 @@ calls a billing API and never fetches prices.
 - A chat without history, or in message mode, has nothing to summarize and
   is told so. A failed summary request, or a reply without text, leaves the
   conversation unchanged, and the chat says so.
+- Budget: after each committed chat-mode reply the room records the
+  conversation's size, that reply's input tokens in every bucket (ordinary,
+  cache reads, cache writes) plus its output tokens, as the provider
+  reported them. Unknown usage records no size, and message mode records
+  none. When the size reaches `CONTEXT_SUMMARY_TOKENS` (150,000), or the
+  history passes the 4 MiB cap, tellm sends a short notice and runs the
+  summary right after delivering that reply, while the provider's cache
+  still holds the conversation. It runs in the chat's worker, so the next
+  message waits for it. If it fails, the history stays, and the check runs
+  again after the next reply.
+- The budget is one constant for every provider, with no per-model or
+  config setting (checked 2026-11-19). Anthropic's server-side compaction
+  starts at 150,000 input tokens by default, and OpenAI's compaction
+  examples use `compact_threshold: 200000`. The lowest long-context price
+  step among the presets is Grok 4.7's: a prompt of 200K tokens or more
+  bills the whole request at the higher rate. GPT-6.2 Astra's step is above
+  272K input tokens, and Claude Fable 5.2 has none. Gemini 4 Carbon and Muse
+  Wonder have windows of about 1M tokens, Grok 4.7 500K.
+- When the provider says a summary request is over the model's context
+  window (see Notes in § Unified parameter set), the request is sent again
+  with the older half of the turns left out, until it fits or a single turn
+  was too much. The kept turns go through their wire-format crate as after
+  any history edit (§ Opaque provider state), and the summary message says
+  how many of the oldest turns it leaves out.
 
 ## Runtime model (ported from console-chat-gpt)
 
@@ -440,6 +487,9 @@ calls a billing API and never fetches prices.
   backs up behind a slow turn, further messages are dropped with a busy
   notice instead of blocking the poll loop for every other chat. At most one
   busy-notice send may be outstanding per room.
+- After each committed reply, the chat's worker checks the conversation's
+  budget (§ Summaries) before it takes the next message, and summarizes the
+  chat into a new one when it is due.
 - In-memory conversations; **room settings persist** across restarts
   (model pin, mode, role, optional thinking override, web-search toggle,
   image-generation toggle, cost-line toggle, memory toggle) in `config_dir()/rooms.toml` — runtime state

@@ -451,6 +451,54 @@ async fn api_error_uses_responses_error_message() {
     );
 }
 
+fn context_length_error() -> MockResponse {
+    MockResponse::json(
+        400,
+        json!({
+            "error": {
+                "message": "Your input exceeds the context window of this model.",
+                "type": "invalid_request_error",
+                "param": "input",
+                "code": "context_length_exceeded"
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn openai_context_length_error_is_its_own_error() {
+    let mock = MockOpenAi::start(vec![context_length_error()]);
+    let mut req = request();
+    req.image_generation = false;
+
+    let error = client(&mock).chat(&req).await.unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ProviderError::ContextWindowExceeded { status: 400, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn xai_and_meta_errors_are_not_read_with_openai_codes() {
+    for model in ["grok-4.7", "muse-wonder-1.0"] {
+        let mock = MockOpenAi::start(vec![context_length_error()]);
+        let mut req = request();
+        req.model = model.to_string();
+        req.image_generation = false;
+
+        let error = client(&mock).chat(&req).await.unwrap_err();
+
+        assert!(
+            matches!(&error, ProviderError::Api { status: 400, .. }),
+            "{model}: {error:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn xai_image_generation_is_reported_unsupported_before_network() {
     let mut req = request();

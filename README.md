@@ -242,8 +242,10 @@ On shutdown it unloads the models this session used and stops the server again
 if it started it. Images are sent only to models whose `ollama show` lists
 `vision`. Other ports and hosts are treated as ordinary endpoints.
 
-**Limits:** each chat keeps at most 32 turns or about 4 MiB of history, and
-attachments can be up to 20 MiB. Edited messages are ignored, so an edit never triggers a
+**Limits:** when a chat reaches 150k tokens (or 4 MiB of history), tellm
+summarizes it right after that reply and continues in a fresh chat that
+carries the summary. `/new summary` does the same at any time. Attachments can
+be up to 20 MiB. Edited messages are ignored, so an edit never triggers a
 second paid request.
 
 ## Troubleshooting

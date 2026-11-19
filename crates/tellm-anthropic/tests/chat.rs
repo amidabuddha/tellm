@@ -395,6 +395,50 @@ async fn api_error_uses_anthropic_error_message() {
 }
 
 #[tokio::test]
+async fn a_prompt_over_the_context_window_is_its_own_error() {
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        400,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "prompt is too long: 1048577 tokens > 1048576 maximum"
+            }
+        }),
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ProviderError::ContextWindowExceeded { status: 400, message }
+                if message.starts_with("prompt is too long")
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn other_errors_mentioning_a_long_prompt_stay_ordinary_api_errors() {
+    // Only the documented 400 invalid_request_error means the context window.
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        529,
+        json!({
+            "type": "error",
+            "error": { "type": "overloaded_error", "message": "prompt is too long to queue" }
+        }),
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(error, ProviderError::Api { status: 529, .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn image_generation_is_reported_unsupported_before_network() {
     let mut req = request();
     req.image_generation = true;

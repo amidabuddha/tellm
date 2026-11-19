@@ -22,6 +22,9 @@
 //!   Meta Model API supports image understanding, not image generation.
 //!   Results come back as base64 in `image_generation_call` output items.
 //! - Files/images: `input_file` / `input_image` content parts.
+//! - Context window: OpenAI's `error.code` `context_length_exceeded` becomes
+//!   `ProviderError::ContextWindowExceeded`; xAI and Meta document no code
+//!   for it (checked 2026-11-19, see [`CONTEXT_LENGTH_EXCEEDED`]).
 //! - Usage: `usage.input_tokens` includes cache reads and writes;
 //!   `input_tokens_details.cached_tokens` counts billed reads and
 //!   `input_tokens_details.cache_write_tokens` billed writes, so ordinary input
@@ -151,7 +154,7 @@ impl Provider for Responses {
             self.off_effort.as_deref(),
             self.max_effort.as_deref(),
         );
-        let response_body = self.send_request(body).await?;
+        let response_body = self.send_request(body, !is_xai && !is_meta).await?;
         let output = response_body
             .get("output")
             .and_then(Value::as_array)
@@ -214,7 +217,8 @@ pub fn usage_from_response(body: &Value, output: &[Value]) -> Option<Usage> {
 }
 
 impl Responses {
-    async fn send_request(&self, body: Value) -> Result<Value, ProviderError> {
+    /// `is_openai` says whether OpenAI's error codes apply to the reply.
+    async fn send_request(&self, body: Value, is_openai: bool) -> Result<Value, ProviderError> {
         let response = self
             .http
             .post(format!("{}/responses", self.base_url))
@@ -226,10 +230,7 @@ impl Responses {
         let status = response.status();
         let response_body: Value = response.json().await?;
         if !status.is_success() {
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: api_error_message(&response_body),
-            });
+            return Err(api_error(status.as_u16(), &response_body, is_openai));
         }
 
         Ok(response_body)
@@ -442,6 +443,31 @@ fn extract_images(output: &[Value]) -> Vec<GeneratedImage> {
             base64: base64.to_string(),
         })
         .collect()
+}
+
+/// OpenAI's error code for input that exceeds the model's context window,
+/// read from `error.code`. Checked 2026-11-19 against developers.openai.com:
+/// the Responses reference says such a request "will fail with a 400 error"
+/// without naming a code, and OpenAI's error tables define this one as
+/// "Input exceeds the model's context window" (Agents API errors and
+/// recovery). xAI and Meta document no code for it (docs.x.ai debugging
+/// errors and Responses reference; dev.meta.ai Responses API, which says
+/// only that an over-context request fails with HTTP 400), so their errors
+/// are not read this way.
+pub const CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
+
+/// Turns an error response into a [`ProviderError`], telling a request over
+/// the context window apart from other API errors where the provider
+/// documents a code for it.
+fn api_error(status: u16, body: &Value, is_openai: bool) -> ProviderError {
+    let message = api_error_message(body);
+    if is_openai
+        && body.pointer("/error/code").and_then(Value::as_str) == Some(CONTEXT_LENGTH_EXCEEDED)
+    {
+        ProviderError::ContextWindowExceeded { status, message }
+    } else {
+        ProviderError::Api { status, message }
+    }
 }
 
 fn api_error_message(value: &Value) -> String {
