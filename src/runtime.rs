@@ -1347,15 +1347,20 @@ async fn keep_chat_within_budget(
         let rooms = handles.rooms.lock().await;
         rooms.get(chat_id).and_then(RoomState::summary_due)
     };
+    // Telegram failures here are reported, never allowed to skip a step:
+    // the prune below is what keeps the next request under the cap.
+    let mut result = Ok(());
     if let Some(trigger) = due {
         if !worker_can_reply(chat_id, handles, cancelled).await {
             return Ok(());
         }
         if let Some(notice) = trigger.notice() {
-            send_command_reply(handles, chat_id, &notice).await?;
+            send_best_effort(handles, chat_id, &notice).await;
         }
-        if summarize_into_new_chat(chat_id, handles, cancelled, trigger).await? {
-            return Ok(());
+        match summarize_into_new_chat(chat_id, handles, cancelled, trigger).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => result = Err(error),
         }
     }
 
@@ -1371,10 +1376,21 @@ async fn keep_chat_within_budget(
             "history over the byte cap; oldest turns dropped chat_id={chat_id} turns={dropped}"
         );
         if worker_can_reply(chat_id, handles, cancelled).await {
-            send_command_reply(handles, chat_id, &summary::pruned_notice(dropped)).await?;
+            send_best_effort(handles, chat_id, &summary::pruned_notice(dropped)).await;
         }
     }
-    Ok(())
+    result
+}
+
+/// Sends a notice whose loss must not stop the work around it; a failure
+/// is logged instead.
+async fn send_best_effort(handles: &RuntimeHandles, chat_id: i64, text: &str) {
+    if let Err(error) = send_command_reply(handles, chat_id, text).await {
+        log::warn!(
+            target: "tellm::telegram",
+            "notice not delivered chat_id={chat_id} error={error:?}"
+        );
+    }
 }
 
 /// Asks the room's model to summarize the conversation and starts a new
@@ -4017,6 +4033,45 @@ mod tests {
         assert_eq!(sent[1], summary::Trigger::HistoryBytes.notice().unwrap());
         assert!(sent[2].contains("Couldn't summarize"), "{sent:?}");
         assert_eq!(sent[3], summary::pruned_notice(1));
+    }
+
+    #[tokio::test]
+    async fn history_over_the_byte_cap_is_pruned_even_when_telegram_fails() {
+        let telegram = MockHttpServer::start(
+            (0..12)
+                .map(|_| {
+                    MockResponse::json(
+                        500,
+                        serde_json::json!({ "ok": false, "description": "boom" }),
+                    )
+                })
+                .collect(),
+        );
+        let provider = MockHttpServer::start(vec![
+            completion("Sure.", 1_000, 10),
+            MockResponse::json(500, serde_json::json!({ "error": { "message": "boom" } })),
+        ]);
+        let handles = mock_handles(&telegram, &provider);
+        handles.rooms.lock().await.get_or_default(42).append_turn(
+            WireFormat::Compat,
+            compat_turn(&"x".repeat(rooms::MAX_HISTORY_BYTES), "Long."),
+        );
+
+        let result = handle_model_message(
+            42,
+            text_message("And then?"),
+            &handles,
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        assert!(result.is_err(), "the undelivered reply is still reported");
+        let rooms = handles.rooms.lock().await;
+        assert_eq!(
+            rooms.get(42).unwrap().history,
+            compat_turn("And then?", "Sure."),
+            "the prune ran although no notice could be sent"
+        );
     }
 
     fn test_model(wire_format: WireFormat, chat_ids: &[i64]) -> ModelConfig {

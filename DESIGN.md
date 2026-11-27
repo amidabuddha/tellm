@@ -104,7 +104,8 @@ state, so:
   the summary. Only when summarizing fails, or a message-mode exchange alone
   is over it, does tellm prune the oldest whole turns down to the cap, so a
   request/response pair is never split, and it says in the chat how many
-  turns it dropped.
+  turns it dropped. The notices are best-effort: a Telegram failure is
+  logged and reported, but never skips the summary or the prune.
 - Verbatim replay holds only while history is append-only. When the runtime
   itself changes what precedes the kept turns (the last-resort pruning
   above, a summary request that leaves the oldest turns out, or a
