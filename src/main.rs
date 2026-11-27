@@ -43,12 +43,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     runtime::Runtime::new(config)?.run().await
 }
 
+const USAGE: &str = "Usage: tellm [--version | -v | secret set NAME]";
+
+/// `tellm --version` (or `-v`) prints the version and exits.
+///
 /// `tellm secret set NAME` — store a provider secret from the console with
 /// hidden input. Keys must never travel through Telegram chat; this
 /// is the supported way to add or rotate them. Secrets are read per request,
 /// so a running bot picks the new value up without a restart.
 fn run_subcommand(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args {
+        [flag] if matches!(flag.as_str(), "--version" | "-v") => {
+            println!("{}", version_line());
+            Ok(())
+        }
         [command, action, name] if command == "secret" && action == "set" => {
             let value = rpassword::prompt_password(format!("Value for {name} (hidden): "))?;
             let Some(destination) = tellm_config::secrets::set_nonempty(name, &value)? else {
@@ -57,10 +65,29 @@ fn run_subcommand(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("{name} stored in {}.", destination.location_label());
             Ok(())
         }
-        _ => Err(format!(
-            "unknown arguments: {}. Usage: tellm [secret set NAME]",
-            args.join(" ")
-        )
-        .into()),
+        _ => Err(format!("unknown arguments: {}. {USAGE}", args.join(" ")).into()),
+    }
+}
+
+fn version_line() -> String {
+    format!("tellm {}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_flags_print_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("tellm {}", env!("CARGO_PKG_VERSION"))
+        );
+        for flag in ["--version", "-v"] {
+            assert!(run_subcommand(&[flag.to_string()]).is_ok(), "{flag}");
+        }
+
+        let error = run_subcommand(&["--verbose".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("--version | -v"), "{error}");
     }
 }

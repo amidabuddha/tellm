@@ -50,6 +50,8 @@ kill a binary that was rewritten in place.
 On first run, a wizard asks for a Telegram bot token and one provider API key,
 then prints a pairing code. Send `/pair CODE` to your bot and you're done.
 
+`tellm --version` (or `-v`) prints the installed version.
+
 ### Build from source
 
 You need Git and Rust 1.88 or newer.
