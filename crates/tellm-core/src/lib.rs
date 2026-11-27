@@ -55,6 +55,35 @@ pub enum ThinkingLevel {
     Max,
 }
 
+impl ThinkingLevel {
+    /// The provider value for this level. `Low`, `Medium` and `High` map to
+    /// their own names on every wire format. `Off` is the model's
+    /// `off_effort`, or `None` (omit the field) when that is unset, and `Max`
+    /// is its `max_effort`, else the wire format's `default_max`.
+    pub fn effort<'a>(
+        self,
+        off_effort: Option<&'a str>,
+        max_effort: Option<&'a str>,
+        default_max: &'a str,
+    ) -> Option<&'a str> {
+        match self {
+            Self::Off => off_effort,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Max => Some(max_effort.unwrap_or(default_max)),
+        }
+    }
+}
+
+/// A base URL without trailing slashes, so paths can be appended with `/`.
+pub fn trim_trailing_slash(mut value: String) -> String {
+    while value.ends_with('/') {
+        value.pop();
+    }
+    value
+}
+
 /// One piece of new user input. Documents and images are passed through
 /// natively to providers that accept them (Anthropic `document`/`image`
 /// blocks, OpenAI `input_file`/`input_image`) — tellm never extracts or

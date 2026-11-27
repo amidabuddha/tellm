@@ -49,7 +49,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ProviderReply,
-    ThinkingLevel, Usage, read_provider_response, usage_count,
+    ThinkingLevel, Usage, read_provider_response, trim_trailing_slash, usage_count,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -339,13 +339,7 @@ fn thinking_level<'a>(
     off_effort: Option<&'a str>,
     max_effort: Option<&'a str>,
 ) -> Option<&'a str> {
-    match thinking {
-        ThinkingLevel::Off => off_effort,
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
-    }
+    thinking.effort(off_effort, max_effort, DEFAULT_MAX_EFFORT)
 }
 
 fn extract_text(steps: &[Value]) -> String {
@@ -423,11 +417,4 @@ fn is_supported_image(media_type: &str) -> bool {
 
 fn is_supported_document(media_type: &str) -> bool {
     matches!(media_type, "application/pdf" | "text/csv")
-}
-
-fn trim_trailing_slash(mut value: String) -> String {
-    while value.ends_with('/') {
-        value.pop();
-    }
-    value
 }

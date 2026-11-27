@@ -56,7 +56,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ProviderReply,
-    ThinkingLevel, Usage, check_image_types, read_provider_response, usage_count,
+    ThinkingLevel, Usage, check_image_types, read_provider_response, trim_trailing_slash,
+    usage_count,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -534,13 +535,7 @@ fn anthropic_effort<'a>(
     off_effort: Option<&'a str>,
     max_effort: Option<&'a str>,
 ) -> Option<&'a str> {
-    match thinking {
-        ThinkingLevel::Off => off_effort,
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
-    }
+    thinking.effort(off_effort, max_effort, DEFAULT_MAX_EFFORT)
 }
 
 fn extract_text(content: &[Value]) -> String {
@@ -568,11 +563,4 @@ fn refusal_message(value: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("request declined")
         .to_string()
-}
-
-fn trim_trailing_slash(mut value: String) -> String {
-    while value.ends_with('/') {
-        value.pop();
-    }
-    value
 }

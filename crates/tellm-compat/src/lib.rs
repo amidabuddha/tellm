@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use tellm_core::{
     CUT_OFF_NOTE, ChatRequest, ChatResponse, ContentPart, GeneratedImage, OUTPUT_LIMIT_BEFORE_TEXT,
     Provider, ProviderError, ProviderReply, ThinkingLevel, Usage, read_provider_response,
-    usage_count,
+    trim_trailing_slash, usage_count,
 };
 
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -359,13 +359,7 @@ fn reasoning_effort<'a>(
     off_effort: Option<&'a str>,
     max_effort: Option<&'a str>,
 ) -> Option<&'a str> {
-    match thinking {
-        ThinkingLevel::Off => off_effort,
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Max => Some(max_effort.unwrap_or(DEFAULT_MAX_EFFORT)),
-    }
+    thinking.effort(off_effort, max_effort, DEFAULT_MAX_EFFORT)
 }
 
 fn extract_text(message: &Value) -> String {
@@ -418,13 +412,6 @@ fn api_error_message(value: &Value) -> String {
 
 fn data_url(media_type: &str, base64: &str) -> String {
     format!("data:{media_type};base64,{base64}")
-}
-
-fn trim_trailing_slash(mut value: String) -> String {
-    while value.ends_with('/') {
-        value.pop();
-    }
-    value
 }
 
 fn chat_completions_url(base_url: String) -> String {
