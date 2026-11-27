@@ -12,13 +12,17 @@
 //!   signatures back unchanged on future turns.
 //! - Thinking: `generation_config.thinking_level` for low/medium/high.
 //!   `Off` sends the model's `off_effort` and omits the field when that is
-//!   unset; `Max` sends the model's `max_effort`, or `high` when unset
-//!   because Interactions has no level above it.
-//!   Gemini 4 Carbon, Gemini 4 Argon, 3.8 Flash and 3.6 Flash support all
-//!   three mapped levels; Carbon, Argon and 3.8 Flash reject `minimal`, so
-//!   `low` is the lowest `off_effort` they take (checked 2026-11-16; Carbon
-//!   2026-11-17). Requests do not send the deprecated sampling
-//!   parameters and always end in a `user_input` step.
+//!   unset; `Max` sends the model's `max_effort`, or `high` when unset,
+//!   because `high` is the top level of Gemini 4 Carbon and Argon. Gemini 4
+//!   Neon and Hydrogen list `xhigh` above it, which a model config opts into
+//!   with `max_effort = "xhigh"` (checked 2026-11-27 against the model pages
+//!   on aistudio.google.com/docs, where ai.google.dev now redirects).
+//!   Gemini 4 Carbon, Neon, Argon, 3.8 Flash and 3.6 Flash support all
+//!   three mapped levels; Carbon, Neon, Argon and 3.8 Flash reject
+//!   `minimal`, so `low` is the lowest `off_effort` they take (checked
+//!   2026-11-16; Carbon 2026-11-17; Neon 2026-11-27 against Google Cloud's
+//!   Gemini 4 Neon developer's guide). Requests do not send the deprecated
+//!   sampling parameters and always end in a `user_input` step.
 //! - Web search: `tools: [{type: "google_search", search_types:
 //!   ["web_search"]}]`.
 //! - Images/documents: native `image` and `document` content blocks with
@@ -52,8 +56,9 @@ pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// `thinking_level` sent for `ThinkingLevel::Max` unless the model's
-/// `max_effort` config names another level. Interactions has no level above
-/// "high".
+/// `max_effort` config names another level. "high" is the top level of
+/// Gemini 4 Carbon and Argon; Gemini 4 Neon and Hydrogen also take "xhigh"
+/// (checked 2026-11-27), which their config sets as `max_effort`.
 pub const DEFAULT_MAX_EFFORT: &str = "high";
 
 #[derive(Clone)]

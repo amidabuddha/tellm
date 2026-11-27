@@ -60,7 +60,7 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 
 // Each preset is its lab's most capable model that an ordinary API key can
 // call; that is what tellm is for. All checked 2026-11-16 and rechecked
-// 2026-11-19, when only OpenAI's had changed:
+// 2026-11-19, when only OpenAI's had changed, and 2026-11-27, when none had:
 // - platform.claude.com model docs: Claude Fable 5.2 uses ID claude-fable-5-2
 //   and is Anthropic's most capable generally available model (Claude Mythos
 //   5.2 is limited to verified organizations). Thinking is always adaptive,
@@ -83,9 +83,12 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 //   the Interactions API as a drop-in for gemini-4-argon, and its thinking
 //   level accepts low/medium/high with medium the default (Gemini 4 Carbon
 //   developer guide on aistudio.google.com); minimal is an HTTP 400
-//   (docs.cloud.google.com developer's guide). The ai.google.dev pages do
-//   not list Carbon and still call Gemini 4 Argon the most capable model,
-//   so they are not enough to check Google's lineup.
+//   (docs.cloud.google.com developer's guide). Rechecked 2026-11-27:
+//   ai.google.dev now redirects to aistudio.google.com/docs, whose models
+//   page calls Carbon "our strongest reasoning model". Gemini 4 Neon
+//   (gemini-4-neon, released 2026-11-18) is the cheaper middle tier, placed
+//   between Carbon and Gemini 4 Hydrogen; Google keeps Carbon for the
+//   hardest long-horizon work (blog.google, "Introducing Gemini 4 Neon").
 //
 // None of the five can turn reasoning off, and without an effort each one
 // reasons at its own default, which is the top tier on Muse Wonder. So each

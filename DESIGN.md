@@ -152,7 +152,11 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   that list a higher tier opt in with `max_effort = "max"`: OpenAI's GPT-5.6,
   GPT-6, GPT-6.1, and GPT-6.2 families, Meta's muse-wonder-1.0, muse-spark-1.3, and
   muse-ember-1.0, and DeepSeek over chat completions. No Grok model lists
-  `max`. Built-in presets write the value their model needs. tellm checks only
+  `max`. Gemini 4 Neon and Gemini 4 Hydrogen list `xhigh` above `high` and opt
+  in with `max_effort = "xhigh"`; Gemini 4 Carbon and Argon stop at `high`
+  (checked 2026-11-27 against the model pages on aistudio.google.com/docs,
+  where ai.google.dev now redirects). Built-in presets write the value their
+  model needs. tellm checks only
   that the value is one token; an unsupported value errors explicitly at the
   provider and the user can lower the room's level.
 - Gemini thinking levels are model-dependent: gemini-4-carbon,
@@ -160,6 +164,10 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   low/medium/high. Carbon, Argon, and 3.8 Flash reject `minimal`, so `low` is
   the lowest `off_effort` they take (checked 2026-11-16; Carbon checked
   2026-11-17 against Google's Gemini 4 Carbon developer guide).
+  gemini-4-neon accepts low/medium/high/xhigh with `high` the default and
+  answers `minimal` with HTTP 400, so it takes `off_effort = "low"` and
+  `max_effort = "xhigh"` (checked 2026-11-27 against Google Cloud's Gemini 4
+  Neon developer's guide).
 - Anthropic sends the model's optional `max_output_tokens` as `max_tokens`,
   and 16000 when it is unset: thinking tokens count toward `max_tokens`, and
   4096 risked mid-thought truncation at high/max effort. The setting exists
@@ -290,10 +298,13 @@ Notes:
   as an array of Interactions `Step` objects (checked 2026-07-26 against
   ai.google.dev for Gemini 3.6 Flash; rechecked 2026-11-16 for Gemini 4
   Argon). Gemini 4 Carbon is a drop-in model id on the same API (checked
-  2026-11-17 against Google's Gemini 4 Carbon developer guide). Requests omit
-  deprecated sampling parameters and end in a `user_input` step, never a
-  prefilled model turn. Long decode past 64K output tokens on Gemini 4 Carbon
-  and Argon needs background execution or a continuation token; tellm uses
+  2026-11-17 against Google's Gemini 4 Carbon developer guide), and so is
+  Gemini 4 Neon, whose Interactions thinking levels are lowercase (checked
+  2026-11-27 against Google Cloud's Gemini 4 Neon developer's guide).
+  Requests omit deprecated sampling parameters and end in a `user_input`
+  step, never a prefilled model turn. Long decode past 64K output tokens on
+  Gemini 4 Carbon, Neon, and Argon needs background execution or a
+  continuation token; tellm uses
   neither, so a reply that stops early comes back with a non-completed status
   and is reported as unsupported follow-up handling.
   Raw response `steps` are replayed through `turn_items`
@@ -742,7 +753,7 @@ restart and local room-setting changes.
 - First run: when `config.toml` is absent, the interactive wizard asks for a
   Telegram bot token, validates it with `getMe`, asks for one provider choice
   from the built-in list, which is each lab's most capable model that an
-  ordinary API key can call (rechecked 2026-11-19: Claude Fable 5.2, GPT-6.2
+  ordinary API key can call (rechecked 2026-11-27: Claude Fable 5.2, GPT-6.2
   Astra, Grok 4.7, Muse Wonder 1.0 in preview, Gemini 4 Carbon), each with the
   list prices that could be checked against the provider's pricing page
   (Claude Fable 5.2 checked 2026-11-18, GPT-6.2 Astra 2026-11-19; Grok needs none because xAI reports its billed cost; Muse Wonder and
