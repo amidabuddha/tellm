@@ -23,7 +23,9 @@
 //! - Image generation: `{"type": "image_generation"}` tool (OpenAI only);
 //!   Meta Model API supports image understanding, not image generation.
 //!   Results come back as base64 in `image_generation_call` output items.
-//! - Files/images: `input_file` / `input_image` content parts.
+//! - Files/images: `input_file` / `input_image` content parts. OpenAI takes
+//!   PNG, JPEG, WEBP and GIF images (checked 2026-11-27, see
+//!   `is_supported_openai_image`); xAI and Meta check their own.
 //! - `status: "incomplete"`: a partial answer gets a closing note, one
 //!   without text is an error, and `content_filter` is a refusal (checked
 //!   2026-11-27, see `incomplete_note`).
@@ -48,8 +50,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     CUT_OFF_NOTE, ChatRequest, ChatResponse, ContentPart, GeneratedImage, OUTPUT_LIMIT_BEFORE_TEXT,
-    Provider, ProviderError, ProviderReply, ThinkingLevel, Usage, read_provider_response,
-    usage_count,
+    Provider, ProviderError, ProviderReply, ThinkingLevel, Usage, check_image_types,
+    read_provider_response, usage_count,
 };
 
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -151,6 +153,15 @@ impl Provider for Responses {
             ));
         }
 
+        // xAI and Meta publish their own image limits; they answer for them.
+        if !is_xai && !is_meta {
+            check_image_types(
+                &request.input,
+                "OpenAI Responses",
+                is_supported_openai_image,
+            )?;
+        }
+
         let user_message = user_message(&request.input);
         let body = request_body(
             request,
@@ -237,6 +248,15 @@ fn incomplete_note(
     } else {
         INCOMPLETE_NOTE
     }))
+}
+
+/// Checked 2026-11-27 against developers.openai.com (images and vision,
+/// input requirements): PNG, JPEG, WEBP and non-animated GIF.
+fn is_supported_openai_image(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
 }
 
 /// xAI's `cost_in_usd_ticks` unit: 10^10 ticks per US dollar (checked

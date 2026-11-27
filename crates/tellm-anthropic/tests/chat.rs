@@ -712,3 +712,22 @@ async fn a_non_json_error_page_keeps_its_status() {
         "{error:?}"
     );
 }
+
+#[tokio::test]
+async fn images_in_unsupported_formats_are_refused_before_sending() {
+    let mock = MockAnthropic::start(Vec::new());
+    let mut req = request();
+    req.input.push(ContentPart::Image {
+        media_type: "image/heic".to_string(),
+        base64: "AAAA".to_string(),
+    });
+
+    let error = client(&mock).chat(&req).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::Unsupported(message)
+            if message == "Anthropic Messages does not support image media type image/heic"),
+        "{error:?}"
+    );
+    assert!(mock.requests().is_empty());
+}

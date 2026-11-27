@@ -292,6 +292,27 @@ fn error_text(bytes: &[u8]) -> String {
     line
 }
 
+/// Refuses an input image whose media type `supported` rejects, before the
+/// request is sent. Telegram passes a file's type through as the sender's
+/// client named it, so an image sent as a file can be HEIC, TIFF or SVG; the
+/// error names the type so the runtime can suggest sending a photo instead.
+pub fn check_image_types(
+    input: &[ContentPart],
+    endpoint: &str,
+    supported: impl Fn(&str) -> bool,
+) -> Result<(), ProviderError> {
+    for part in input {
+        if let ContentPart::Image { media_type, .. } = part
+            && !supported(media_type)
+        {
+            return Err(ProviderError::Unsupported(format!(
+                "{endpoint} does not support image media type {media_type}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Appended to the text of a reply that stopped at the provider's output
 /// limit, so a cut-off answer is not mistaken for a finished one. Only the
 /// user sees it: the stored `turn_items` keep the model's own content.

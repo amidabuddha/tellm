@@ -349,6 +349,13 @@ Notes:
   Gemini `document`/`image` content blocks.
   `.txt` is read as text. Providers that can't take a part get a clear
   "unsupported" message, not silent degradation.
+  Telegram photos always arrive as JPEG, but an image sent as a file keeps
+  whatever type the sender's client gave it. Anthropic and OpenAI take JPEG,
+  PNG, GIF and WebP (checked 2026-11-27, platform.claude.com vision and
+  developers.openai.com images and vision); Gemini also takes HEIC, HEIF,
+  BMP and TIFF; xAI and Meta check their own. An image of another type is
+  refused before the request is sent, and the reply suggests sending it as
+  a photo.
 - **No streaming anywhere.** Telegram delivers complete messages; providers
   are called non-streaming. This deletes the largest complexity class of the
   parent app.

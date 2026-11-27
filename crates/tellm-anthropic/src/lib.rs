@@ -26,6 +26,8 @@
 //!   once the runtime prunes earlier turns, leaves them out of a request, or
 //!   the tool list changes, every kept turn must go through
 //!   [`without_thinking_blocks`] before it is sent again.
+//! - Images must be JPEG, PNG, GIF or WebP (checked 2026-11-27, see
+//!   `is_supported_image`); others are refused before sending.
 //! - Documents/images: native `document` / `image` content blocks (base64) —
 //!   PDFs pass through without client-side extraction.
 //! - Handle `stop_reason: "refusal"` before reading content
@@ -54,7 +56,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ProviderReply,
-    ThinkingLevel, Usage, read_provider_response, usage_count,
+    ThinkingLevel, Usage, check_image_types, read_provider_response, usage_count,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -204,6 +206,7 @@ impl Provider for Anthropic {
                 "Anthropic Messages does not support image generation".to_string(),
             ));
         }
+        check_image_types(&request.input, "Anthropic Messages", is_supported_image)?;
 
         let user_message = json!({
             "role": "user",
@@ -360,6 +363,15 @@ impl Anthropic {
             ProviderReply::Error { status, body } => Err(api_error(status, &body)),
         }
     }
+}
+
+/// Checked 2026-11-27 against platform.claude.com (vision, supported
+/// formats): JPEG, PNG, GIF and WebP; an animation is read as its first frame.
+fn is_supported_image(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    )
 }
 
 /// The message Anthropic gives a request whose input alone exceeds the

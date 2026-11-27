@@ -154,6 +154,10 @@ pub(crate) fn provider_error_reply(error: &TurnError) -> String {
         reply.push_str(
             "\nTip: this chat no longer fits the model's context window; /new summary carries a summary of it into a new chat",
         );
+    } else if message.contains("image media type") {
+        reply.push_str(
+            "\nTip: send the picture as a photo rather than a file; Telegram delivers photos as JPEG",
+        );
     } else if message.contains("image generation") || message.contains("image_generation") {
         reply.push_str("\nTip: /imagegen off");
     } else if message.contains("web search") || message.contains("web_search") {
@@ -568,6 +572,17 @@ mod tests {
 
         assert!(reply.contains("Tip: /reasoning low"), "{reply}");
         assert!(reply.contains("max_output_tokens"), "{reply}");
+    }
+
+    #[test]
+    fn unsupported_image_types_suggest_sending_a_photo() {
+        let error = TurnError::from(tellm_core::ProviderError::Unsupported(
+            "Anthropic Messages does not support image media type image/heic".to_string(),
+        ));
+
+        let reply = provider_error_reply(&error);
+
+        assert!(reply.contains("send the picture as a photo"), "{reply}");
     }
 
     #[test]
