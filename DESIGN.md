@@ -828,7 +828,10 @@ that key is configured again.
   billed cost). Gemini 4 Carbon gets the price Google charges from 2026-12-01,
   twice its launch price, and no search price, because Google's first 5,000
   searches a month are free and a missing search price counts searches as
-  free. The wizard stores Telegram/provider
+  free. A secret whose `TELLM_*` variable is set is taken from it without a
+  prompt and is not stored, since that variable overrides any stored value;
+  a set but empty or non-UTF-8 variable stops the wizard with its name. The
+  wizard stores the other Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather
   than repeatedly prompting on a closed input stream.

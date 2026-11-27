@@ -221,9 +221,14 @@ pub async fn run_first_run(
         output,
         "Create a Telegram bot with BotFather, then paste its token here."
     )?;
-    let telegram_token = prompt_required(input, output, "Telegram bot token: ")?;
+    let telegram_token = secret_or_prompt(
+        input,
+        output,
+        "Telegram bot token",
+        secrets::environment_override(secrets::TELEGRAM_BOT_TOKEN),
+    )?;
 
-    let bot = Telegram::new(telegram_token.clone()).get_me().await?;
+    let bot = Telegram::new(telegram_token.value.clone()).get_me().await?;
     if !bot.is_bot {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -248,30 +253,24 @@ pub async fn run_first_run(
         )?;
     }
     let preset = prompt_provider(input, output)?;
-    let api_key = prompt_required(input, output, &format!("{} API key: ", preset.label))?;
+    let api_key = secret_or_prompt(
+        input,
+        output,
+        &format!("{} API key", preset.label),
+        secrets::environment_override(preset.api_key_secret),
+    )?;
 
     let config = config_for_preset(preset);
-    let telegram_destination = secrets::set_nonempty(secrets::TELEGRAM_BOT_TOKEN, &telegram_token)?
-        .expect("prompt_required returned a non-empty Telegram token");
-    let provider_destination = secrets::set_nonempty(preset.api_key_secret, &api_key)?
-        .expect("prompt_required returned a non-empty provider key");
+    let telegram_status = store_wizard_secret(secrets::TELEGRAM_BOT_TOKEN, &telegram_token)?;
+    let provider_status = store_wizard_secret(preset.api_key_secret, &api_key)?;
     // A config file marks setup complete, so publish it only after every
     // referenced secret has been stored successfully.
     tellm_config::save(&config)?;
 
     writeln!(output)?;
     writeln!(output, "Config saved to {}.", config_path()?.display())?;
-    writeln!(
-        output,
-        "Telegram bot token {}.",
-        telegram_destination.status_message()
-    )?;
-    writeln!(
-        output,
-        "{} API key {}.",
-        preset.label,
-        provider_destination.status_message()
-    )?;
+    writeln!(output, "Telegram bot token {telegram_status}.")?;
+    writeln!(output, "{} API key {provider_status}.", preset.label)?;
     writeln!(
         output,
         "Pairing mode is enabled until a Telegram chat claims the bot with /pair CODE."
@@ -282,6 +281,57 @@ pub async fn run_first_run(
     )?;
     output.flush()?;
     Ok(())
+}
+
+/// A secret the wizard needs, and the `TELLM_*` variable it came from, if
+/// one is set.
+#[derive(Debug, PartialEq, Eq)]
+struct WizardSecret {
+    value: String,
+    variable: Option<String>,
+}
+
+/// Takes a secret from its `TELLM_*` override when one is set, and asks for
+/// it otherwise. The override wins over every stored value, so asking would
+/// be pointless and storing the answer impossible.
+fn secret_or_prompt(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    label: &str,
+    environment: Option<(String, Option<String>)>,
+) -> Result<WizardSecret, Box<dyn std::error::Error>> {
+    match environment {
+        Some((variable, Some(value))) if !value.trim().is_empty() => {
+            writeln!(output, "{label}: using {variable}.")?;
+            Ok(WizardSecret {
+                value: value.trim().to_string(),
+                variable: Some(variable),
+            })
+        }
+        Some((variable, _)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{variable} is set but empty or not UTF-8; set it to the {label} or unset it"),
+        )
+        .into()),
+        None => Ok(WizardSecret {
+            value: prompt_required(input, output, &format!("{label}: "))?,
+            variable: None,
+        }),
+    }
+}
+
+/// Stores a prompted secret and says where; one from the environment is
+/// left there.
+fn store_wizard_secret(
+    name: &str,
+    secret: &WizardSecret,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(variable) = &secret.variable {
+        return Ok(format!("comes from {variable}, so it was not stored"));
+    }
+    let destination = secrets::set_nonempty(name, &secret.value)?
+        .expect("prompt_required returned a non-empty value");
+    Ok(destination.status_message().to_string())
 }
 
 fn prompt_provider(
@@ -542,5 +592,49 @@ mod tests {
             "first-run input ended before setup was complete"
         );
         assert_eq!(output, b"Telegram bot token: ");
+    }
+
+    #[test]
+    fn secrets_set_in_the_environment_are_used_without_asking_or_storing() {
+        let mut input = std::io::Cursor::new(b"typed-key\n".to_vec());
+        let mut output = Vec::new();
+
+        let from_env = secret_or_prompt(
+            &mut input,
+            &mut output,
+            "Telegram bot token",
+            Some((
+                "TELLM_TELEGRAM_BOT_TOKEN".to_string(),
+                Some(" env-token ".to_string()),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            from_env,
+            WizardSecret {
+                value: "env-token".to_string(),
+                variable: Some("TELLM_TELEGRAM_BOT_TOKEN".to_string()),
+            }
+        );
+        assert_eq!(
+            store_wizard_secret("telegram_bot_token", &from_env).unwrap(),
+            "comes from TELLM_TELEGRAM_BOT_TOKEN, so it was not stored"
+        );
+
+        let prompted = secret_or_prompt(&mut input, &mut output, "Claude API key", None).unwrap();
+        assert_eq!(prompted.value, "typed-key");
+        assert_eq!(prompted.variable, None);
+        let shown = String::from_utf8(output).unwrap();
+        assert!(shown.contains("Telegram bot token: using TELLM_TELEGRAM_BOT_TOKEN."));
+        assert!(shown.contains("Claude API key: "));
+
+        let unusable = secret_or_prompt(
+            &mut std::io::Cursor::new(Vec::new()),
+            &mut Vec::new(),
+            "Claude API key",
+            Some(("TELLM_ANTHROPIC_API_KEY".to_string(), None)),
+        )
+        .unwrap_err();
+        assert!(unusable.to_string().contains("TELLM_ANTHROPIC_API_KEY"));
     }
 }

@@ -696,6 +696,18 @@ pub mod secrets {
         Ok(SecretDestination::OsKeychain)
     }
 
+    /// The `TELLM_*` variable that overrides `name`, with its value, when
+    /// it is set. The value is `None` when it is not UTF-8, which [`get`]
+    /// treats as no value rather than falling back to a stored one.
+    pub fn environment_override(name: &str) -> Option<(String, Option<String>)> {
+        if is_reserved_name(name) {
+            return None;
+        }
+        let variable = env_var_name(name);
+        let value = std::env::var_os(&variable)?;
+        Some((variable, value.into_string().ok()))
+    }
+
     pub fn set_nonempty(name: &str, value: &str) -> Result<Option<SecretDestination>, SecretError> {
         let value = value.trim();
         if value.is_empty() {
