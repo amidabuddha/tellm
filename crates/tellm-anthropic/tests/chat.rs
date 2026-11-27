@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tellm_anthropic::{
-    API_VERSION, Anthropic, CUT_OFF_NOTE, DEFAULT_MAX_TOKENS, MAX_TOKENS_PER_REQUEST_TIMEOUT,
-    OUTPUT_LIMIT_BEFORE_TEXT, WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL_TYPE, request_timeout_for,
+    API_VERSION, Anthropic, CONTEXT_FULL_BEFORE_TEXT, CONTEXT_FULL_NOTE, CUT_OFF_NOTE,
+    DEFAULT_MAX_TOKENS, MAX_TOKENS_PER_REQUEST_TIMEOUT, OUTPUT_LIMIT_BEFORE_TEXT,
+    WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL_TYPE, request_timeout_for,
 };
 use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
 use tellm_test_support::{MockHttpServer as MockAnthropic, MockResponse};
@@ -371,6 +372,44 @@ async fn max_tokens_stop_before_any_text_is_an_error_not_an_empty_turn() {
 
     assert!(
         matches!(error, ProviderError::Api { status: 200, message } if message == OUTPUT_LIMIT_BEFORE_TEXT)
+    );
+}
+
+#[tokio::test]
+async fn context_window_stop_marks_the_reply_as_cut_off() {
+    let assistant_content = json!([{ "type": "text", "text": "The first half" }]);
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": assistant_content,
+            "stop_reason": "model_context_window_exceeded"
+        }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    assert_eq!(response.text, format!("The first half{CONTEXT_FULL_NOTE}"));
+    assert_eq!(
+        response.turn_items[1],
+        json!({ "role": "assistant", "content": assistant_content })
+    );
+}
+
+#[tokio::test]
+async fn context_window_stop_before_any_text_is_a_context_window_error() {
+    let mock = MockAnthropic::start(vec![MockResponse::json(
+        200,
+        json!({
+            "content": [{ "type": "thinking", "thinking": "", "signature": "sig-1" }],
+            "stop_reason": "model_context_window_exceeded"
+        }),
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::ContextWindowExceeded { status: 200, message } if message == CONTEXT_FULL_BEFORE_TEXT),
+        "{error:?}"
     );
 }
 

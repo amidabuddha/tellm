@@ -221,6 +221,12 @@ Notes:
   so, while the stored turn keeps the model's own content. A reply cut off
   before any text is a provider error, and the error reply suggests
   `/reasoning low` or a higher `max_output_tokens`.
+- Handle Anthropic `stop_reason: model_context_window_exceeded` (checked
+  2026-11-27 against platform.claude.com, handling stop reasons): the reply
+  stopped because the chat filled the context window. A cut-off answer gets
+  a closing note pointing at `/new summary`; one without text is the same
+  context-window error as an oversized prompt, so the error reply offers
+  `/new summary` too.
 - A request over the model's context window is told apart from other API
   errors only where the provider documents an error for it (checked
   2026-11-19): Anthropic's HTTP 400 `invalid_request_error` "prompt is too

@@ -37,6 +37,10 @@
 //! - Handle `stop_reason: "max_tokens"`: thinking counts toward the limit, so
 //!   a reply can stop mid-answer or before any text. A cut-off answer gets
 //!   [`CUT_OFF_NOTE`]; one without text is an error instead of an empty turn.
+//! - Handle `stop_reason: "model_context_window_exceeded"` the same way, with
+//!   [`CONTEXT_FULL_NOTE`]; without text it is
+//!   `ProviderError::ContextWindowExceeded` (checked 2026-11-27 against
+//!   platform.claude.com, handling stop reasons).
 //! - Usage: `usage.input_tokens` counts only input that was neither read from
 //!   nor written to the cache; `cache_read_input_tokens` and
 //!   `cache_creation_input_tokens` are reported beside it, and
@@ -83,6 +87,12 @@ pub const CUT_OFF_NOTE: &str = "\n\n(Reply cut off: it reached the output limit.
 /// Error message for a reply that stopped at `max_tokens` before any text.
 pub const OUTPUT_LIMIT_BEFORE_TEXT: &str =
     "the reply reached the max_tokens output limit before any answer text";
+/// Appended to a reply that stopped because the chat filled the model's
+/// context window. Like [`CUT_OFF_NOTE`], only the user sees it.
+pub const CONTEXT_FULL_NOTE: &str = "\n\n(Reply cut off: this chat filled the model's context window. /new summary carries a summary of it into a new chat.)";
+/// Error message for a reply that filled the context window before any text.
+pub const CONTEXT_FULL_BEFORE_TEXT: &str =
+    "the reply filled the model's context window before any answer text";
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Idle time before TCP keep-alive probes start. A non-streamed reply sends
@@ -263,6 +273,19 @@ impl Provider for Anthropic {
                     message: OUTPUT_LIMIT_BEFORE_TEXT.to_string(),
                 });
             }
+            // Checked 2026-11-27 against platform.claude.com (handling stop
+            // reasons): `model_context_window_exceeded` means the reply
+            // stopped because input plus output filled the context window.
+            // What came back is valid but incomplete. Without text it is the
+            // same failure as an oversized prompt, so it takes that error
+            // and the runtime offers /new summary.
+            let context_full = stop_reason == "model_context_window_exceeded";
+            if context_full && text_parts.is_empty() {
+                return Err(ProviderError::ContextWindowExceeded {
+                    status: 200,
+                    message: CONTEXT_FULL_BEFORE_TEXT.to_string(),
+                });
+            }
 
             if stop_reason == "pause_turn" {
                 if continuation == MAX_PAUSE_TURN_CONTINUATIONS {
@@ -284,6 +307,8 @@ impl Provider for Anthropic {
             let mut text = text_parts.join("");
             if cut_off {
                 text.push_str(CUT_OFF_NOTE);
+            } else if context_full {
+                text.push_str(CONTEXT_FULL_NOTE);
             }
 
             return Ok(ChatResponse {
