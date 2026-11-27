@@ -365,7 +365,7 @@ impl Runtime {
                                     // from allowed_updates can still arrive. Never turn an edit
                                     // into a second billed provider call.
                                     log_update_route(
-                                        message.chat.id,
+                                        &message,
                                         UpdateKind::EditedMessage,
                                         UpdateRoute::Ignored,
                                     );
@@ -559,7 +559,7 @@ impl Runtime {
                 if let Some(code) =
                     pair_code_from_message(&message, handles.bot_username.as_deref())
                 {
-                    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Command);
+                    log_update_route(&message, UpdateKind::Message, UpdateRoute::Command);
                     let pairer = message.from.as_ref().map(|user| user.id);
                     if let Err(error) = handle_pair_attempt(chat_id, code, pairer, handles).await {
                         log::warn!(
@@ -568,7 +568,7 @@ impl Runtime {
                         );
                     }
                 } else if send_hint {
-                    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
+                    log_update_route(&message, UpdateKind::Message, UpdateRoute::Ignored);
                     let telegram = self.telegram.clone();
                     tokio::spawn(async move {
                         let _ = telegram
@@ -576,7 +576,7 @@ impl Runtime {
                             .await;
                     });
                 } else {
-                    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
+                    log_update_route(&message, UpdateKind::Message, UpdateRoute::Ignored);
                 }
             }
         }
@@ -803,11 +803,11 @@ async fn handle_allowed_message(
         .await?
         {
             Route::Command(action) => {
-                log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Command);
+                log_update_route(&message, UpdateKind::Message, UpdateRoute::Command);
                 return handle_command(chat_id, action, handles, cancelled).await;
             }
             Route::Ignore => {
-                log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
+                log_update_route(&message, UpdateKind::Message, UpdateRoute::Ignored);
                 return Ok(());
             }
             Route::UserMessage => {}
@@ -815,10 +815,10 @@ async fn handle_allowed_message(
     }
 
     if !model_turn::message_has_input(&message) {
-        log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Ignored);
+        log_update_route(&message, UpdateKind::Message, UpdateRoute::Ignored);
         return Ok(());
     }
-    log_update_route(chat_id, UpdateKind::Message, UpdateRoute::Model);
+    log_update_route(&message, UpdateKind::Message, UpdateRoute::Model);
     handle_model_message(chat_id, message, handles, cancelled).await
 }
 
@@ -2353,17 +2353,32 @@ fn allowed_group_chat_ids(config: &AccessConfig) -> BTreeSet<i64> {
         .collect()
 }
 
-fn log_update_route(chat_id: i64, kind: UpdateKind, route: UpdateRoute) {
+fn log_update_route(message: &IncomingMessage, kind: UpdateKind, route: UpdateRoute) {
     log::debug!(
         target: "tellm::telegram",
         "{}",
-        update_log_line(chat_id, kind, route)
+        update_log_line(
+            message.chat.id,
+            message.message_id,
+            message.from.as_ref().map(|user| user.id),
+            kind,
+            route,
+        )
     );
 }
 
-fn update_log_line(chat_id: i64, kind: UpdateKind, route: UpdateRoute) -> String {
+/// The message id tells a second message from the same one delivered twice,
+/// and the sender tells the user's own messages from another group member's.
+fn update_log_line(
+    chat_id: i64,
+    message_id: i64,
+    sender_id: Option<i64>,
+    kind: UpdateKind,
+    route: UpdateRoute,
+) -> String {
+    let sender = sender_id.map_or_else(|| "none".to_string(), |id| id.to_string());
     format!(
-        "update chat_id={chat_id} kind={} route={}",
+        "update chat_id={chat_id} message_id={message_id} from={sender} kind={} route={}",
         kind.as_str(),
         route.as_str()
     )
@@ -2898,6 +2913,7 @@ mod tests {
     #[test]
     fn edited_updates_are_never_dispatchable_as_model_or_command_messages() {
         let edited = IncomingMessage {
+            message_id: 1,
             chat: tellm_telegram::Chat {
                 id: 42,
                 title: None,
@@ -3128,12 +3144,12 @@ mod tests {
     #[test]
     fn update_log_line_contains_only_metadata() {
         assert_eq!(
-            update_log_line(-100, UpdateKind::Message, UpdateRoute::Model),
-            "update chat_id=-100 kind=message route=model"
+            update_log_line(-100, 17, Some(7), UpdateKind::Message, UpdateRoute::Model),
+            "update chat_id=-100 message_id=17 from=7 kind=message route=model"
         );
         assert_eq!(
-            update_log_line(42, UpdateKind::EditedMessage, UpdateRoute::Ignored),
-            "update chat_id=42 kind=edited_message route=ignored"
+            update_log_line(42, 3, None, UpdateKind::EditedMessage, UpdateRoute::Ignored),
+            "update chat_id=42 message_id=3 from=none kind=edited_message route=ignored"
         );
     }
 
@@ -3505,6 +3521,7 @@ mod tests {
 
     fn text_message(text: &str) -> IncomingMessage {
         IncomingMessage {
+            message_id: 1,
             chat: tellm_telegram::Chat {
                 id: 42,
                 title: None,

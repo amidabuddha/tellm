@@ -72,6 +72,7 @@ async fn get_updates_posts_long_poll_payload_and_parses_messages() {
         {
             "update_id": 11,
             "message": {
+                "message_id": 5,
                 "chat": { "id": 42 },
                 "date": 1000,
                 "text": "hello"
@@ -80,6 +81,7 @@ async fn get_updates_posts_long_poll_payload_and_parses_messages() {
         {
             "update_id": 12,
             "edited_message": {
+                "message_id": 4,
                 "chat": { "id": 43 },
                 "date": 1001,
                 "caption": "caption",
@@ -106,6 +108,7 @@ async fn get_updates_posts_long_poll_payload_and_parses_messages() {
     assert_eq!(updates.len(), 3);
     assert_eq!(updates[0].update_id, 11);
     assert_eq!(updates[0].message.as_ref().unwrap().chat.id, 42);
+    assert_eq!(updates[0].message.as_ref().unwrap().message_id, 5);
     assert_eq!(
         updates[1]
             .edited_message

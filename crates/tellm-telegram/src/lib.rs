@@ -74,6 +74,10 @@ pub struct ChatMember {
 /// The subset of Telegram's `Message` that tellm consumes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IncomingMessage {
+    /// Unique inside its chat and always present (0 for ephemeral
+    /// messages). Checked 2026-11-27 against
+    /// core.telegram.org/bots/api#message.
+    pub message_id: i64,
     pub chat: Chat,
     pub from: Option<User>,
     pub date: i64,

@@ -641,8 +641,11 @@ restart and local room-setting changes.
   process.
 - Runtime stderr diagnostics use an RFC 3339 local timestamp with milliseconds
   and UTC offset, followed by a level and component. Received-message
-  breadcrumbs are `DEBUG` records containing chat id, update kind, and route
-  (`command` / `model` / `ignored`) only; never message content. Negative
+  breadcrumbs are `DEBUG` records containing chat id, message id, sender user
+  id (`none` when Telegram names no sender), update kind, and route
+  (`command` / `model` / `ignored`) only; never message content. The message
+  id tells a second message from one delivered twice, and the sender tells
+  the owner's messages from another group member's. Negative
   allowed or pinned chat ids produce one aggregated group-privacy warning plus
   a debug id list at startup because Telegram privacy mode can filter plain
   group text before tellm receives it. Repeated identical `getUpdates`

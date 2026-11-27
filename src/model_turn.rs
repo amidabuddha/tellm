@@ -695,6 +695,7 @@ mod tests {
     #[test]
     fn message_model_input_detection_ignores_blank_messages() {
         let mut message = IncomingMessage {
+            message_id: 1,
             chat: tellm_telegram::Chat {
                 id: 42,
                 title: None,
