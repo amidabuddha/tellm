@@ -85,6 +85,16 @@ pub struct IncomingMessage {
     pub caption: Option<String>,
     pub photo: Option<Vec<PhotoSize>>,
     pub document: Option<Document>,
+    /// Shared by the items of one album. Telegram delivers an album (2-10
+    /// photos or files sent together) as one message per item, and a
+    /// caption arrives on the item it was written for, usually the first.
+    /// Checked 2026-11-27 against core.telegram.org/bots/api#message and
+    /// #sendmediagroup.
+    pub media_group_id: Option<String>,
+    /// Not from Telegram: the album's other items, in order, once tellm has
+    /// gathered an album into its first message.
+    #[serde(skip)]
+    pub album: Vec<IncomingMessage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -270,6 +270,20 @@ pub(crate) async fn content_parts_from_message(
         });
     }
 
+    for item in std::iter::once(message).chain(&message.album) {
+        push_attachment_parts(telegram, item, &mut parts).await?;
+    }
+
+    Ok(parts)
+}
+
+/// The photo or file one Telegram message carries, as content parts. An
+/// album's items each go through here, in order, after the caption.
+async fn push_attachment_parts(
+    telegram: &Telegram,
+    message: &IncomingMessage,
+    parts: &mut Vec<ContentPart>,
+) -> Result<(), String> {
     if let Some(photo) = largest_photo(message.photo.as_deref()) {
         let bytes = download_attachment(telegram, &photo.file_id, photo.file_size, "photo").await?;
         parts.push(ContentPart::Image {
@@ -304,7 +318,7 @@ pub(crate) async fn content_parts_from_message(
         }
     }
 
-    Ok(parts)
+    Ok(())
 }
 
 async fn download_attachment(
@@ -400,11 +414,20 @@ pub(crate) fn message_text(message: &IncomingMessage) -> Option<&str> {
 
 pub(crate) fn message_has_input(message: &IncomingMessage) -> bool {
     message_text(message).is_some_and(|text| !text.trim().is_empty())
-        || message
-            .photo
-            .as_ref()
-            .is_some_and(|photos| !photos.is_empty())
-        || message.document.is_some()
+        || std::iter::once(message)
+            .chain(&message.album)
+            .any(has_attachment)
+}
+
+pub(crate) fn has_photo(message: &IncomingMessage) -> bool {
+    message
+        .photo
+        .as_ref()
+        .is_some_and(|photos| !photos.is_empty())
+}
+
+fn has_attachment(message: &IncomingMessage) -> bool {
+    has_photo(message) || message.document.is_some()
 }
 
 fn largest_photo(photos: Option<&[PhotoSize]>) -> Option<&PhotoSize> {
@@ -753,6 +776,8 @@ mod tests {
             caption: None,
             photo: None,
             document: None,
+            media_group_id: None,
+            album: Vec::new(),
         };
 
         assert!(!message_has_input(&message));
@@ -1016,6 +1041,66 @@ mod tests {
             configured_provider_secret_names(&config),
             vec!["gemini_api_key".to_string(), "shared_api_key".to_string()]
         );
+    }
+
+    fn photo_message(file_id: &str) -> IncomingMessage {
+        IncomingMessage {
+            message_id: 1,
+            chat: tellm_telegram::Chat {
+                id: 42,
+                title: None,
+            },
+            from: None,
+            date: 1000,
+            text: None,
+            caption: None,
+            photo: Some(vec![PhotoSize {
+                file_id: file_id.to_string(),
+                width: 1,
+                height: 1,
+                file_size: Some(5),
+            }]),
+            document: None,
+            media_group_id: Some("album".to_string()),
+            album: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_album_is_its_caption_then_every_item_in_order() {
+        use tellm_test_support::{MockHttpServer, MockResponse};
+        let file = |path: &str| {
+            MockResponse::json(
+                200,
+                serde_json::json!({ "ok": true, "result": { "file_path": path } }),
+            )
+        };
+        let server = MockHttpServer::start(vec![
+            file("photos/a.jpg"),
+            MockResponse::bytes(200, "image/jpeg", b"first".to_vec()),
+            file("photos/b.jpg"),
+            MockResponse::bytes(200, "image/jpeg", b"other".to_vec()),
+        ]);
+        let telegram = Telegram::with_base_urls("token", server.base_url(), server.base_url());
+        let mut album = photo_message("a");
+        album.caption = Some("two shots".to_string());
+        album.album = vec![photo_message("b")];
+
+        assert!(message_has_input(&album));
+        let parts = content_parts_from_message(&telegram, &album).await.unwrap();
+
+        assert!(
+            matches!(&parts[0], ContentPart::Text { text } if text == "two shots"),
+            "{parts:?}"
+        );
+        let images: Vec<Vec<u8>> = parts[1..]
+            .iter()
+            .map(|part| match part {
+                ContentPart::Image { base64, .. } => BASE64.decode(base64).unwrap(),
+                other => panic!("expected an image, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(images, vec![b"first".to_vec(), b"other".to_vec()]);
     }
 
     #[tokio::test]

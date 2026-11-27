@@ -592,6 +592,12 @@ calls a billing API and never fetches prices.
   core content parts. Downloads accept images, PDFs, and text documents up to
   20 MiB. Declared oversize files are rejected before download; unknown-length
   bodies are read incrementally and stopped at the same limit.
+- Albums are one turn. Telegram delivers photos or files sent together as one
+  message per item sharing a `media_group_id` (2-10 items, checked 2026-11-27
+  against core.telegram.org/bots/api#sendmediagroup). The room's worker
+  gathers the items that follow the first in its queue, each within 1 s of
+  the last and up to 10, into one turn: every caption, then every item in
+  order. A message that arrives right after the album is answered after it.
 - Edited-message updates are deliberately ignored so correcting a Telegram
   message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with

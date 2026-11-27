@@ -30,6 +30,12 @@ const GET_UPDATES_RETRY_DELAY: Duration = Duration::from_secs(2);
 const GET_UPDATES_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const CHAT_QUEUE_SIZE: usize = 32;
 const CHAT_TASK_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long the worker waits for an album's next item before treating the
+/// album as complete. Telegram creates an album's messages together, so the
+/// items reach the queue back to back; the wait only bounds a straggler.
+const ALBUM_SETTLE: Duration = Duration::from_secs(1);
+/// Telegram's album size limit (sendMediaGroup takes 2-10 items).
+const MAX_ALBUM_ITEMS: usize = 10;
 const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 const TERMINAL_SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 static NEXT_CHAT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
@@ -612,6 +618,62 @@ fn dispatchable_message(update: &mut tellm_telegram::Update) -> Option<IncomingM
 /// Queue the update for its chat worker without ever blocking the poll
 /// loop: awaiting a full queue would stall dispatch for every chat behind
 /// one slow room, so a full queue drops the message with a busy notice.
+/// Gathers an album into its first message so the model sees every photo
+/// or file in one turn and replies once. Telegram delivers an album as one
+/// message per item, all sharing a `media_group_id`; the items that follow
+/// the first in the room's queue within `settle` of each other join it.
+/// Returns the first queued message that isn't part of the album, if one was
+/// read, so the caller handles it next.
+async fn gather_album(
+    first: IncomingMessage,
+    receiver: &mut mpsc::Receiver<IncomingMessage>,
+    settle: Duration,
+) -> (IncomingMessage, Option<IncomingMessage>) {
+    let Some(group) = first.media_group_id.clone() else {
+        return (first, None);
+    };
+    let mut items = vec![first];
+    let read_ahead = loop {
+        if items.len() >= MAX_ALBUM_ITEMS {
+            break None;
+        }
+        match timeout(settle, receiver.recv()).await {
+            Ok(Some(next)) if next.media_group_id.as_deref() == Some(group.as_str()) => {
+                items.push(next);
+            }
+            Ok(Some(next)) => break Some(next),
+            Ok(None) | Err(_) => break None,
+        }
+    };
+    (merge_album(items), read_ahead)
+}
+
+/// One message for a whole album: the first item, carrying every item's
+/// caption (usually there is one) and the other items in `album`.
+fn merge_album(mut items: Vec<IncomingMessage>) -> IncomingMessage {
+    let mut rest = items.split_off(1);
+    let Some(mut first) = items.pop() else {
+        unreachable!("gather_album always passes the first item");
+    };
+    let captions: Vec<String> = std::iter::once(&first)
+        .chain(&rest)
+        .filter_map(model_turn::message_text)
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !captions.is_empty() {
+        first.text = None;
+        first.caption = Some(captions.join("\n\n"));
+    }
+    for item in &mut rest {
+        item.text = None;
+        item.caption = None;
+    }
+    first.album = rest;
+    first
+}
+
 fn send_to_chat_worker(
     chat_id: i64,
     message: IncomingMessage,
@@ -739,6 +801,9 @@ fn spawn_chat_worker(
             worker_id,
             workers: worker_guard_registry,
         };
+        // A message read while gathering an album that isn't part of it; it
+        // is handled next, so the room's order holds.
+        let mut read_ahead: Option<IncomingMessage> = None;
         loop {
             // A self-deny does not abort the task so it can send the command
             // confirmation. Observe its flag before waiting for another item
@@ -747,13 +812,19 @@ fn spawn_chat_worker(
             {
                 break;
             }
-            match timeout(CHAT_TASK_IDLE_TIMEOUT, receiver.recv()).await {
+            let received = match read_ahead.take() {
+                Some(message) => Ok(Some(message)),
+                None => timeout(CHAT_TASK_IDLE_TIMEOUT, receiver.recv()).await,
+            };
+            match received {
                 Ok(Some(message)) => {
                     if worker_cancelled.load(Ordering::Acquire)
                         || !chat_is_allowed(chat_id, &handles).await
                     {
                         break;
                     }
+                    let (message, next) = gather_album(message, &mut receiver, ALBUM_SETTLE).await;
+                    read_ahead = next;
                     if let Err(error) =
                         handle_allowed_message(chat_id, message, &handles, &worker_cancelled).await
                     {
@@ -2660,19 +2731,28 @@ fn update_log_line(
 }
 
 /// What a message carries, never its content: `text(8)`, `photo+caption(12)`,
-/// `document`, or `none`. Text starting with `/` is flagged, so a slash
+/// `photos(7)` for an album, `document`, or `none`. Text starting with `/` is flagged, so a slash
 /// command tellm doesn't know shows up as `route=model` with `slash`.
 fn input_shape(message: &IncomingMessage) -> String {
+    let items = || std::iter::once(message).chain(&message.album);
     let mut parts = Vec::new();
-    if message
-        .photo
-        .as_ref()
-        .is_some_and(|photos| !photos.is_empty())
-    {
-        parts.push("photo".to_string());
-    }
-    if message.document.is_some() {
-        parts.push("document".to_string());
+    for (count, one, many) in [
+        (
+            items().filter(|item| model_turn::has_photo(item)).count(),
+            "photo",
+            "photos",
+        ),
+        (
+            items().filter(|item| item.document.is_some()).count(),
+            "document",
+            "documents",
+        ),
+    ] {
+        match count {
+            0 => {}
+            1 => parts.push(one.to_string()),
+            count => parts.push(format!("{many}({count})")),
+        }
     }
     if let Some(text) = model_turn::message_text(message)
         .map(str::trim)
@@ -3329,6 +3409,8 @@ mod tests {
             caption: None,
             photo: None,
             document: None,
+            media_group_id: None,
+            album: Vec::new(),
         };
         let mut update = tellm_telegram::Update {
             update_id: 7,
@@ -3641,6 +3723,103 @@ mod tests {
             ),
             "update chat_id=42 message_id=3 from=none kind=edited_message input=none route=ignored"
         );
+    }
+
+    fn album_item(message_id: i64, group: &str, caption: Option<&str>) -> IncomingMessage {
+        let mut item = text_message("");
+        item.message_id = message_id;
+        item.text = None;
+        item.caption = caption.map(str::to_string);
+        item.photo = Some(vec![tellm_telegram::PhotoSize {
+            file_id: format!("photo-{message_id}"),
+            width: 1,
+            height: 1,
+            file_size: None,
+        }]);
+        item.media_group_id = Some(group.to_string());
+        item
+    }
+
+    #[tokio::test]
+    async fn an_album_is_one_message_and_a_message_after_it_waits_its_turn() {
+        let (sender, mut receiver) = mpsc::channel(CHAT_QUEUE_SIZE);
+        for id in 2..=7 {
+            sender.send(album_item(id, "g", None)).await.unwrap();
+        }
+        sender.send(text_message("what do you see?")).await.unwrap();
+
+        let (album, next) = gather_album(
+            album_item(1, "g", Some("my trip")),
+            &mut receiver,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(album.message_id, 1);
+        assert_eq!(
+            album
+                .album
+                .iter()
+                .map(|item| item.message_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(album.caption.as_deref(), Some("my trip"));
+        assert_eq!(input_shape(&album), "photos(7)+caption(7)");
+        assert_eq!(
+            next.and_then(|message| message.text).as_deref(),
+            Some("what do you see?"),
+            "the next message is handed back, not dropped or reordered"
+        );
+    }
+
+    #[tokio::test]
+    async fn album_gathering_stops_at_telegrams_limit_and_on_a_quiet_queue() {
+        let (sender, mut receiver) = mpsc::channel(CHAT_QUEUE_SIZE);
+        for id in 2..=11 {
+            sender.send(album_item(id, "g", None)).await.unwrap();
+        }
+        let (album, next) = gather_album(
+            album_item(1, "g", None),
+            &mut receiver,
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(album.album.len(), MAX_ALBUM_ITEMS - 1);
+        assert!(next.is_none());
+        assert_eq!(
+            receiver.try_recv().unwrap().message_id,
+            11,
+            "an item past the limit stays queued"
+        );
+
+        let (album, next) = gather_album(
+            album_item(20, "h", None),
+            &mut receiver,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(album.album.is_empty() && next.is_none());
+
+        let (single, next) = timeout(
+            Duration::from_secs(1),
+            gather_album(text_message("hi"), &mut receiver, Duration::from_secs(60)),
+        )
+        .await
+        .expect("a message outside an album is not held back");
+        assert_eq!(single.text.as_deref(), Some("hi"));
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn an_albums_captions_all_reach_the_model() {
+        let album = merge_album(vec![
+            album_item(1, "g", Some("first")),
+            album_item(2, "g", None),
+            album_item(3, "g", Some(" third ")),
+        ]);
+        assert_eq!(album.caption.as_deref(), Some("first\n\nthird"));
+        assert!(album.album.iter().all(|item| item.caption.is_none()));
     }
 
     #[test]
@@ -4202,6 +4381,8 @@ mod tests {
             caption: None,
             photo: None,
             document: None,
+            media_group_id: None,
+            album: Vec::new(),
         }
     }
 
