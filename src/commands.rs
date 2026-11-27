@@ -66,6 +66,11 @@ pub enum ParsedRoute<'a> {
         command: KnownCommand,
         args: &'a str,
     },
+    /// A well-formed command name tellm doesn't have, such as `/start` or a
+    /// typo. It gets a short reply instead of a billed model call.
+    Unknown {
+        name: &'a str,
+    },
     UserMessage,
     Ignore,
 }
@@ -182,6 +187,9 @@ pub enum KnownCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandReject {
+    UnknownCommand {
+        name: String,
+    },
     UnknownNewOption {
         value: String,
     },
@@ -234,6 +242,11 @@ pub fn parse<'a>(text: &'a str, bot_username: Option<&str>) -> ParsedRoute<'a> {
         return ParsedRoute::Ignore;
     }
     let Some(command) = parse_known_command(parsed.name) else {
+        if is_command_name(parsed.name) {
+            return ParsedRoute::Unknown { name: parsed.name };
+        }
+        // Text that only starts like a command, such as a path
+        // ("/etc/hosts: what is this?"), is a normal message.
         return ParsedRoute::UserMessage;
     };
     ParsedRoute::Command {
@@ -273,6 +286,7 @@ pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) 
 pub fn route(text: &str, bot_username: Option<&str>, context: &CommandContext<'_>) -> Route {
     match parse(text, bot_username) {
         ParsedRoute::Command { command, args } => Route::Command(resolve(command, args, context)),
+        ParsedRoute::Unknown { name } => Route::Command(unknown_command(name)),
         ParsedRoute::UserMessage => Route::UserMessage,
         ParsedRoute::Ignore => Route::Ignore,
     }
@@ -719,6 +733,23 @@ fn parse_command<'a>(text: &'a str, bot_username: Option<&str>) -> Option<Parsed
     })
 }
 
+/// Telegram's command shape: 1–32 Latin letters, digits and underscores
+/// (checked 2026-11-27 against core.telegram.org/bots/features#commands).
+fn is_command_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+pub fn unknown_command(name: &str) -> CommandAction {
+    CommandAction::Reject {
+        reason: CommandReject::UnknownCommand {
+            name: name.to_string(),
+        },
+    }
+}
+
 fn parse_known_command(name: &str) -> Option<KnownCommand> {
     match name.to_ascii_lowercase().as_str() {
         "new" => Some(KnownCommand::New),
@@ -778,10 +809,49 @@ mod tests {
     use tellm_core::ThinkingLevel;
 
     #[test]
-    fn non_commands_and_unknown_commands_route_to_model_input() {
+    fn non_commands_and_command_lookalikes_route_to_model_input() {
         assert_eq!(route_command("hello"), Route::UserMessage);
-        assert_eq!(route_command("/unknown value"), Route::UserMessage);
         assert_eq!(route_command("/"), Route::UserMessage);
+        assert_eq!(
+            route_command("/etc/hosts: what is this file?"),
+            Route::UserMessage
+        );
+        assert_eq!(route_command("/día"), Route::UserMessage);
+        assert_eq!(
+            route_command(&format!("/{}", "a".repeat(33))),
+            Route::UserMessage
+        );
+    }
+
+    #[test]
+    fn unknown_commands_are_refused_instead_of_sent_to_the_model() {
+        for (text, name) in [
+            ("/start", "start"),
+            ("/unknown value", "unknown"),
+            ("/web_search on", "web_search"),
+            ("/Models", "Models"),
+        ] {
+            assert_eq!(
+                route_command(text),
+                Route::Command(CommandAction::Reject {
+                    reason: CommandReject::UnknownCommand {
+                        name: name.to_string()
+                    },
+                }),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            route_command_with(
+                "/start@OtherBot",
+                rooms::RoomSettings::default(),
+                Some("tellmbot"),
+                access::PrivilegedAccess::Allowed,
+                &["claude"],
+            ),
+            Route::Ignore,
+            "another bot's command stays ignored"
+        );
     }
 
     #[test]

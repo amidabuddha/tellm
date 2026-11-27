@@ -925,6 +925,9 @@ async fn route_command(
     }
     let (command, args) = match commands::parse(text, handles.bot_username.as_deref()) {
         commands::ParsedRoute::Command { command, args } => (command, args),
+        commands::ParsedRoute::Unknown { name } => {
+            return Ok(Route::Command(commands::unknown_command(name)));
+        }
         commands::ParsedRoute::UserMessage => return Ok(Route::UserMessage),
         commands::ParsedRoute::Ignore => return Ok(Route::Ignore),
     };
@@ -2796,6 +2799,9 @@ fn format_deny_chat_reply(chat_id: i64, result: &DenyChatConfigResult) -> String
 
 fn format_reject(reason: CommandReject) -> String {
     match reason {
+        CommandReject::UnknownCommand { name } => {
+            format!("Unknown command /{name}. Send /help for the list.")
+        }
         CommandReject::UnknownNewOption { value } => format!(
             "Unknown /new option \"{value}\". Use /new to start over, or /new summary to carry a summary of this chat into the new one."
         ),

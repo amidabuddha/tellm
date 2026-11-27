@@ -618,8 +618,11 @@ Dropped as waste:
 `/webfetch` (fold into websearch decision later), assistants, AI-managed mode,
 MCP tooling.
 Known commands accept Telegram's group form (`/cmd@BotName`); commands
-addressed to a different bot are ignored, and unknown slash commands pass
-through as normal model input rather than producing "command not found" noise.
+addressed to a different bot are ignored. An unknown command (a name of
+Telegram's command shape: 1–32 letters, digits or underscores, such as
+`/start` or a typo) gets "Unknown command /NAME. Send /help for the list."
+instead of a billed model reply that answers the command as if it were a
+question. Text that only starts with `/`, such as a path, stays model input.
 Argument semantics: `/new [summary]` starts a new conversation, and with
 `summary` carries a summary of this one into it (§ Summaries); any other
 argument is refused, so a mistyped `summary` never ends a conversation. `/id`
