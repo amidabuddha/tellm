@@ -435,3 +435,19 @@ fn usage_reads_deepseek_cache_hits_and_the_openrouter_cost() {
         "http://localhost:11434/v1/chat/completions"
     ));
 }
+
+#[tokio::test]
+async fn a_non_json_error_page_keeps_its_status() {
+    let mock = MockCompat::start(vec![MockResponse::bytes(
+        502,
+        "text/html",
+        "<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>",
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::Api { status: 502, message } if message == "502 Bad Gateway"),
+        "{error:?}"
+    );
+}

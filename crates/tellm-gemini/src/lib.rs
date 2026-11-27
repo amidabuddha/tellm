@@ -48,8 +48,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tellm_core::{
-    ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
-    Usage, usage_count,
+    ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ProviderReply,
+    ThinkingLevel, Usage, read_provider_response, usage_count,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -224,16 +224,13 @@ impl Gemini {
             .send()
             .await?;
 
-        let status = response.status();
-        let response_body: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: api_error_message(&response_body),
-            });
+        match read_provider_response(response).await? {
+            ProviderReply::Success(body) => Ok(body),
+            ProviderReply::Error { status, body } => Err(ProviderError::Api {
+                status,
+                message: api_error_message(&body),
+            }),
         }
-
-        Ok(response_body)
     }
 }
 

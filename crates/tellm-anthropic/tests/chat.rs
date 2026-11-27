@@ -696,3 +696,19 @@ async fn a_reply_without_a_usage_block_reports_no_usage() {
 
     assert_eq!(response.usage, None);
 }
+
+#[tokio::test]
+async fn a_non_json_error_page_keeps_its_status() {
+    let mock = MockAnthropic::start(vec![MockResponse::bytes(
+        502,
+        "text/html",
+        "<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>",
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::Api { status: 502, message } if message == "502 Bad Gateway"),
+        "{error:?}"
+    );
+}

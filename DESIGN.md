@@ -237,6 +237,11 @@ Notes:
   a closing note pointing at `/new summary`; one without text is the same
   context-window error as an oversized prompt, so the error reply offers
   `/new summary` too.
+- Every client looks at the HTTP status before it parses the body. A
+  success must be JSON; an error body that is not JSON (an HTML or
+  plain-text page from a proxy or gateway in front of the API) becomes an
+  API error with that status and a one-line excerpt, the page title for
+  HTML, instead of a JSON decoding error that hides the status.
 - A request over the model's context window is told apart from other API
   errors only where the provider documents an error for it (checked
   2026-11-19): Anthropic's HTTP 400 `invalid_request_error` "prompt is too

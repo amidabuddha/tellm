@@ -689,3 +689,26 @@ async fn usage_counts_web_search_calls_and_splits_cached_input() {
     assert_eq!(usage.reasoning_tokens, 64);
     assert_eq!(usage.web_searches, 1);
 }
+
+#[tokio::test]
+async fn a_non_json_error_page_keeps_its_status() {
+    let mock = MockOpenAi::start(vec![MockResponse::bytes(
+        502,
+        "text/html",
+        "<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>",
+    )]);
+
+    let error = client(&mock)
+        .chat(&{
+            let mut req = request();
+            req.image_generation = false;
+            req
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::Api { status: 502, message } if message == "502 Bad Gateway"),
+        "{error:?}"
+    );
+}

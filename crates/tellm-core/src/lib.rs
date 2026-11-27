@@ -217,6 +217,81 @@ pub trait Provider {
     ) -> impl Future<Output = Result<ChatResponse, ProviderError>> + Send;
 }
 
+/// A provider response whose body has been read: the JSON of a success, or
+/// the status and JSON body of an error, which each wire-format crate turns
+/// into its own [`ProviderError`].
+#[derive(Debug)]
+pub enum ProviderReply {
+    Success(serde_json::Value),
+    Error {
+        status: u16,
+        body: serde_json::Value,
+    },
+}
+
+/// Longest stretch of a non-JSON error body kept in an error message.
+const ERROR_TEXT_LIMIT: usize = 300;
+
+/// Reads a provider response, looking at the status before the body. A
+/// success must be JSON. An error body is often not: a proxy, gateway or
+/// load balancer in front of the API answers with an HTML or plain-text
+/// page. Decoding that as JSON would hide the status behind a parse error,
+/// so such a body becomes [`ProviderError::Api`] with the status and a
+/// short excerpt (an HTML page's title, when it has one).
+pub async fn read_provider_response(
+    response: reqwest::Response,
+) -> Result<ProviderReply, ProviderError> {
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+    if status.is_success() {
+        return parsed
+            .map(ProviderReply::Success)
+            .map_err(|error| ProviderError::Api {
+                status: status.as_u16(),
+                message: format!("the response body is not JSON ({error})"),
+            });
+    }
+    match parsed {
+        Ok(body) => Ok(ProviderReply::Error {
+            status: status.as_u16(),
+            body,
+        }),
+        Err(_) => Err(ProviderError::Api {
+            status: status.as_u16(),
+            message: error_text(&bytes),
+        }),
+    }
+}
+
+/// A short, single-line description of a non-JSON error body.
+fn error_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "empty response body".to_string();
+    }
+    let excerpt = if trimmed.starts_with('<') {
+        let lower = trimmed.to_ascii_lowercase();
+        match (lower.find("<title>"), lower.find("</title>")) {
+            (Some(start), Some(end)) if start + 7 <= end => &trimmed[start + 7..end],
+            _ => return "an HTML error page".to_string(),
+        }
+    } else {
+        trimmed
+    };
+    let mut line = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.len() > ERROR_TEXT_LIMIT {
+        let mut cut = ERROR_TEXT_LIMIT;
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        line.truncate(cut);
+        line.push('…');
+    }
+    line
+}
+
 /// Appended to the text of a reply that stopped at the provider's output
 /// limit, so a cut-off answer is not mistaken for a finished one. Only the
 /// user sees it: the stored `turn_items` keep the model's own content.
@@ -293,6 +368,25 @@ mod tests {
         });
         assert_eq!(usage.total_input_tokens(), 240, "billing sums both");
         assert_eq!(usage.context_size(), 137, "size comes from the later one");
+    }
+
+    #[test]
+    fn non_json_error_bodies_become_a_short_line() {
+        assert_eq!(
+            error_text(b"<html><head><TITLE>502 Bad Gateway</TITLE></head><body>...</body></html>"),
+            "502 Bad Gateway"
+        );
+        assert_eq!(
+            error_text(b"<html><body>oops</body></html>"),
+            "an HTML error page"
+        );
+        assert_eq!(
+            error_text(b"  upstream\n  timed out \n"),
+            "upstream timed out"
+        );
+        assert_eq!(error_text(b""), "empty response body");
+        let long = error_text("é".repeat(400).as_bytes());
+        assert!(long.ends_with('…') && long.len() <= ERROR_TEXT_LIMIT + '…'.len_utf8());
     }
 
     #[test]

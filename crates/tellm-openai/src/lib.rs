@@ -48,7 +48,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     CUT_OFF_NOTE, ChatRequest, ChatResponse, ContentPart, GeneratedImage, OUTPUT_LIMIT_BEFORE_TEXT,
-    Provider, ProviderError, ThinkingLevel, Usage, usage_count,
+    Provider, ProviderError, ProviderReply, ThinkingLevel, Usage, read_provider_response,
+    usage_count,
 };
 
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -285,13 +286,10 @@ impl Responses {
             .send()
             .await?;
 
-        let status = response.status();
-        let response_body: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &response_body, is_openai));
+        match read_provider_response(response).await? {
+            ProviderReply::Success(body) => Ok(body),
+            ProviderReply::Error { status, body } => Err(api_error(status, &body, is_openai)),
         }
-
-        Ok(response_body)
     }
 
     fn is_xai_request(&self, request: &ChatRequest) -> bool {

@@ -53,8 +53,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tellm_core::{
-    ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
-    Usage, usage_count,
+    ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ProviderReply,
+    ThinkingLevel, Usage, read_provider_response, usage_count,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -355,13 +355,10 @@ impl Anthropic {
             .send()
             .await?;
 
-        let status = response.status();
-        let response_body: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &response_body));
+        match read_provider_response(response).await? {
+            ProviderReply::Success(body) => Ok(body),
+            ProviderReply::Error { status, body } => Err(api_error(status, &body)),
         }
-
-        Ok(response_body)
     }
 }
 

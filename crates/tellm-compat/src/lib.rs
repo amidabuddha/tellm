@@ -37,7 +37,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tellm_core::{
     CUT_OFF_NOTE, ChatRequest, ChatResponse, ContentPart, GeneratedImage, OUTPUT_LIMIT_BEFORE_TEXT,
-    Provider, ProviderError, ThinkingLevel, Usage, usage_count,
+    Provider, ProviderError, ProviderReply, ThinkingLevel, Usage, read_provider_response,
+    usage_count,
 };
 
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -212,17 +213,14 @@ impl Compat {
         }
         let response = request.json(&body).send().await?;
 
-        let status = response.status();
-        let response_body: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(api_error(
-                status.as_u16(),
-                &response_body,
+        match read_provider_response(response).await? {
+            ProviderReply::Success(body) => Ok(body),
+            ProviderReply::Error { status, body } => Err(api_error(
+                status,
+                &body,
                 is_openrouter_url(&self.chat_completions_url),
-            ));
+            )),
         }
-
-        Ok(response_body)
     }
 }
 
