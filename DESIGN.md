@@ -765,7 +765,13 @@ that key is configured again.
   default local HTTP Ollama endpoint (`http://localhost:11434`,
   `http://127.0.0.1:11434`, or `http://[::1]:11434`, with or without `/v1`),
   the runtime checks the TCP port before dispatch. If it is down, tellm starts
-  `ollama serve` once and waits briefly for readiness. Before dispatching a new
+  `ollama serve` once with `OLLAMA_HOST=127.0.0.1:11434` and waits briefly
+  for readiness. Ollama binds there by default (checked 2026-11-27 against
+  docs.ollama.com FAQ), so tellm starts it only for `localhost` and
+  `127.0.0.1`; a down `[::1]` endpoint is an error that says so. While a
+  child tellm started is still running, tellm never starts another: an
+  unreachable endpoint with a live child is an error naming its pid, and a
+  child that has exited is reaped and may be started again. Before dispatching a new
   image input, tellm calls `POST /api/show` and requires the model's reported
   `capabilities` to contain `vision`; a missing capability, malformed metadata,
   or metadata API failure rejects the turn before inference (checked 2026-08-02

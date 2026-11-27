@@ -17,6 +17,12 @@ use tokio::time::{Instant as TokioInstant, sleep};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const START_WAIT: Duration = Duration::from_secs(15);
+/// Where a tellm-started `ollama serve` listens. Checked 2026-11-27 against
+/// docs.ollama.com (FAQ): Ollama binds 127.0.0.1 port 11434 by default and
+/// `OLLAMA_HOST` changes that. tellm sets it for its child, so an
+/// `OLLAMA_HOST` inherited from the shell cannot move the server away from
+/// the address tellm then waits on.
+const STARTED_LISTEN_ADDR: &str = "127.0.0.1:11434";
 const READY_POLL: Duration = Duration::from_millis(250);
 const MODEL_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,6 +51,20 @@ impl ManagedChild {
 
     fn id(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
+    }
+
+    /// The child's pid while it still runs. One that has exited is reaped
+    /// and forgotten, so dropping this no longer signals a pid that may
+    /// since belong to another process.
+    fn running_pid(&mut self) -> Option<u32> {
+        let child = self.child.as_mut()?;
+        match child.try_wait() {
+            Ok(None) => Some(child.id()),
+            Ok(Some(_)) | Err(_) => {
+                self.child = None;
+                None
+            }
+        }
     }
 
     fn stop(mut self) -> Result<String, String> {
@@ -107,6 +127,18 @@ pub(crate) async fn ensure_ready(base_url: &str) -> Result<(), String> {
     let _start_guard = start_lock().lock().await;
     if tcp_connects(addr.clone()).await? {
         return Ok(());
+    }
+    if !can_start_for(&addr) {
+        return Err(format!(
+            "local Ollama endpoint {base_url} is not reachable. tellm starts `ollama serve` only for localhost and 127.0.0.1, where Ollama listens by default; start Ollama yourself or point base_url at http://127.0.0.1:11434/v1"
+        ));
+    }
+    // A child that is still running but not answering would only collide
+    // with a second one on the same port.
+    if let Some(pid) = running_child_pid() {
+        return Err(format!(
+            "local Ollama endpoint {base_url} is not reachable, and the `ollama serve` tellm started (pid {pid}) is still running; check it or stop it, then try again"
+        ));
     }
 
     log::info!(
@@ -320,6 +352,7 @@ async fn start_serve() -> Result<(), String> {
     let spawned_child = spawn_blocking(|| {
         ProcessCommand::new("ollama")
             .arg("serve")
+            .env("OLLAMA_HOST", STARTED_LISTEN_ADDR)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -597,6 +630,25 @@ fn wait_for_exit(child: &mut Child) -> Result<Option<std::process::ExitStatus>, 
     }
 }
 
+/// The pid of the `ollama serve` tellm started, while it still runs.
+fn running_child_pid() -> Option<u32> {
+    let mut slot = child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let pid = slot.as_mut().and_then(ManagedChild::running_pid);
+    if pid.is_none() {
+        *slot = None;
+    }
+    pid
+}
+
+/// Whether a server tellm starts would answer at `addr`: it listens on
+/// [`STARTED_LISTEN_ADDR`], which `localhost` reaches too, but `[::1]` does
+/// not.
+fn can_start_for(addr: &str) -> bool {
+    split_host_port(addr).is_some_and(|(host, _)| matches!(host, "localhost" | "127.0.0.1"))
+}
+
 fn local_addr(base_url: &str) -> Option<String> {
     let rest = base_url.strip_prefix("http://")?;
     let authority = rest.split('/').next().unwrap_or(rest);
@@ -643,6 +695,43 @@ mod tests {
         assert_eq!(local_addr("https://api.mistral.ai/v1"), None);
         assert_eq!(local_addr("http://localhost:8080/v1"), None);
         assert_eq!(local_addr("http://192.168.1.10:11434/v1"), None);
+    }
+
+    #[test]
+    fn only_addresses_the_default_listener_answers_on_are_auto_started() {
+        assert!(can_start_for("localhost:11434"));
+        assert!(can_start_for("127.0.0.1:11434"));
+        assert!(
+            !can_start_for("[::1]:11434"),
+            "a server on 127.0.0.1 never answers there"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_reports_its_pid_and_an_exited_one_is_forgotten() {
+        let spawn = |program: &str, args: &[&str]| {
+            ProcessCommand::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn test process")
+        };
+        let mut running = ManagedChild::new(spawn("sleep", &["30"]));
+        let pid = running.id().unwrap();
+        assert_eq!(running.running_pid(), Some(pid));
+        drop(running);
+        assert!(!process_exists(pid), "dropping still stops a running child");
+
+        let mut exited = ManagedChild::new(spawn("true", &[]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while exited.running_pid().is_some() {
+            assert!(std::time::Instant::now() < deadline, "true never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(exited.child.is_none());
     }
 
     #[tokio::test]
