@@ -2564,26 +2564,68 @@ fn log_update_route(message: &IncomingMessage, kind: UpdateKind, route: UpdateRo
             message.message_id,
             message.from.as_ref().map(|user| user.id),
             kind,
+            &input_shape(message),
             route,
         )
     );
 }
 
 /// The message id tells a second message from the same one delivered twice,
-/// and the sender tells the user's own messages from another group member's.
+/// the sender tells the user's own messages from another group member's, and
+/// the input shape tells which message a model reply answered once the
+/// message itself is deleted from the chat.
 fn update_log_line(
     chat_id: i64,
     message_id: i64,
     sender_id: Option<i64>,
     kind: UpdateKind,
+    input: &str,
     route: UpdateRoute,
 ) -> String {
     let sender = sender_id.map_or_else(|| "none".to_string(), |id| id.to_string());
     format!(
-        "update chat_id={chat_id} message_id={message_id} from={sender} kind={} route={}",
+        "update chat_id={chat_id} message_id={message_id} from={sender} kind={} input={input} route={}",
         kind.as_str(),
         route.as_str()
     )
+}
+
+/// What a message carries, never its content: `text(8)`, `photo+caption(12)`,
+/// `document`, or `none`. Text starting with `/` is flagged, so a slash
+/// command tellm doesn't know shows up as `route=model` with `slash`.
+fn input_shape(message: &IncomingMessage) -> String {
+    let mut parts = Vec::new();
+    if message
+        .photo
+        .as_ref()
+        .is_some_and(|photos| !photos.is_empty())
+    {
+        parts.push("photo".to_string());
+    }
+    if message.document.is_some() {
+        parts.push("document".to_string());
+    }
+    if let Some(text) = model_turn::message_text(message)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        let label = if message.text.is_some() {
+            "text"
+        } else {
+            "caption"
+        };
+        let chars = text.chars().count();
+        parts.push(if text.starts_with('/') {
+            format!("{label}({chars},slash)")
+        } else {
+            format!("{label}({chars})")
+        });
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join("+")
+    }
 }
 
 fn format_log_duration(duration: Duration) -> String {
@@ -3506,13 +3548,60 @@ mod tests {
     #[test]
     fn update_log_line_contains_only_metadata() {
         assert_eq!(
-            update_log_line(-100, 17, Some(7), UpdateKind::Message, UpdateRoute::Model),
-            "update chat_id=-100 message_id=17 from=7 kind=message route=model"
+            update_log_line(
+                -100,
+                17,
+                Some(7),
+                UpdateKind::Message,
+                "text(8)",
+                UpdateRoute::Model
+            ),
+            "update chat_id=-100 message_id=17 from=7 kind=message input=text(8) route=model"
         );
         assert_eq!(
-            update_log_line(42, 3, None, UpdateKind::EditedMessage, UpdateRoute::Ignored),
-            "update chat_id=42 message_id=3 from=none kind=edited_message route=ignored"
+            update_log_line(
+                42,
+                3,
+                None,
+                UpdateKind::EditedMessage,
+                "none",
+                UpdateRoute::Ignored
+            ),
+            "update chat_id=42 message_id=3 from=none kind=edited_message input=none route=ignored"
         );
+    }
+
+    #[test]
+    fn input_shape_names_kind_and_length_never_content() {
+        let secret = "my password is hunter2";
+        let shape = input_shape(&text_message(secret));
+        assert_eq!(shape, "text(22)");
+        assert!(!shape.contains("hunter2"));
+
+        assert_eq!(input_shape(&text_message("  Hi there \n")), "text(8)");
+        assert_eq!(input_shape(&text_message("/start")), "text(6,slash)");
+        assert_eq!(input_shape(&text_message("   ")), "none");
+
+        let mut photo = text_message("");
+        photo.text = None;
+        photo.caption = Some("look at this".to_string());
+        photo.photo = Some(vec![tellm_telegram::PhotoSize {
+            file_id: "f".to_string(),
+            width: 1,
+            height: 1,
+            file_size: None,
+        }]);
+        assert_eq!(input_shape(&photo), "photo+caption(12)");
+
+        let mut document = text_message("");
+        document.text = None;
+        document.document = Some(tellm_telegram::Document {
+            file_id: "d".to_string(),
+            file_name: None,
+            mime_type: None,
+            file_size: None,
+        });
+        assert_eq!(input_shape(&document), "document");
     }
 
     #[test]
