@@ -193,8 +193,8 @@ last part is the chat's size: at 150k tokens tellm summarizes it into a fresh
 chat. `/cost` shows the same totals in more detail, including how much of the
 input came from the provider's cache.
 xAI and OpenRouter report what they charged. For other providers tellm
-multiplies the reported tokens by the model's price table; the built-in Claude
-and OpenAI entries include one. Add one for any other model:
+multiplies the reported tokens by the model's price table; the built-in Claude,
+OpenAI, Meta and Gemini entries include one. Add one for any other model:
 
 ```toml
 [models.gpt.price]   # US dollars

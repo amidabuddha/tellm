@@ -756,10 +756,12 @@ restart and local room-setting changes.
   ordinary API key can call (rechecked 2026-11-27: Claude Fable 5.2, GPT-6.2
   Astra, Grok 4.7, Muse Wonder 1.0 in preview, Gemini 4 Carbon), each with the
   list prices that could be checked against the provider's pricing page
-  (Claude Fable 5.2 checked 2026-11-18, GPT-6.2 Astra 2026-11-19; Grok needs none because xAI reports its billed cost; Muse Wonder and
-  Gemini 4 Carbon ship without a price, so their replies show token counts
-  until the user adds one), stores
-  Telegram/provider
+  (Claude Fable 5.2 checked 2026-11-18, GPT-6.2 Astra 2026-11-19, Muse Wonder
+  1.0 and Gemini 4 Carbon 2026-11-27; Grok needs none because xAI reports its
+  billed cost). Gemini 4 Carbon gets the price Google charges from 2026-12-01,
+  twice its launch price, and no search price, because Google's first 5,000
+  searches a month are free and a missing search price counts searches as
+  free. The wizard stores Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather
   than repeatedly prompting on a closed input stream.

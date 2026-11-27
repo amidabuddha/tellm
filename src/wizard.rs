@@ -102,8 +102,9 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 // Opus 5 at `xhigh` or `max` (checked 2026-11-17). The model's output maximum
 // is 128k (checked 2026-11-16).
 //
-// Prices are standard list prices, checked 2026-11-18, for the per-reply cost
-// line; they go stale and the user keeps them current in config.toml:
+// Prices are standard list prices for the per-reply cost line, checked
+// 2026-11-18 unless a date says otherwise; they go stale and the user keeps
+// them current in config.toml:
 // - platform.claude.com pricing: Claude Fable 5.2 is $8 input, $10 5-minute
 //   cache writes (tellm's `ephemeral` cache uses the 5-minute TTL), $0.20
 //   cache hits and $40 output per MTok; web search is $10 per 1,000.
@@ -111,9 +112,19 @@ pub(crate) fn model_config_from_preset(preset: &ProviderPreset) -> ModelConfig {
 //   $0.40 cached input, $10 30-minute cache writes (the default TTL, which
 //   tellm keeps) and $40 output per MTok; web search is $10 per 1,000 calls.
 // - xAI reports each response's billed cost, so the Grok preset needs none.
-// - Meta's and Google's pricing pages could not be checked from the
-//   implementation environment, so those presets ship without a price and
-//   show token counts until the user adds one.
+// - dev.meta.ai pricing and rate limits (2026-11-27): muse-wonder-1.0 is $4
+//   input, $0.20 cached input and $20 output per MTok in Standard mode, with
+//   no cache-write price listed; web search grounding is $2.50 per 1,000
+//   queries on top of tokens.
+// - aistudio.google.com Gemini 4 Carbon model page (2026-11-27): the paid
+//   Standard tier is $4 input, $0.20 cached input and $20 output per MTok
+//   from 2026-12-01, double the $2, $0.10 and $10 it charges through
+//   2026-11-30, so the preset writes the later price. Caching is implicit
+//   only and the page lists no cache-write price. Google Search grounding
+//   is free for 5,000 requests a month, shared across Gemini 3 and newer
+//   models, then $14 per 1,000. The preset leaves the search price unset,
+//   so searches count as free instead of overstating a chat that stays
+//   inside the free allowance.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "anthropic",
@@ -173,7 +184,13 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         max_effort: Some("max"),
         off_effort: Some("minimal"),
         max_output_tokens: None,
-        price: None,
+        price: Some(ModelPrice {
+            input: 4.0,
+            cached_input: Some(0.20),
+            cache_write: None,
+            output: 20.0,
+            web_search: Some(2.50),
+        }),
     },
     ProviderPreset {
         key: "gemini",
@@ -185,7 +202,13 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         max_effort: None,
         off_effort: Some("low"),
         max_output_tokens: None,
-        price: None,
+        price: Some(ModelPrice {
+            input: 4.0,
+            cached_input: Some(0.20),
+            cache_write: None,
+            output: 20.0,
+            web_search: None,
+        }),
     },
 ];
 
@@ -414,12 +437,34 @@ mod tests {
             })
         );
 
-        // xAI reports its own billed cost; Meta and Google prices were not
-        // checked against their pricing pages.
-        for key in ["xai", "meta", "gemini"] {
-            let model = model_config_from_preset(preset_by_key(key).unwrap());
-            assert_eq!(model.price, None, "{key}");
-        }
+        let meta = model_config_from_preset(preset_by_key("meta").unwrap());
+        assert_eq!(
+            meta.price,
+            Some(ModelPrice {
+                input: 4.0,
+                cached_input: Some(0.20),
+                cache_write: None,
+                output: 20.0,
+                web_search: Some(2.50),
+            })
+        );
+        // Google's first 5,000 searches a month are free, so the Gemini
+        // preset leaves the search price unset.
+        let gemini = model_config_from_preset(preset_by_key("gemini").unwrap());
+        assert_eq!(
+            gemini.price,
+            Some(ModelPrice {
+                input: 4.0,
+                cached_input: Some(0.20),
+                cache_write: None,
+                output: 20.0,
+                web_search: None,
+            })
+        );
+
+        // xAI reports its own billed cost.
+        let xai = model_config_from_preset(preset_by_key("xai").unwrap());
+        assert_eq!(xai.price, None);
 
         let mut config = config_for_preset(preset_by_key("anthropic").unwrap());
         config.validate().unwrap();
