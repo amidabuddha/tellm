@@ -812,7 +812,11 @@ that key is configured again.
   destination. A successful keychain write removes the stale file entry. A new
   file fallback records an internal preference marker atomically with the value,
   so a recovered stale keychain cannot shadow it; legacy unmarked files remain
-  keychain-first. An active environment override must be unset before rotation,
+  keychain-first. Because the file can outrank the keychain, a
+  credentials.toml that exists but cannot be read or parsed makes every
+  stored secret count as missing (logged as an error) rather than letting a
+  possibly stale keychain value through. A parse error names only the byte
+  position, never the line, which may hold a key. An active environment override must be unset before rotation,
   since it remains the effective value. Credentials-file read/modify/write is
   serialized within one process; multiple tellm processes must not share and
   mutate the same config directory concurrently.

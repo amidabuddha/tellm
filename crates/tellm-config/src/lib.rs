@@ -561,7 +561,9 @@ pub mod secrets {
     pub enum SecretError {
         #[error("io error: {0}")]
         Io(#[from] std::io::Error),
-        #[error("credentials parse error: {0}")]
+        // The parser's own message quotes the offending line, which in this
+        // file can be a key, and this error can reach logs and Telegram.
+        #[error("credentials.toml is not valid TOML{}", parse_position(.0))]
         Parse(#[from] toml::de::Error),
         #[error("credentials serialize error: {0}")]
         Serialize(#[from] toml::ser::Error),
@@ -581,6 +583,14 @@ pub mod secrets {
             #[source]
             source: Box<SecretError>,
         },
+    }
+
+    /// Where a credentials.toml parse error is, without any of its text.
+    fn parse_position(error: &toml::de::Error) -> String {
+        error
+            .span()
+            .map(|span| format!(" (at byte {})", span.start))
+            .unwrap_or_default()
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,8 +630,32 @@ pub mod secrets {
         // marker must outrank a stale keychain value. Keeping this read fresh
         // also lets a running daemon observe `tellm secret set` rotations from
         // a separate invocation without a restart.
-        let file_secrets = read_file_secrets().ok();
-        persisted_secret(name, file_secrets.as_ref(), || keychain_get(name))
+        resolve_persisted(name, read_file_secrets(), || keychain_get(name))
+    }
+
+    /// Picks the stored value of `name` from credentials.toml (as read) and
+    /// the keychain. The file can mark its own value as the current one over
+    /// a stale keychain entry, so a file that exists but cannot be read or
+    /// parsed leaves no way to tell which value is current: the secret is
+    /// missing until the file is fixed, and the failure is logged.
+    fn resolve_persisted(
+        name: &str,
+        file: Result<BTreeMap<String, String>, SecretError>,
+        keychain_get: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let file_secrets = match file {
+            Ok(secrets) => secrets,
+            // No config directory, so no file that could outrank the keychain.
+            Err(SecretError::NoConfigDir) => BTreeMap::new(),
+            Err(error) => {
+                log::error!(
+                    target: "tellm::secrets",
+                    "credentials.toml unusable; secret treated as missing name={name} error=\"{error}\" action=\"fix or remove credentials.toml\""
+                );
+                return None;
+            }
+        };
+        persisted_secret(name, Some(&file_secrets), keychain_get)
     }
 
     fn persisted_secret(
@@ -1021,6 +1055,44 @@ pub mod secrets {
 
             assert_eq!(value.as_deref(), Some("new-file-value"));
             assert!(!read_keychain.get());
+        }
+
+        #[test]
+        fn an_unusable_credentials_file_hides_the_keychain_value() {
+            let read_keychain = Cell::new(false);
+            let unreadable = Err(SecretError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )));
+
+            let value = resolve_persisted("openai_api_key", unreadable, || {
+                read_keychain.set(true);
+                Some("maybe-stale".to_string())
+            });
+
+            assert_eq!(value, None, "the file may mark the keychain value stale");
+            assert!(!read_keychain.get());
+            assert_eq!(
+                resolve_persisted("openai_api_key", Err(SecretError::NoConfigDir), || {
+                    Some("keychain".to_string())
+                }),
+                Some("keychain".to_string()),
+                "without a config directory there is no file to consult"
+            );
+        }
+
+        #[test]
+        fn credentials_parse_errors_never_quote_the_file() {
+            let error =
+                toml::from_str::<BTreeMap<String, String>>("openai_api_key = sk-live-not-quoted\n")
+                    .unwrap_err();
+
+            let shown = SecretError::from(error).to_string();
+
+            assert!(
+                shown.starts_with("credentials.toml is not valid TOML"),
+                "{shown}"
+            );
+            assert!(!shown.contains("sk-live"), "{shown}");
         }
 
         #[test]
