@@ -539,8 +539,6 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
 pub mod secrets {
     use std::collections::BTreeMap;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
@@ -917,7 +915,7 @@ pub mod secrets {
         if !path.exists() {
             return Ok(BTreeMap::new());
         }
-        ensure_credentials_permissions(&path)?;
+        super::restrict_to_owner(&path)?;
         let text = fs::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
     }
@@ -928,8 +926,7 @@ pub mod secrets {
             fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(secrets)?;
-        super::write_atomic_with_mode(&path, &text, Some(0o600))?;
-        ensure_credentials_permissions(&path)?;
+        super::write_atomic_private(&path, &text)?;
         Ok(())
     }
 
@@ -937,21 +934,6 @@ pub mod secrets {
         Ok(super::config_dir()
             .map_err(|_| SecretError::NoConfigDir)?
             .join(CREDENTIALS_FILE))
-    }
-
-    #[cfg(unix)]
-    fn ensure_credentials_permissions(path: &PathBuf) -> Result<(), SecretError> {
-        let metadata = fs::metadata(path)?;
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn ensure_credentials_permissions(_path: &PathBuf) -> Result<(), SecretError> {
-        Ok(())
     }
 
     #[cfg(feature = "keychain")]
