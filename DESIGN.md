@@ -531,6 +531,10 @@ calls a billing API and never fetches prices.
   backs up behind a slow turn, further messages are dropped with a busy
   notice instead of blocking the poll loop for every other chat. At most one
   busy-notice send may be outstanding per room.
+- Chats that are not allowed have no worker. The poll loop checks their
+  `/pair` code itself, so attempts count in update order, and hands the
+  save and the reply to a separate task; their hints are sent the same way.
+  Nothing an unknown chat sends makes the poll loop wait on Telegram or disk.
 - After each committed reply, the chat's worker checks the conversation's
   budget (§ Summaries) before it takes the next message, and summarizes the
   chat into a new one when it is due.

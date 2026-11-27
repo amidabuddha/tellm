@@ -556,12 +556,7 @@ impl Runtime {
                 {
                     log_update_route(&message, UpdateKind::Message, UpdateRoute::Command);
                     let pairer = message.from.as_ref().map(|user| user.id);
-                    if let Err(error) = handle_pair_attempt(chat_id, code, pairer, handles).await {
-                        log::warn!(
-                            target: "tellm::access",
-                            "pairing attempt failed chat_id={chat_id} error={error:?}"
-                        );
-                    }
+                    drop(start_pair_attempt(chat_id, &code, pairer, handles).await);
                 } else if send_hint {
                     log_update_route(&message, UpdateKind::Message, UpdateRoute::Ignored);
                     let telegram = self.telegram.clone();
@@ -1705,11 +1700,48 @@ async fn handle_pair_attempt(
     pairer_user_id: Option<i64>,
     handles: &RuntimeHandles,
 ) -> Result<(), String> {
-    let attempt = {
-        let mut access = handles.access.lock().await;
-        access.attempt_pair(chat_id, &code, now_access_time())
-    };
+    let attempt = check_pair_code(chat_id, &code, handles).await;
+    finish_pair_attempt(chat_id, attempt, pairer_user_id, handles).await
+}
 
+/// `/pair CODE` from a chat that is not allowed yet, run by the poll loop.
+/// The code is checked here, in update order, so every attempt counts once
+/// and in sequence. Saving and replying run on their own task: a slow
+/// Telegram call or disk write must not hold up updates for every other
+/// chat, and a stranger's chat can send `/pair` as often as it likes.
+async fn start_pair_attempt(
+    chat_id: i64,
+    code: &str,
+    pairer_user_id: Option<i64>,
+    handles: &RuntimeHandles,
+) -> tokio::task::JoinHandle<()> {
+    let attempt = check_pair_code(chat_id, code, handles).await;
+    let handles = handles.clone();
+    tokio::spawn(async move {
+        if let Err(error) = finish_pair_attempt(chat_id, attempt, pairer_user_id, &handles).await {
+            log::warn!(
+                target: "tellm::access",
+                "pairing attempt failed chat_id={chat_id} error={error:?}"
+            );
+        }
+    })
+}
+
+async fn check_pair_code(chat_id: i64, code: &str, handles: &RuntimeHandles) -> PairingAttempt {
+    handles
+        .access
+        .lock()
+        .await
+        .attempt_pair(chat_id, code, now_access_time())
+}
+
+/// Saves a successful pairing and sends the reply for any attempt.
+async fn finish_pair_attempt(
+    chat_id: i64,
+    attempt: PairingAttempt,
+    pairer_user_id: Option<i64>,
+    handles: &RuntimeHandles,
+) -> Result<(), String> {
     match attempt {
         PairingAttempt::Paired => {
             let became_owner = match persist_provisional_pair(chat_id, pairer_user_id, handles)
@@ -2697,6 +2729,7 @@ mod tests {
     use tellm_test_support::{MockHttpServer, MockResponse};
 
     use super::*;
+    use crate::access::MAX_PAIRING_ATTEMPTS;
     use crate::rooms::HistoryReset;
 
     #[tokio::test]
@@ -3434,6 +3467,30 @@ mod tests {
             .expect("other chats can use the rooms while /new waits on Telegram");
         drop(rooms);
         command.abort();
+    }
+
+    #[tokio::test]
+    async fn pair_attempts_from_unknown_chats_do_not_wait_for_their_reply() {
+        let telegram = MockHttpServer::start_stalled();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = mock_handles(&telegram, &provider);
+        handles.access.lock().await.arm_room(-7, now_access_time());
+
+        let reply = tokio::time::timeout(
+            Duration::from_millis(500),
+            start_pair_attempt(-7, "not-the-code", Some(9), &handles),
+        )
+        .await
+        .expect("the poll loop moves on while Telegram stalls");
+
+        // The attempt was counted before the poll loop moved on.
+        assert!(matches!(
+            check_pair_code(-7, "not-the-code", &handles).await,
+            PairingAttempt::Rejected {
+                attempts_remaining
+            } if attempts_remaining == MAX_PAIRING_ATTEMPTS - 2
+        ));
+        reply.abort();
     }
 
     /// Runtime handles for chat 42 with a keyless compat model, where both
