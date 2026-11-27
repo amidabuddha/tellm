@@ -184,6 +184,11 @@ struct TerminalPromptSlot {
 struct TerminalSecretPrompt {
     secret_name: String,
     line_tx: mpsc::UnboundedSender<String>,
+    /// The room whose worker waits on this prompt; its later messages queue
+    /// behind it until the prompt ends.
+    chat_id: i64,
+    /// Whether that room was already told its messages are waiting.
+    wait_notice_sent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,7 +623,19 @@ fn send_to_chat_worker(
         .or_insert_with(|| spawn_chat_worker(chat_id, handles.clone(), None));
 
     let message = match dispatcher.sender.try_send(message) {
-        Ok(()) => return,
+        Ok(()) => {
+            if let Some(secret_name) =
+                reserve_prompt_wait_notice(&handles.terminal_prompts, chat_id)
+            {
+                let telegram = handles.telegram.clone();
+                tokio::spawn(async move {
+                    let _ = telegram
+                        .send_message(chat_id, &prompt_wait_notice(&secret_name))
+                        .await;
+                });
+            }
+            return;
+        }
         Err(TrySendError::Full(_)) => {
             log::warn!(
                 target: "tellm::dispatcher",
@@ -660,6 +677,32 @@ fn send_to_chat_worker(
         );
     }
     dispatchers.insert(chat_id, dispatcher);
+}
+
+/// Claims the one notice for a message that reaches the room whose worker is
+/// waiting on the terminal key prompt. The message is kept and answered after
+/// the prompt ends; without the notice the room looks unresponsive, then
+/// answers everything sent meanwhile in a burst.
+fn reserve_prompt_wait_notice(
+    secret_prompts: &TerminalSecretPrompts,
+    chat_id: i64,
+) -> Option<String> {
+    let mut slot = secret_prompts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prompt = slot
+        .pending
+        .as_mut()
+        .filter(|prompt| prompt.chat_id == chat_id && !prompt.wait_notice_sent)?;
+    prompt.wait_notice_sent = true;
+    Some(prompt.secret_name.clone())
+}
+
+fn prompt_wait_notice(secret_name: &str) -> String {
+    format!(
+        "This chat is waiting for {secret_name} in the tellm terminal. Messages sent here \
+         meanwhile are answered once that prompt ends."
+    )
 }
 
 fn reserve_queue_full_notice(pending: &Arc<StdMutex<BTreeSet<i64>>>, chat_id: i64) -> bool {
@@ -2115,7 +2158,7 @@ async fn prompt_and_store_secret(
 ) -> Result<Option<secrets::SecretDestination>, String> {
     let secret_name = secret_name.into();
     let (mut lines, _guard) =
-        reserve_terminal_secret_prompt(&handles.terminal_prompts, secret_name.clone())?;
+        reserve_terminal_secret_prompt(&handles.terminal_prompts, chat_id, secret_name.clone())?;
 
     send_command_reply(handles, chat_id, prompt_notice).await?;
     log::info!(
@@ -2347,6 +2390,7 @@ impl Drop for TerminalPromptGuard {
 
 fn reserve_terminal_secret_prompt(
     secret_prompts: &TerminalSecretPrompts,
+    chat_id: i64,
     secret_name: String,
 ) -> Result<(mpsc::UnboundedReceiver<String>, TerminalPromptGuard), String> {
     let (line_tx, line_rx) = mpsc::unbounded_channel();
@@ -2365,6 +2409,8 @@ fn reserve_terminal_secret_prompt(
         slot.pending = Some(TerminalSecretPrompt {
             secret_name: secret_name.clone(),
             line_tx,
+            chat_id,
+            wait_notice_sent: false,
         });
     }
 
@@ -3329,10 +3375,45 @@ mod tests {
     }
 
     #[test]
+    fn a_message_during_a_key_prompt_gets_one_wait_notice_in_that_chat() {
+        let prompts: TerminalSecretPrompts = Arc::default();
+        assert_eq!(
+            reserve_prompt_wait_notice(&prompts, 7),
+            None,
+            "no prompt waiting"
+        );
+
+        let (_lines, guard) =
+            reserve_terminal_secret_prompt(&prompts, 7, "gemini_api_key".to_string()).unwrap();
+        assert_eq!(
+            reserve_prompt_wait_notice(&prompts, 8),
+            None,
+            "other rooms are not held by the prompt"
+        );
+        assert_eq!(
+            reserve_prompt_wait_notice(&prompts, 7).as_deref(),
+            Some("gemini_api_key")
+        );
+        assert_eq!(
+            reserve_prompt_wait_notice(&prompts, 7),
+            None,
+            "one notice per prompt"
+        );
+
+        drop(guard);
+        assert_eq!(
+            reserve_prompt_wait_notice(&prompts, 7),
+            None,
+            "prompt ended"
+        );
+        assert!(prompt_wait_notice("gemini_api_key").contains("gemini_api_key"));
+    }
+
+    #[test]
     fn terminal_prompts_fail_at_once_after_terminal_input_closes() {
         let prompts: TerminalSecretPrompts = Arc::default();
         let (mut waiting, _guard) =
-            reserve_terminal_secret_prompt(&prompts, "first_key".to_string()).unwrap();
+            reserve_terminal_secret_prompt(&prompts, 7, "first_key".to_string()).unwrap();
 
         close_terminal_input(&prompts);
 
@@ -3343,7 +3424,7 @@ mod tests {
             ),
             "a prompt that was waiting ends with the input"
         );
-        let error = reserve_terminal_secret_prompt(&prompts, "second_key".to_string())
+        let error = reserve_terminal_secret_prompt(&prompts, 7, "second_key".to_string())
             .err()
             .expect("no new prompt once input is closed");
         assert_eq!(error, TERMINAL_INPUT_CLOSED);

@@ -726,7 +726,11 @@ that key is configured again.
   The terminal-control reader has one prompt slot: while a prompt is active,
   terminal lines go to that prompt, `reset`/`exit`/`quit` are rejected as API
   keys rather than executed, and the prompt expires after five minutes so it
-  cannot block later prompts indefinitely. Both paths store through the
+  cannot block later prompts indefinitely. The room that ran `/model add`
+  waits on its prompt: messages sent there meanwhile are kept and answered
+  in order once the prompt ends, and the first of them gets a single notice
+  saying so, since the burst of replies would otherwise look like duplicates.
+  Both paths store through the
   secret facade and are picked up per request without restart. On startup,
   tellm reads each unique configured provider `api_key_secret` once so OS
   keychain permission prompts happen before the first model call in that
