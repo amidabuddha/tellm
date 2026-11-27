@@ -1461,14 +1461,22 @@ async fn summarize_into_new_chat(
                 "summary failed chat_id={chat_id} error={:?}",
                 error.message
             );
-            let restored = {
+            let will_retry = {
                 let mut rooms = handles.rooms.lock().await;
-                rooms.get_mut(chat_id).is_some_and(|room| {
-                    room.restore_failed_turn(prepared.generation, prepared.rollback)
+                rooms.get_mut(chat_id).and_then(|room| {
+                    if !room.restore_failed_turn(prepared.generation, prepared.rollback) {
+                        return None;
+                    }
+                    if trigger != summary::Trigger::Command {
+                        room.failed_summaries = room.failed_summaries.saturating_add(1);
+                    }
+                    Some(room.failed_summaries < summary::MAX_AUTOMATIC_SUMMARY_FAILURES)
                 })
             };
-            if restored && worker_can_reply(chat_id, handles, cancelled).await {
-                let reply = summary::failed_reply(trigger, &error.message);
+            if let Some(will_retry) = will_retry
+                && worker_can_reply(chat_id, handles, cancelled).await
+            {
+                let reply = summary::failed_reply(trigger, &error.message, will_retry);
                 send_command_reply(handles, chat_id, &reply).await?;
             }
             return Ok(false);
@@ -3959,6 +3967,47 @@ mod tests {
                  Tokens 151.5k in · 300 out · no price set · 151.8k of 150k tokens"
                     .to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_summaries_stop_after_failing_twice() {
+        let telegram = telegram_mock();
+        let failure =
+            || MockResponse::json(500, serde_json::json!({ "error": { "message": "boom" } }));
+        let provider = MockHttpServer::start(vec![
+            completion("Sure.", 149_000, 2_000),
+            failure(),
+            completion("Again.", 152_000, 2_000),
+            failure(),
+        ]);
+        let handles = mock_handles(&telegram, &provider);
+
+        for text in ["And then?", "And now?"] {
+            handle_model_message(42, text_message(text), &handles, &AtomicBool::new(false))
+                .await
+                .unwrap();
+        }
+
+        let rooms = handles.rooms.lock().await;
+        let room = rooms.get(42).unwrap();
+        assert_eq!(room.failed_summaries, 2);
+        assert_eq!(room.context_tokens, Some(154_000));
+        assert_eq!(room.summary_due(), None, "no third attempt on its own");
+        drop(rooms);
+        let sent = sent_texts(&telegram);
+        assert!(sent.last().unwrap().contains("won't try again"), "{sent:?}");
+
+        handles
+            .rooms
+            .lock()
+            .await
+            .get_mut(42)
+            .unwrap()
+            .reset_history();
+        assert_eq!(
+            handles.rooms.lock().await.get(42).unwrap().failed_summaries,
+            0
         );
     }
 

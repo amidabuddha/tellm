@@ -506,7 +506,11 @@ calls a billing API and never fetches prices.
   summary right after delivering that reply, while the provider's cache
   still holds the conversation. It runs in the chat's worker, so the next
   message waits for it. If it fails, the history stays, and the check runs
-  again after the next reply.
+  again after the next reply. Each attempt resends the whole conversation,
+  so after `MAX_AUTOMATIC_SUMMARY_FAILURES` (2) failures in one
+  conversation tellm stops summarizing it on its own and says so; `/new
+  summary` still tries on request, and a new conversation starts the count
+  again. A history over the byte cap is still pruned.
 - The budget is one constant for every provider, with no per-model or
   config setting (checked 2026-11-19). Anthropic's server-side compaction
   starts at 150,000 input tokens by default, and OpenAI's compaction

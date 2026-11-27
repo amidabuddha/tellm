@@ -33,6 +33,12 @@ use crate::rooms::MAX_HISTORY_BYTES;
 /// inside every preset's window.
 pub const CONTEXT_SUMMARY_TOKENS: u64 = 150_000;
 
+/// Failed automatic summaries after which a conversation is no longer
+/// summarized on its own. Each attempt resends the whole conversation, so a
+/// provider that keeps failing would otherwise bill a full context after
+/// every reply. Two allows one retry for a passing outage.
+pub const MAX_AUTOMATIC_SUMMARY_FAILURES: u8 = 2;
+
 /// Why a conversation is being summarized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -111,11 +117,16 @@ pub fn carried_reply(summary: &str, left_out: usize) -> String {
 /// What the chat gets when the summary request failed. The conversation is
 /// still the one it was; an automatic summary is tried again after the next
 /// reply.
-pub fn failed_reply(trigger: Trigger, error: &str) -> String {
+/// `will_retry` says whether an automatic summary is tried again after the
+/// next reply; it is ignored for `/new summary`.
+pub fn failed_reply(trigger: Trigger, error: &str, will_retry: bool) -> String {
     let next = match trigger {
         Trigger::Command => "so it continues unchanged",
-        Trigger::TokenBudget | Trigger::HistoryBytes => {
+        Trigger::TokenBudget | Trigger::HistoryBytes if will_retry => {
             "so it continues and I'll try again after the next reply"
+        }
+        Trigger::TokenBudget | Trigger::HistoryBytes => {
+            "so it continues unchanged. I won't try again on my own: /new summary tries now, /new starts a fresh chat"
         }
     };
     format!("Couldn't summarize this chat, {next}.\nProvider error: {error}")
@@ -167,14 +178,17 @@ mod tests {
             "Summary carried into a new chat. The oldest 3 turns didn't fit the model's \
              context window, so the summary leaves them out:\n\nNotes."
         );
-        let failed = failed_reply(Trigger::Command, "api error 500: boom");
+        let failed = failed_reply(Trigger::Command, "api error 500: boom", true);
         assert!(failed.contains("continues unchanged"), "{failed}");
         assert!(failed.contains("api error 500: boom"), "{failed}");
-        let automatic = failed_reply(Trigger::TokenBudget, "boom");
+        let automatic = failed_reply(Trigger::TokenBudget, "boom", true);
         assert!(
             automatic.contains("try again after the next reply"),
             "{automatic}"
         );
+        let last = failed_reply(Trigger::HistoryBytes, "boom", false);
+        assert!(last.contains("won't try again"), "{last}");
+        assert!(last.contains("/new summary"), "{last}");
         assert_eq!(
             pruned_notice(1),
             "To keep this chat's history under 4 MiB, I dropped its oldest turn; the model no longer sees them."

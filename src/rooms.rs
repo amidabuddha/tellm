@@ -96,6 +96,11 @@ pub struct RoomState {
     /// provider reported it. `None` when the provider reported no usage, in
     /// message mode, and before the first reply.
     pub context_tokens: Option<u64>,
+    /// Automatic summaries of the current conversation that failed. At
+    /// [`summary::MAX_AUTOMATIC_SUMMARY_FAILURES`] the conversation is no
+    /// longer summarized on its own, since each attempt sends all of it
+    /// again; `/new summary` still works.
+    pub failed_summaries: u8,
     history_turns: VecDeque<HistoryTurn>,
     generation: u64,
 }
@@ -136,6 +141,7 @@ impl RoomState {
             memory: None,
             summary: None,
             context_tokens: None,
+            failed_summaries: 0,
             history_turns: VecDeque::new(),
             generation: 0,
         }
@@ -196,6 +202,7 @@ impl RoomState {
         self.memory = None;
         self.summary = None;
         self.context_tokens = None;
+        self.failed_summaries = 0;
     }
 
     /// Records the conversation's size after a committed reply, from the
@@ -210,9 +217,13 @@ impl RoomState {
 
     /// Whether the conversation has grown enough to be summarized into a new
     /// one, and why: its context reached the token budget, or its history
-    /// passed the byte cap. Only a chat-mode conversation is summarized.
+    /// passed the byte cap. Only a chat-mode conversation is summarized, and
+    /// only until its automatic summaries have failed too often.
     pub fn summary_due(&self) -> Option<summary::Trigger> {
-        if self.settings.mode != ChatMode::Chat || self.history.is_empty() {
+        if self.settings.mode != ChatMode::Chat
+            || self.history.is_empty()
+            || self.failed_summaries >= summary::MAX_AUTOMATIC_SUMMARY_FAILURES
+        {
             return None;
         }
         if self
