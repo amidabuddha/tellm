@@ -18,9 +18,13 @@ pub(crate) struct Persistence {
     room_mutations: Arc<Mutex<()>>,
 }
 
+/// One change to config.toml, applied by the writer thread to the file as
+/// it is on disk at that moment.
+pub(crate) type ConfigChange = Box<dyn FnOnce(&mut Config) + Send>;
+
 enum PersistenceCommand {
-    SaveConfig {
-        config: Config,
+    UpdateConfig {
+        change: ConfigChange,
         reply: oneshot::Sender<Result<(), String>>,
     },
     SaveRooms {
@@ -33,11 +37,18 @@ enum PersistenceCommand {
 }
 
 impl Persistence {
-    pub(crate) async fn save_config(&self, config: &Config) -> Result<(), String> {
+    /// Applies `change` to config.toml as it is on disk now and writes the
+    /// result. The runtime's own copy is loaded once at startup, so writing
+    /// that copy would revert every edit the owner made to the file since;
+    /// applying just the change keeps them.
+    pub(crate) async fn update_config(
+        &self,
+        change: impl FnOnce(&mut Config) + Send + 'static,
+    ) -> Result<(), String> {
         let (reply, result) = oneshot::channel();
         self.sender
-            .send(PersistenceCommand::SaveConfig {
-                config: config.clone(),
+            .send(PersistenceCommand::UpdateConfig {
+                change: Box::new(change),
                 reply,
             })
             .map_err(|_| "config persistence writer stopped".to_string())?;
@@ -122,30 +133,40 @@ impl Persistence {
 }
 
 pub(crate) fn spawn() -> std::io::Result<(Persistence, std::thread::JoinHandle<()>)> {
-    spawn_with_impl(
-        |config| tellm_config::save(&config).map_err(|error| error.to_string()),
-        |settings| rooms::save_settings(&settings).map_err(|error| error.to_string()),
-    )
+    spawn_with_impl(update_config_file, |settings| {
+        rooms::save_settings(&settings).map_err(|error| error.to_string())
+    })
+}
+
+/// Reads config.toml, applies `change`, and writes it back. A file that no
+/// longer parses is left alone: the change fails instead of overwriting
+/// whatever the owner is in the middle of editing.
+fn update_config_file(change: ConfigChange) -> Result<(), String> {
+    let mut config = tellm_config::load().map_err(|error| {
+        format!("config.toml could not be read, so it was left unchanged: {error}")
+    })?;
+    change(&mut config);
+    tellm_config::save(&config).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
-pub(crate) fn spawn_with<SaveConfig, SaveRooms>(
-    save_config: SaveConfig,
+pub(crate) fn spawn_with<UpdateConfig, SaveRooms>(
+    update_config: UpdateConfig,
     save_rooms: SaveRooms,
 ) -> std::io::Result<(Persistence, std::thread::JoinHandle<()>)>
 where
-    SaveConfig: Fn(Config) -> Result<(), String> + Send + 'static,
+    UpdateConfig: Fn(ConfigChange) -> Result<(), String> + Send + 'static,
     SaveRooms: Fn(BTreeMap<i64, RoomSettings>) -> Result<(), String> + Send + 'static,
 {
-    spawn_with_impl(save_config, save_rooms)
+    spawn_with_impl(update_config, save_rooms)
 }
 
-fn spawn_with_impl<SaveConfig, SaveRooms>(
-    save_config: SaveConfig,
+fn spawn_with_impl<UpdateConfig, SaveRooms>(
+    update_config: UpdateConfig,
     save_rooms: SaveRooms,
 ) -> std::io::Result<(Persistence, std::thread::JoinHandle<()>)>
 where
-    SaveConfig: Fn(Config) -> Result<(), String> + Send + 'static,
+    UpdateConfig: Fn(ConfigChange) -> Result<(), String> + Send + 'static,
     SaveRooms: Fn(BTreeMap<i64, RoomSettings>) -> Result<(), String> + Send + 'static,
 {
     let (sender, receiver) = std_mpsc::channel();
@@ -154,8 +175,8 @@ where
         .spawn(move || {
             while let Ok(command) = receiver.recv() {
                 match command {
-                    PersistenceCommand::SaveConfig { config, reply } => {
-                        let _ = reply.send(save_config(config));
+                    PersistenceCommand::UpdateConfig { change, reply } => {
+                        let _ = reply.send(update_config(change));
                     }
                     PersistenceCommand::SaveRooms { settings, reply } => {
                         let _ = reply.send(save_rooms(settings));
@@ -193,7 +214,7 @@ mod tests {
         let thread_release = Arc::clone(&release_first);
         let (started_tx, started_rx) = std_mpsc::channel();
         let (persistence, thread) = spawn_with(
-            |_config: Config| Ok(()),
+            |_change| Ok(()),
             move |settings| {
                 let ids = settings.keys().copied().collect::<Vec<_>>();
                 if ids == [1] {
@@ -248,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn failed_room_mutation_restores_settings_without_resurrecting_history() {
         let (persistence, thread) = spawn_with(
-            |_config: Config| Ok(()),
+            |_change| Ok(()),
             |_settings| Err("injected room failure".to_string()),
         )
         .expect("spawn persistence writer");
@@ -280,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn failed_denied_room_cleanup_does_not_restore_the_room() {
         let (persistence, thread) = spawn_with(
-            |_config: Config| Ok(()),
+            |_change| Ok(()),
             |_settings| Err("injected room failure".to_string()),
         )
         .expect("spawn persistence writer");

@@ -453,19 +453,11 @@ impl Runtime {
                     None => false,
                 };
                 if let Some(user_id) = adder.filter(|_| trusted_adder) {
-                    let persisted = {
-                        let mut config = self.config.lock().await;
-                        let before = config.clone();
-                        let changed = allow_chat_in_config(&mut config, chat_id);
-                        if changed
-                            && let Err(error) = handles.persistence.save_config(&config).await
-                        {
-                            *config = before;
-                            Err(error)
-                        } else {
-                            Ok(changed)
-                        }
-                    };
+                    let persisted = update_config(handles, move |config| {
+                        let changed = allow_chat_in_config(config, chat_id);
+                        (changed, changed)
+                    })
+                    .await;
                     let changed = match persisted {
                         Ok(changed) => changed,
                         Err(error) => {
@@ -947,20 +939,18 @@ async fn handle_command(
             send_command_reply(handles, chat_id, &model_set_reply(&model_key)).await
         }
         CommandAction::PinModel { model_key } => {
-            {
-                let mut config = handles.config.lock().await;
-                let before = config.clone();
+            let pinned_key = model_key.clone();
+            update_config(handles, move |config| {
                 for model in config.models.values_mut() {
                     model.telegram_chat_ids.retain(|pinned| *pinned != chat_id);
                 }
-                if let Some(model) = config.models.get_mut(&model_key) {
+                if let Some(model) = config.models.get_mut(&pinned_key) {
                     model.telegram_chat_ids.push(chat_id);
                 }
-                if let Err(error) = handles.persistence.save_config(&config).await {
-                    *config = before;
-                    return Err(format!("failed to persist model pin: {error}"));
-                }
-            }
+                (true, ())
+            })
+            .await
+            .map_err(|error| format!("failed to persist model pin: {error}"))?;
             handles
                 .persistence
                 .mutate_room(&handles.rooms, chat_id, reset_room_model_context)
@@ -975,9 +965,7 @@ async fn handle_command(
             .await
         }
         CommandAction::UnpinModel => {
-            let was_pinned = {
-                let mut config = handles.config.lock().await;
-                let before = config.clone();
+            let was_pinned = update_config(handles, move |config| {
                 let mut was_pinned = false;
                 for model in config.models.values_mut() {
                     let before = model.telegram_chat_ids.len();
@@ -989,12 +977,10 @@ async fn handle_command(
                 if was_pinned && !config.telegram.allowed_chat_ids.contains(&chat_id) {
                     config.telegram.allowed_chat_ids.push(chat_id);
                 }
-                if was_pinned && let Err(error) = handles.persistence.save_config(&config).await {
-                    *config = before;
-                    return Err(format!("failed to persist model unpin: {error}"));
-                }
-                was_pinned
-            };
+                (was_pinned, was_pinned)
+            })
+            .await
+            .map_err(|error| format!("failed to persist model unpin: {error}"))?;
             let reply = if was_pinned {
                 handles
                     .persistence
@@ -1025,23 +1011,21 @@ async fn handle_command(
                 return handle_configured_model_secret(chat_id, preset_key, handles).await;
             };
 
-            let already = {
-                let mut config = handles.config.lock().await;
+            // On disk, an entry the owner added by hand since startup wins
+            // over the preset: the change only inserts a missing key.
+            let already = update_config(handles, move |config| {
                 if config.models.contains_key(preset.key) {
-                    true
+                    (false, true)
                 } else {
-                    let before = config.clone();
                     config.models.insert(
                         preset.key.to_string(),
                         crate::wizard::model_config_from_preset(preset),
                     );
-                    if let Err(error) = handles.persistence.save_config(&config).await {
-                        *config = before;
-                        return Err(format!("failed to persist added model: {error}"));
-                    }
-                    false
+                    (true, false)
                 }
-            };
+            })
+            .await
+            .map_err(|error| format!("failed to persist added model: {error}"))?;
 
             let base_reply = model_add_base_reply(already, preset);
             if secrets::get(preset.api_key_secret).is_some() {
@@ -1597,18 +1581,12 @@ async fn handle_allow_chat(
     target_chat_id: i64,
     handles: &RuntimeHandles,
 ) -> Result<(), String> {
-    let changed = {
-        let mut config = handles.config.lock().await;
-        let before = config.clone();
-        let changed = allow_chat_in_config(&mut config, target_chat_id);
-        if changed && let Err(error) = handles.persistence.save_config(&config).await {
-            *config = before;
-            return Err(format!(
-                "failed to persist allowed chat {target_chat_id}: {error}"
-            ));
-        }
-        changed
-    };
+    let changed = update_config(handles, move |config| {
+        let changed = allow_chat_in_config(config, target_chat_id);
+        (changed, changed)
+    })
+    .await
+    .map_err(|error| format!("failed to persist allowed chat {target_chat_id}: {error}"))?;
 
     {
         let mut access = handles.access.lock().await;
@@ -1668,8 +1646,14 @@ async fn handle_deny_chat(
             target_chat_id != requester_chat_id,
         );
 
+        // The file gets the same change, applied to it as it is on disk.
         if result.changed()
-            && let Err(error) = handles.persistence.save_config(&config).await
+            && let Err(error) = handles
+                .persistence
+                .update_config(move |config| {
+                    deny_chat_in_config(config, target_chat_id);
+                })
+                .await
         {
             *config = before;
             if was_allowed {
@@ -1871,28 +1855,54 @@ async fn persist_paired_chat(
     pairer_user_id: Option<i64>,
     handles: &RuntimeHandles,
 ) -> Result<bool, String> {
+    update_config(handles, move |config| {
+        let mut changed = false;
+        if !config.telegram.allowed_chat_ids.contains(&chat_id) {
+            config.telegram.allowed_chat_ids.push(chat_id);
+            changed = true;
+        }
+        // Code pairing proves console access: record the pairing USER as an
+        // owner. Owners are the sole privilege concept; chats never confer it.
+        let mut became_owner = false;
+        if let Some(user_id) = pairer_user_id
+            && !config.telegram.owner_user_ids.contains(&user_id)
+        {
+            config.telegram.owner_user_ids.push(user_id);
+            became_owner = true;
+            changed = true;
+        }
+        (changed, became_owner)
+    })
+    .await
+}
+
+/// Changes the runtime's config and config.toml together. `change` runs on
+/// the in-memory copy and, when it reports a change, again on the file as it
+/// is on disk, so edits the owner made to the file since startup are kept. A
+/// failed write restores the in-memory copy. Returns what `change` returned
+/// for the in-memory copy.
+async fn update_config<T>(
+    handles: &RuntimeHandles,
+    change: impl Fn(&mut Config) -> (bool, T) + Send + Sync + 'static,
+) -> Result<T, String> {
+    let change = Arc::new(change);
     let mut config = handles.config.lock().await;
     let before = config.clone();
-    let mut changed = false;
-    if !config.telegram.allowed_chat_ids.contains(&chat_id) {
-        config.telegram.allowed_chat_ids.push(chat_id);
-        changed = true;
+    let (changed, value) = change(&mut config);
+    if changed {
+        let on_disk = Arc::clone(&change);
+        let saved = handles
+            .persistence
+            .update_config(move |config| {
+                on_disk(config);
+            })
+            .await;
+        if let Err(error) = saved {
+            *config = before;
+            return Err(error);
+        }
     }
-    // Code pairing proves console access: record the pairing USER as an
-    // owner. Owners are the sole privilege concept; chats never confer it.
-    let mut became_owner = false;
-    if let Some(user_id) = pairer_user_id
-        && !config.telegram.owner_user_ids.contains(&user_id)
-    {
-        config.telegram.owner_user_ids.push(user_id);
-        became_owner = true;
-        changed = true;
-    }
-    if changed && let Err(error) = handles.persistence.save_config(&config).await {
-        *config = before;
-        return Err(error);
-    }
-    Ok(became_owner)
+    Ok(value)
 }
 
 /// The provider catalog for /model add: every preset as a tappable command,
@@ -2029,7 +2039,7 @@ fn configured_model_base_reply(model_key: &str) -> String {
 
 fn configured_model_has_no_secret_reply(model_key: &str) -> String {
     format!(
-        "{model_key} is already configured with no API key prompt. Select it here with /model {model_key}. If this endpoint needs a key, add api_key_secret = \"...\" under [models.{model_key}] in config.toml."
+        "{model_key} is already configured with no API key prompt. Select it here with /model {model_key}. If this endpoint needs a key, add api_key_secret = \"...\" under [models.{model_key}] in config.toml and restart tellm."
     )
 }
 
@@ -2684,6 +2694,85 @@ mod tests {
     use crate::rooms::HistoryReset;
 
     #[tokio::test]
+    async fn config_writes_apply_their_change_to_the_file_as_it_is_on_disk() {
+        let startup = Config {
+            default_model: "openai".to_string(),
+            models: BTreeMap::from([(
+                "openai".to_string(),
+                test_model(WireFormat::Responses, &[]),
+            )]),
+            telegram: tellm_config::TelegramConfig::default(),
+        };
+        // Since startup the owner added a model to config.toml by hand.
+        let mut edited = startup.clone();
+        edited.models.insert(
+            "added-by-hand".to_string(),
+            test_model(WireFormat::Compat, &[]),
+        );
+        let disk = Arc::new(StdMutex::new(edited));
+        let writer_disk = Arc::clone(&disk);
+        let (persistence, thread) = persistence::spawn_with(
+            move |change: persistence::ConfigChange| {
+                change(&mut writer_disk.lock().unwrap());
+                Ok(())
+            },
+            |_settings| Ok(()),
+        )
+        .expect("spawn persistence writer");
+        let config = Arc::new(Mutex::new(startup));
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let handles = RuntimeHandles {
+            telegram: Telegram::new("test-token"),
+            config: Arc::clone(&config),
+            rooms: Arc::new(Mutex::new(RoomStates::default())),
+            access: Arc::new(Mutex::new(AccessControl::new(AccessConfig::default()))),
+            terminal_prompts: Arc::new(StdMutex::new(None)),
+            bot_username: None,
+            shutdown_tx,
+            persistence: persistence.clone(),
+            workers: Arc::new(StdMutex::new(BTreeMap::new())),
+            queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
+        };
+
+        assert!(persist_paired_chat(42, Some(7), &handles).await.unwrap());
+
+        let on_disk = disk.lock().unwrap().clone();
+        assert!(
+            on_disk.models.contains_key("added-by-hand"),
+            "the hand edit survives the runtime's write"
+        );
+        assert_eq!(on_disk.telegram.allowed_chat_ids, vec![42]);
+        assert_eq!(on_disk.telegram.owner_user_ids, vec![7]);
+        let in_memory = config.lock().await.clone();
+        assert_eq!(in_memory.telegram.allowed_chat_ids, vec![42]);
+        assert!(!in_memory.models.contains_key("added-by-hand"));
+
+        // A change that reports nothing new writes nothing.
+        let written_before = disk.lock().unwrap().clone();
+        assert!(
+            !update_config(&handles, |config| {
+                let changed = allow_chat_in_config(config, 42);
+                (changed, changed)
+            })
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            disk.lock().unwrap().telegram.allowed_chat_ids,
+            written_before.telegram.allowed_chat_ids
+        );
+
+        persistence
+            .shutdown()
+            .await
+            .expect("writer should shut down");
+        spawn_blocking(move || thread.join())
+            .await
+            .expect("join persistence thread")
+            .expect("persistence thread should not panic");
+    }
+
+    #[tokio::test]
     async fn failed_pair_persistence_revokes_live_access_and_rearms_the_room() {
         let mut codes = ["123456", "654321"].into_iter();
         let mut access = AccessControl::new_with_generator(AccessConfig::default(), move || {
@@ -2707,7 +2796,7 @@ mod tests {
         };
         let config = Arc::new(Mutex::new(config));
         let (persistence, thread) = persistence::spawn_with(
-            |_config: Config| Err("injected config failure".to_string()),
+            |_change| Err("injected config failure".to_string()),
             |_settings| Ok(()),
         )
         .expect("spawn persistence writer");
@@ -2810,7 +2899,7 @@ mod tests {
         let writer_release = Arc::clone(&release_save);
         let (save_started_tx, save_started_rx) = std_mpsc::channel();
         let (persistence, writer_thread) = persistence::spawn_with(
-            move |_config: Config| {
+            move |_change| {
                 let _ = save_started_tx.send(());
                 writer_release.wait();
                 Err("injected config failure".to_string())
@@ -3328,9 +3417,8 @@ mod tests {
             },
         };
         let access = AccessControl::new(AccessConfig::from_config(&config));
-        let (persistence, _writer) =
-            persistence::spawn_with(|_config: Config| Ok(()), |_settings| Ok(()))
-                .expect("spawn persistence writer");
+        let (persistence, _writer) = persistence::spawn_with(|_change| Ok(()), |_settings| Ok(()))
+            .expect("spawn persistence writer");
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
         RuntimeHandles {
             telegram: Telegram::with_base_urls(

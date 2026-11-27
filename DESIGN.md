@@ -681,6 +681,13 @@ restart and local room-setting changes.
   that requires them is used. The missing-key provider error names the console
   fallback.
 - Non-secrets: human-editable TOML at `dirs::config_dir()/tellm/config.toml`.
+  tellm reads it once at startup, so hand edits take effect at the next
+  start. The runtime writes it only for `/allow`, `/deny`, pairing, an
+  owner's group add, and `/model pin|unpin|add`. Each of those re-reads the
+  file and applies just its own change to what is on disk, so edits made
+  while tellm runs are kept; a file that no longer parses is left alone and
+  the command fails. Comments are not kept, because the file is written back
+  from its parsed values.
   **Capability routing is explicit** (`wire_format` field per model) — never
   inferred from the spelling of user-chosen keys (parent-app lesson). The two
   ends of the reasoning scale follow the same rule: the optional per-model
