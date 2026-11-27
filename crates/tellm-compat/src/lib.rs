@@ -27,6 +27,9 @@
 //!   the amount charged in credits, which are US dollars; it is trusted only
 //!   from openrouter.ai, because the field has no shared meaning in the
 //!   dialect.
+//! - A 200 with a top-level `error` and no `choices`, or with an `error` on
+//!   `choices[0]`, is a provider error (checked 2026-11-27 against
+//!   openrouter.ai, API errors).
 //! - `finish_reason: "length"`: a partial answer gets a closing note and one
 //!   without text is an error; `content_filter` is a refusal (checked
 //!   2026-11-27 against developers.openai.com, chat completions reference).
@@ -115,18 +118,41 @@ impl Provider for Compat {
             self.max_effort.as_deref(),
         );
         let response_body = self.send_request(body).await?;
-        let choice = response_body
+        // Checked 2026-11-27 against openrouter.ai (API errors): a provider
+        // that fails after the headers went out yields a 200 whose body holds
+        // only an `error` object and no `choices`, and one that fails partway
+        // puts an `error` on `choices[0]` with `finish_reason: "error"`. Both
+        // are failures, not answers; a partial answer is not stored.
+        let Some(choice) = response_body
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
             .cloned()
-            .unwrap_or_default();
+        else {
+            return Err(ProviderError::Api {
+                status: 200,
+                message: if response_body.get("error").is_some() {
+                    api_error_message(&response_body)
+                } else {
+                    NO_CHOICES.to_string()
+                },
+            });
+        };
         let message = choice.get("message").cloned().unwrap_or_else(|| {
             json!({
                 "role": "assistant",
                 "content": null,
             })
         });
+
+        if choice.get("error").is_some()
+            || choice.get("finish_reason").and_then(Value::as_str) == Some("error")
+        {
+            return Err(ProviderError::Api {
+                status: 200,
+                message: api_error_message(&choice),
+            });
+        }
 
         if let Some(refusal) = message.get("refusal").and_then(Value::as_str) {
             return Err(ProviderError::Refusal(refusal.to_string()));
@@ -377,6 +403,9 @@ fn api_error(status: u16, body: &Value, is_openrouter: bool) -> ProviderError {
         ProviderError::Api { status, message }
     }
 }
+
+/// Error message for a successful response that holds no choice.
+pub const NO_CHOICES: &str = "the response has no choices";
 
 fn api_error_message(value: &Value) -> String {
     value

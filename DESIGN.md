@@ -237,6 +237,11 @@ Notes:
   a closing note pointing at `/new summary`; one without text is the same
   context-window error as an oversized prompt, so the error reply offers
   `/new summary` too.
+- A chat-completions 200 is not always an answer (checked 2026-11-27
+  against openrouter.ai, API errors): a body with an `error` object and no
+  `choices`, or with an `error` on `choices[0]` and `finish_reason: error`,
+  is a provider error carrying that message, and a body with no choice at
+  all is an error too, never an empty turn.
 - Every client looks at the HTTP status before it parses the body. A
   success must be JSON; an error body that is not JSON (an HTML or
   plain-text page from a proxy or gateway in front of the API) becomes an

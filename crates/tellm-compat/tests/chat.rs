@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tellm_compat::Compat;
+use tellm_compat::{Compat, NO_CHOICES};
 use tellm_core::{
     CUT_OFF_NOTE, ChatRequest, ContentPart, OUTPUT_LIMIT_BEFORE_TEXT, Provider, ProviderError,
     ThinkingLevel,
@@ -449,5 +449,43 @@ async fn a_non_json_error_page_keeps_its_status() {
     assert!(
         matches!(&error, ProviderError::Api { status: 502, message } if message == "502 Bad Gateway"),
         "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_success_without_choices_reports_the_providers_error() {
+    let mock = MockCompat::start(vec![
+        MockResponse::json(
+            200,
+            json!({ "error": { "message": "upstream provider overloaded", "code": 502 } }),
+        ),
+        MockResponse::json(200, json!({ "id": "gen-1" })),
+        MockResponse::json(
+            200,
+            json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": "Half an ans" },
+                    "finish_reason": "error",
+                    "error": { "message": "provider disconnected", "code": 502 }
+                }]
+            }),
+        ),
+    ]);
+
+    let gateway = client(&mock).chat(&request()).await.unwrap_err();
+    let bare = client(&mock).chat(&request()).await.unwrap_err();
+    let partial = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(&gateway, ProviderError::Api { status: 200, message } if message == "upstream provider overloaded"),
+        "{gateway:?}"
+    );
+    assert!(
+        matches!(&bare, ProviderError::Api { status: 200, message } if message == NO_CHOICES),
+        "{bare:?}"
+    );
+    assert!(
+        matches!(&partial, ProviderError::Api { status: 200, message } if message == "provider disconnected"),
+        "{partial:?}"
     );
 }
