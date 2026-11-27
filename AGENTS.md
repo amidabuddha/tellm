@@ -52,7 +52,7 @@ When a change is complete, close it out in this order:
 
    ```sh
    cargo build --release
-   codesign --force --sign "tellm local" --identifier tellm target/release/tellm
+   codesign --force --sign "Apple Development" --identifier tellm target/release/tellm
    install -m 755 target/release/tellm ~/.local/bin/.tellm.new
    mv -f ~/.local/bin/.tellm.new ~/.local/bin/tellm
    ```
@@ -61,19 +61,28 @@ When a change is complete, close it out in this order:
    installed file in place (for example `cp` onto it): macOS caches code
    signatures and can kill the rewritten binary.
 
-   `tellm local` is a self-signed code-signing identity in the maintainer's
-   login keychain. The linker's ad-hoc signature changes with every build, so
-   macOS would treat each build as a new app and ask for the login password
-   once for every stored secret. Signed with the same identity and
-   identifier, every build has the same designated requirement
-   (`identifier tellm and certificate leaf = H"…"`), so a keychain
-   "Always Allow" grant carries over to the next build. If the identity is
-   missing, create a Code Signing certificate named `tellm local` with
-   Keychain Access's Certificate Assistant; the first start after that asks
-   once more per secret.
+   `Apple Development` is the maintainer's certificate from a free Xcode
+   Personal Team, in the login keychain. macOS reads a stored secret without
+   asking only when the build passes two checks on that keychain item: its
+   access list, which matches the build's designated requirement
+   (`identifier tellm and anchor apple generic and certificate leaf[...]`),
+   and its partition list, which records the signer's Team ID
+   (`teamid:…`). A build without a Team ID, whether ad-hoc or self-signed,
+   is recorded by its cdhash instead, which changes with every build, so
+   each new build would ask for the login password once per stored secret.
+   Signed with this certificate and identifier, a keychain "Always Allow"
+   grant carries over to later builds. If codesign reports no valid
+   identity, create one in Xcode → Settings → Accounts → Manage
+   Certificates → + → Apple Development, and check that the login keychain
+   holds Apple's WWDR G3 intermediate
+   (`https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer`), which
+   Xcode does not always install. The certificate expires after a year;
+   after renewing it, the first start may ask once more per secret.
 3. Verify: `cmp target/release/tellm ~/.local/bin/tellm` succeeds,
-   `codesign -d -r- ~/.local/bin/tellm` shows `identifier tellm and
-   certificate leaf`, and `command -v tellm` prints `~/.local/bin/tellm`.
+   `codesign -dv ~/.local/bin/tellm` shows a `TeamIdentifier` (not
+   `not set`), `codesign -d -r- ~/.local/bin/tellm` shows `identifier tellm
+   and anchor apple generic`, and `command -v tellm` prints
+   `~/.local/bin/tellm`.
 4. Remove the build output with `cargo clean`. Keep `Cargo.lock`, source
    and configuration; secrets live in the keychain or the
    user's config directory, never in this repository.
