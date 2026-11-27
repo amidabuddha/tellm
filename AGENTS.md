@@ -47,10 +47,12 @@ These rules apply to every contributor — human, Claude, Codex, or otherwise.
 When a change is complete, close it out in this order:
 
 1. Run the Verification gate below and commit locally.
-2. Build the release binary and replace the installed one atomically:
+2. Build the release binary, sign it, and replace the installed one
+   atomically:
 
    ```sh
    cargo build --release
+   codesign --force --sign "tellm local" --identifier tellm target/release/tellm
    install -m 755 target/release/tellm ~/.local/bin/.tellm.new
    mv -f ~/.local/bin/.tellm.new ~/.local/bin/tellm
    ```
@@ -58,8 +60,20 @@ When a change is complete, close it out in this order:
    `~/.local/bin` comes first on the maintainer's `PATH`. Never overwrite the
    installed file in place (for example `cp` onto it): macOS caches code
    signatures and can kill the rewritten binary.
-3. Verify: `cmp target/release/tellm ~/.local/bin/tellm` succeeds and
-   `command -v tellm` prints `~/.local/bin/tellm`.
+
+   `tellm local` is a self-signed code-signing identity in the maintainer's
+   login keychain. The linker's ad-hoc signature changes with every build, so
+   macOS would treat each build as a new app and ask for the login password
+   once for every stored secret. Signed with the same identity and
+   identifier, every build has the same designated requirement
+   (`identifier tellm and certificate leaf = H"…"`), so a keychain
+   "Always Allow" grant carries over to the next build. If the identity is
+   missing, create a Code Signing certificate named `tellm local` with
+   Keychain Access's Certificate Assistant; the first start after that asks
+   once more per secret.
+3. Verify: `cmp target/release/tellm ~/.local/bin/tellm` succeeds,
+   `codesign -d -r- ~/.local/bin/tellm` shows `identifier tellm and
+   certificate leaf`, and `command -v tellm` prints `~/.local/bin/tellm`.
 4. Remove the build output with `cargo clean`. Keep `Cargo.lock`, source
    and configuration; secrets live in the keychain or the
    user's config directory, never in this repository.
