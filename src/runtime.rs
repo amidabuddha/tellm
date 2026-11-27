@@ -2044,7 +2044,7 @@ fn model_key_skipped_reply(model_key: &str) -> String {
 
 fn model_key_prompt_failed_reply(model_key: &str, secret_name: &str, error: &str) -> String {
     format!(
-        "Could not complete the terminal prompt for {model_key}: {error}. Fallback: run tellm secret set {secret_name} in the tellm console."
+        "Could not complete the terminal prompt for {model_key}: {error}. Fallback: run tellm secret set {secret_name} in a separate terminal; the running bot uses the key from the next message without a restart."
     )
 }
 

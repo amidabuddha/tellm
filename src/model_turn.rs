@@ -478,8 +478,9 @@ async fn fetch_secret(secret_name: String) -> Result<String, String> {
 
 fn missing_provider_secret_error(secret_name: &str) -> String {
     format!(
-        "missing provider secret \"{secret_name}\" — set it in the tellm console with: \
-         tellm secret set {secret_name}"
+        "missing provider secret \"{secret_name}\" — run tellm secret set {secret_name} \
+         in a separate terminal, not the one running the bot; the bot uses the key from \
+         the next message without a restart"
     )
 }
 
@@ -679,6 +680,16 @@ mod tests {
         document.file_name = Some("notes.pdf".to_string());
         assert!(is_text_document(&document, "text/plain"));
         assert!(!is_text_document(&document, "application/pdf"));
+    }
+
+    #[test]
+    fn missing_secret_error_points_outside_the_bots_terminal() {
+        // The running bot's terminal only takes reset/exit/quit, so the hint
+        // must send the user to another shell for the subcommand.
+        let error = missing_provider_secret_error("gemini_api_key");
+        assert!(error.contains("tellm secret set gemini_api_key"), "{error}");
+        assert!(error.contains("separate terminal"), "{error}");
+        assert!(!error.contains("tellm console"), "{error}");
     }
 
     #[test]
