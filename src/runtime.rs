@@ -8,7 +8,7 @@ use tellm_config::{Config, WireFormat, secrets};
 use tellm_core::{ChatRequest, ChatResponse, ContentPart};
 use tellm_telegram::{IncomingMessage, Telegram, TelegramError};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::{sleep, timeout};
 
@@ -64,6 +64,12 @@ struct ChatDispatcher {
     handle: JoinHandle<()>,
     worker_id: u64,
     cancelled: Arc<AtomicBool>,
+    /// Resolves when this worker's task ends, however it ends. A worker
+    /// that replaces this one waits for it.
+    done: Option<oneshot::Receiver<()>>,
+    /// The worker this one replaced, which may still be finishing messages
+    /// it had queued. Kept so shutdown aborts and joins it too.
+    previous: Option<JoinHandle<()>>,
 }
 
 type WorkerRegistry = Arc<StdMutex<BTreeMap<i64, WorkerRegistration>>>;
@@ -417,8 +423,18 @@ impl Runtime {
                 }
             }
 
+            // A worker that closed its queue but is still running is
+            // finishing queued messages; keep it until it ends, so the next
+            // message's worker can wait for it and shutdown can join it.
             dispatchers.retain(|chat_id, dispatcher| {
-                let keep = !dispatcher.handle.is_finished() && !dispatcher.sender.is_closed();
+                if dispatcher
+                    .previous
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    dispatcher.previous = None;
+                }
+                let keep = !dispatcher.handle.is_finished();
                 if !keep {
                     remove_worker_registration(&workers, *chat_id, dispatcher.worker_id);
                 }
@@ -599,7 +615,7 @@ fn send_to_chat_worker(
 ) {
     let dispatcher = dispatchers
         .entry(chat_id)
-        .or_insert_with(|| spawn_chat_worker(chat_id, handles.clone()));
+        .or_insert_with(|| spawn_chat_worker(chat_id, handles.clone(), None));
 
     let message = match dispatcher.sender.try_send(message) {
         Ok(()) => return,
@@ -630,7 +646,13 @@ fn send_to_chat_worker(
         Err(TrySendError::Closed(message)) => message,
     };
 
-    let dispatcher = spawn_chat_worker(chat_id, handles.clone());
+    // The old worker may still be finishing messages that reached its queue
+    // before it closed; the new one starts after it, so order holds.
+    let previous = dispatchers.remove(&chat_id).map(|mut old| {
+        let done = old.done.take();
+        (old.handle, done)
+    });
+    let dispatcher = spawn_chat_worker(chat_id, handles.clone(), previous);
     if dispatcher.sender.try_send(message).is_err() {
         log::error!(
             target: "tellm::dispatcher",
@@ -647,14 +669,28 @@ fn reserve_queue_full_notice(pending: &Arc<StdMutex<BTreeSet<i64>>>, chat_id: i6
         .insert(chat_id)
 }
 
-fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
+fn spawn_chat_worker(
+    chat_id: i64,
+    handles: RuntimeHandles,
+    previous: Option<(JoinHandle<()>, Option<oneshot::Receiver<()>>)>,
+) -> ChatDispatcher {
     let (sender, mut receiver) = mpsc::channel::<IncomingMessage>(CHAT_QUEUE_SIZE);
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let (previous, previous_done) = match previous {
+        Some((handle, done)) => (Some(handle), done),
+        None => (None, None),
+    };
     let worker_id = NEXT_CHAT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let workers = Arc::clone(&handles.workers);
     let worker_guard_registry = Arc::clone(&workers);
     let handle = tokio::spawn(async move {
+        // Dropped when this task ends, even by abort, which resolves `done`.
+        let _done = done_tx;
+        if let Some(previous_done) = previous_done {
+            let _ = previous_done.await;
+        }
         let _registry_guard = WorkerRegistryGuard {
             chat_id,
             worker_id,
@@ -692,11 +728,16 @@ fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
                 }
                 Ok(None) => break,
                 Err(_) => {
+                    // Close, then finish what is queued: the poll loop can
+                    // send between the timeout and the close, and dropping
+                    // the receiver would lose that message. From the close
+                    // on, sends fail and the poll loop starts a new worker,
+                    // which waits for this one; `recv` ends with `None`.
                     log::debug!(
                         target: "tellm::dispatcher",
                         "idle task reaped chat_id={chat_id}"
                     );
-                    break;
+                    receiver.close();
                 }
             }
         }
@@ -719,6 +760,8 @@ fn spawn_chat_worker(chat_id: i64, handles: RuntimeHandles) -> ChatDispatcher {
         handle,
         worker_id,
         cancelled,
+        done: Some(done_rx),
+        previous,
     }
 }
 
@@ -765,6 +808,10 @@ async fn stop_chat_workers(dispatchers: BTreeMap<i64, ChatDispatcher>, workers: 
         dispatcher.handle.abort();
         remove_worker_registration(workers, chat_id, dispatcher.worker_id);
         handles.push((chat_id, dispatcher.handle));
+        if let Some(previous) = dispatcher.previous {
+            previous.abort();
+            handles.push((chat_id, previous));
+        }
     }
     for (chat_id, handle) in handles {
         if let Err(error) = handle.await
@@ -3530,6 +3577,43 @@ mod tests {
         assert!(capabilities.web_search);
         assert!(!capabilities.image_generation);
         assert_eq!(capabilities.endpoint, "Meta Model API Responses");
+    }
+
+    #[tokio::test]
+    async fn a_replacement_worker_starts_after_the_worker_it_replaces() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = mock_handles(&telegram, &provider);
+        // Stands in for a reaped worker still finishing its queued messages.
+        let (old_done_tx, old_done_rx) = oneshot::channel::<()>();
+        let old = tokio::spawn(std::future::pending::<()>());
+
+        let dispatcher = spawn_chat_worker(42, handles.clone(), Some((old, Some(old_done_rx))));
+        dispatcher.sender.try_send(text_message("/id")).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            sent_texts(&telegram).is_empty(),
+            "nothing runs while the old worker may still be replying"
+        );
+
+        drop(old_done_tx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while sent_texts(&telegram).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "queued message never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sent_texts(&telegram), vec![chat_id_reply(42)]);
+
+        // Shutdown aborts and joins the replaced worker too.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            stop_chat_workers(BTreeMap::from([(42, dispatcher)]), &handles.workers),
+        )
+        .await
+        .expect("both workers are joined");
     }
 
     #[tokio::test]

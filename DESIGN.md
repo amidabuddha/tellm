@@ -530,7 +530,11 @@ calls a billing API and never fetches prices.
 
 - Long polling (`getUpdates`, modest timeout so terminal controls stay responsive).
 - **Strictly ordered execution per chat via one tokio mpsc task per chat**
-  (decided 2026-07-04; idle tasks are reaped). The channel gives ordering and
+  (decided 2026-07-04; idle tasks are reaped). An idle task closes its
+  queue and finishes whatever reached it before the close; the next
+  message starts a new task that waits for the old one to end, so no
+  message is lost and two tasks never serve one chat at once. Shutdown
+  joins both. The channel gives ordering and
   backpressure for free and is the tokio-native equivalent of the parent's
   chained-futures design. The queue is bounded (32 per chat); when a room
   backs up behind a slow turn, further messages are dropped with a busy
