@@ -831,7 +831,8 @@ that key is configured again.
   free. A secret whose `TELLM_*` variable is set is taken from it without a
   prompt and is not stored, since that variable overrides any stored value;
   a set but empty or non-UTF-8 variable stops the wizard with its name. The
-  wizard stores the other Telegram/provider
+  wizard validates the config it is about to write before it stores
+  anything, then stores the other Telegram/provider
   secrets via the secret facade, writes nonsecret config last, and explains the
   `/pair CODE` claim step. EOF before completion exits once with an error rather
   than repeatedly prompting on a closed input stream.

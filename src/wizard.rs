@@ -261,6 +261,9 @@ pub async fn run_first_run(
     )?;
 
     let config = config_for_preset(preset);
+    // Checked before anything is stored: a config the runtime would refuse
+    // must not leave secrets behind or mark setup as done.
+    config.validate()?;
     let telegram_status = store_wizard_secret(secrets::TELEGRAM_BOT_TOKEN, &telegram_token)?;
     let provider_status = store_wizard_secret(preset.api_key_secret, &api_key)?;
     // A config file marks setup complete, so publish it only after every
@@ -592,6 +595,19 @@ mod tests {
             "first-run input ended before setup was complete"
         );
         assert_eq!(output, b"Telegram bot token: ");
+    }
+
+    #[test]
+    fn every_preset_writes_a_config_the_runtime_accepts() {
+        for preset in PROVIDER_PRESETS {
+            let config = config_for_preset(preset);
+            if let Err(error) = config.validate() {
+                panic!("preset {} is invalid: {error}", preset.key);
+            }
+            let text = toml::to_string_pretty(&config).unwrap();
+            let reread: tellm_config::Config = toml::from_str(&text).unwrap();
+            reread.validate().unwrap();
+        }
     }
 
     #[test]
