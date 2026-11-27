@@ -196,7 +196,10 @@ Validity caveats (OpenAI refreshed 2026-07-10; Anthropic refreshed
   web search: compat), naming the model and endpoint. Support that still varies
   per model *inside* a capable format (for example, which OpenAI models can use
   the image tool) stays a request-time error, with the error reply suggesting
-  the off command.
+  the off command. Changing a room's model (`/model KEY`, `/model pin`,
+  `/model unpin`) turns off the toggles the new model can never honor, by the
+  same rule, and the reply says which, so a setting chosen under the old
+  model can't make every following message fail.
 
 Notes:
 - **API surface details are pinned at implementation time against live

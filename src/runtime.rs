@@ -1034,14 +1034,21 @@ async fn handle_command(
             }
         }
         CommandAction::SetModel { model_key } => {
+            let capabilities = {
+                let config = handles.config.lock().await;
+                model_capabilities(&config, model_key.clone())
+            };
+            let mut settings_note = None;
             handles
                 .persistence
                 .mutate_room(&handles.rooms, chat_id, |room| {
                     room.settings.model_key = Some(model_key.clone());
                     reset_room_model_context(room);
+                    settings_note = drop_unsupported_settings(room, &capabilities);
                 })
                 .await?;
-            send_command_reply(handles, chat_id, &model_set_reply(&model_key)).await
+            let reply = with_settings_note(model_set_reply(&model_key), settings_note);
+            send_command_reply(handles, chat_id, &reply).await
         }
         CommandAction::PinModel { model_key } => {
             let pinned_key = model_key.clone();
@@ -1056,18 +1063,25 @@ async fn handle_command(
             })
             .await
             .map_err(|error| format!("failed to persist model pin: {error}"))?;
+            let capabilities = {
+                let config = handles.config.lock().await;
+                model_capabilities(&config, model_key.clone())
+            };
+            let mut settings_note = None;
             handles
                 .persistence
-                .mutate_room(&handles.rooms, chat_id, reset_room_model_context)
+                .mutate_room(&handles.rooms, chat_id, |room| {
+                    reset_room_model_context(room);
+                    settings_note = drop_unsupported_settings(room, &capabilities);
+                })
                 .await?;
-            send_command_reply(
-                handles,
-                chat_id,
-                &format!(
+            let reply = with_settings_note(
+                format!(
                     "Room pinned to {model_key}. Chat history reset. /model unpin releases it."
                 ),
-            )
-            .await
+                settings_note,
+            );
+            send_command_reply(handles, chat_id, &reply).await
         }
         CommandAction::UnpinModel => {
             let was_pinned = update_config(handles, move |config| {
@@ -1087,15 +1101,30 @@ async fn handle_command(
             .await
             .map_err(|error| format!("failed to persist model unpin: {error}"))?;
             let reply = if was_pinned {
+                // The room falls back to its stored selection or the default
+                // model, which may not support what the pinned one did.
+                let capabilities = {
+                    let config = handles.config.lock().await;
+                    let mut rooms = handles.rooms.lock().await;
+                    room_capabilities(&config, rooms.get_or_default(chat_id), chat_id)
+                };
+                let mut settings_note = None;
                 handles
                     .persistence
-                    .mutate_room(&handles.rooms, chat_id, reset_room_model_context)
+                    .mutate_room(&handles.rooms, chat_id, |room| {
+                        reset_room_model_context(room);
+                        settings_note = drop_unsupported_settings(room, &capabilities);
+                    })
                     .await?;
-                "Room unpinned. Chat history reset. /model KEY now switches models here."
+                with_settings_note(
+                    "Room unpinned. Chat history reset. /model KEY now switches models here."
+                        .to_string(),
+                    settings_note,
+                )
             } else {
-                "This room isn't pinned."
+                "This room isn't pinned.".to_string()
             };
-            send_command_reply(handles, chat_id, reply).await
+            send_command_reply(handles, chat_id, &reply).await
         }
         CommandAction::ShowModelCatalog => {
             let configured: BTreeSet<String> = {
@@ -1977,7 +2006,10 @@ fn room_capabilities(
     room: &RoomState,
     chat_id: i64,
 ) -> commands::RoomCapabilities {
-    let model_key = selected_model_key(config, room, chat_id);
+    model_capabilities(config, selected_model_key(config, room, chat_id))
+}
+
+fn model_capabilities(config: &Config, model_key: String) -> commands::RoomCapabilities {
     let Some(model) = config.models.get(&model_key) else {
         return commands::RoomCapabilities::permissive();
     };
@@ -2009,6 +2041,40 @@ fn room_capabilities(
         image_generation,
         model_key,
         endpoint: endpoint.to_string(),
+    }
+}
+
+/// Turns off the room settings its model can't use. A setting chosen under
+/// the old model would otherwise make every message after a model switch
+/// fail with a capability error. Returns the line that says so, if any.
+fn drop_unsupported_settings(
+    room: &mut RoomState,
+    capabilities: &commands::RoomCapabilities,
+) -> Option<String> {
+    let web_search = room.settings.web_search && !capabilities.web_search;
+    let image_generation = room.settings.image_generation && !capabilities.image_generation;
+    if web_search {
+        room.set_web_search(false);
+    }
+    if image_generation {
+        room.settings.image_generation = false;
+    }
+    let (what, pronoun) = match (web_search, image_generation) {
+        (true, true) => ("Web search and image generation are", "them"),
+        (true, false) => ("Web search is", "it"),
+        (false, true) => ("Image generation is", "it"),
+        (false, false) => return None,
+    };
+    Some(format!(
+        "{what} now off: {} doesn't support {pronoun}.",
+        capabilities.model_key
+    ))
+}
+
+fn with_settings_note(reply: String, note: Option<String>) -> String {
+    match note {
+        Some(note) => format!("{reply}\n{note}"),
+        None => reply,
     }
 }
 
@@ -3702,6 +3768,64 @@ mod tests {
         assert!(hint.contains("/allow -100"));
         assert!(hint.contains("registered owner"));
         assert!(!hint.contains("admin chat"));
+    }
+
+    #[test]
+    fn switching_models_turns_off_settings_the_new_model_cannot_use() {
+        let mut config = Config {
+            default_model: "astra".to_string(),
+            models: BTreeMap::new(),
+            telegram: tellm_config::TelegramConfig::default(),
+        };
+        config
+            .models
+            .insert("astra".to_string(), test_model(WireFormat::Responses, &[]));
+        config
+            .models
+            .insert("inkling".to_string(), test_model(WireFormat::Compat, &[]));
+        let mut claude = test_model(WireFormat::Anthropic, &[]);
+        claude.model_name = "claude-test".to_string();
+        config.models.insert("claude".to_string(), claude);
+        let both_on = || {
+            RoomState::new(crate::rooms::RoomSettings {
+                web_search: true,
+                image_generation: true,
+                ..crate::rooms::RoomSettings::default()
+            })
+        };
+
+        let mut room = both_on();
+        let note = drop_unsupported_settings(
+            &mut room,
+            &model_capabilities(&config, "inkling".to_string()),
+        );
+        assert_eq!(
+            note.as_deref(),
+            Some("Web search and image generation are now off: inkling doesn't support them.")
+        );
+        assert!(!room.settings.web_search && !room.settings.image_generation);
+
+        let mut room = both_on();
+        let note = drop_unsupported_settings(
+            &mut room,
+            &model_capabilities(&config, "claude".to_string()),
+        );
+        assert_eq!(
+            note.as_deref(),
+            Some("Image generation is now off: claude doesn't support it.")
+        );
+        assert!(room.settings.web_search && !room.settings.image_generation);
+
+        let mut room = both_on();
+        let note =
+            drop_unsupported_settings(&mut room, &model_capabilities(&config, "astra".to_string()));
+        assert_eq!(note, None, "a model that supports both keeps both");
+        assert!(room.settings.web_search && room.settings.image_generation);
+
+        assert_eq!(
+            with_settings_note("Model set.".to_string(), note),
+            "Model set."
+        );
     }
 
     #[test]
