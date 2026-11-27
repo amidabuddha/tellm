@@ -733,7 +733,10 @@ that key is configured again.
   file and applies just its own change to what is on disk, so edits made
   while tellm runs are kept; a file that no longer parses is left alone and
   the command fails. Comments are not kept, because the file is written back
-  from its parsed values.
+  from its parsed values. Every file tellm writes (config.toml, rooms.toml,
+  memory, credentials) is replaced atomically through a temp file and a
+  rename beside it; a path that is a symlink is followed to its target, so
+  a linked file stays linked.
   **Capability routing is explicit** (`wire_format` field per model) — never
   inferred from the spelling of user-chosen keys (parent-app lesson). The two
   ends of the reasoning scale follow the same rule: the optional per-model

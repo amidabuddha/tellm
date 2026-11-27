@@ -428,6 +428,7 @@ pub fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
 }
 
 fn write_atomic_with_mode(path: &Path, contents: &str, mode: Option<u32>) -> std::io::Result<()> {
+    let path = &write_target(path)?;
     let (tmp, mut file) = create_unique_temp(path, mode)?;
     let result = (|| {
         file.write_all(contents.as_bytes())?;
@@ -440,6 +441,17 @@ fn write_atomic_with_mode(path: &Path, contents: &str, mode: Option<u32>) -> std
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// The file a write to `path` replaces. A symlink (config kept in a dotfiles
+/// checkout, say) is followed to the file it points at: renaming over the
+/// link itself would turn it into a regular file and leave the real one
+/// stale. A link that points nowhere is an error rather than a new file.
+fn write_target(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(path),
+        _ => Ok(path.to_path_buf()),
+    }
 }
 
 fn publish_atomic_file(path: &Path, tmp: &Path) -> std::io::Result<()> {
@@ -1627,6 +1639,38 @@ mod tests {
             assert!(parsed.get("writer").is_some());
             assert!(candidates.iter().any(|candidate| candidate == &published));
             assert_no_atomic_temps(dir, "concurrent.toml");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_go_through_a_symlink_to_its_target() {
+        with_temp_config_dir(|dir| {
+            let dotfiles = dir.join("dotfiles");
+            std::fs::create_dir(&dotfiles).unwrap();
+            let real = dotfiles.join("config.toml");
+            std::fs::write(&real, "value = 0\n").unwrap();
+            let link = dir.join("config.toml");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+
+            write_atomic(&link, "value = 1\n").unwrap();
+            write_atomic_private(&link, "value = 2\n").unwrap();
+
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the link is kept"
+            );
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), "value = 2\n");
+            assert_no_atomic_temps(dir, "config.toml");
+            assert_no_atomic_temps(&dotfiles, "config.toml");
+
+            let dangling = dir.join("dangling.toml");
+            std::os::unix::fs::symlink(dir.join("missing.toml"), &dangling).unwrap();
+            assert!(write_atomic(&dangling, "value = 3\n").is_err());
+            assert!(!dir.join("missing.toml").exists());
         });
     }
 
