@@ -158,6 +158,12 @@ pub(crate) fn provider_error_reply(error: &TurnError) -> String {
         reply.push_str(
             "\nTip: send the picture as a photo rather than a file; Telegram delivers photos as JPEG",
         );
+    } else if message.contains("does not support documents") {
+        // Only the chat-completions endpoints refuse documents; the
+        // providers named here read PDFs natively (DESIGN.md § File upload).
+        reply.push_str(
+            "\nTip: this model can't read files; send a screenshot as a photo, or switch with /model to a Claude, OpenAI or Gemini model",
+        );
     } else if message.contains("image generation") || message.contains("image_generation") {
         reply.push_str("\nTip: /imagegen off");
     } else if message.contains("web search") || message.contains("web_search") {
@@ -534,6 +540,13 @@ mod tests {
         assert!(compat.contains("Tip: /websearch off"), "{compat}");
         let plain = reply_to("api error 500: boom");
         assert!(!plain.contains("Tip:"), "{plain}");
+    }
+
+    #[test]
+    fn provider_error_reply_offers_a_photo_or_another_model_for_documents() {
+        let reply = reply_to("chat completions compat does not support documents");
+        assert!(reply.contains("send a screenshot as a photo"), "{reply}");
+        assert!(reply.contains("/model"), "{reply}");
     }
 
     #[test]

@@ -348,7 +348,9 @@ Notes:
   Anthropic `document`/`image` blocks, OpenAI `input_file`/`input_image`,
   Gemini `document`/`image` content blocks.
   `.txt` is read as text. Providers that can't take a part get a clear
-  "unsupported" message, not silent degradation.
+  "unsupported" message, not silent degradation; for a PDF on a
+  chat-completions model, the reply suggests sending a screenshot as a photo
+  or switching to a model that reads PDFs.
   Telegram photos always arrive as JPEG, but an image sent as a file keeps
   whatever type the sender's client gave it. Anthropic and OpenAI take JPEG,
   PNG, GIF and WebP (checked 2026-11-27, platform.claude.com vision and
