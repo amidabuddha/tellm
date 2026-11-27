@@ -603,7 +603,15 @@ restart and local room-setting changes.
   terminal only (never sent over Telegram) and announced with the group
   title. `/pair CODE` typed in the room approves it. Constant-time compare,
   10-minute per-room rotation, per-chat 5-attempt / 5-minute lockout.
-  Approving one room never disables pairing for others. Unknown chats get
+  Because every chat has its own code and lockout, an attacker who opens
+  many chats would otherwise get guesses in proportion to them, and a match
+  makes the guesser an owner. So wrong codes also spend one process-wide
+  budget of 20: once it is spent, pairing is off in every chat — even the
+  right code is refused and no new codes are armed — until tellm restarts.
+  The console logs this once. Owners still add the bot to groups without a
+  code, so only pairing a new owner or a stranger's chat waits for the
+  restart. That bounds an attacker to 20 guesses (one in 50,000) per
+  process. Approving one room never disables pairing for others. Unknown chats get
   one hint containing the chat id, the /pair instruction, and the /allow
   alternative.
 - **Owner users**: completing a code pairing records the pairing

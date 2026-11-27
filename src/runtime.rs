@@ -12,7 +12,10 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::{sleep, timeout};
 
-use crate::access::{AccessConfig, AccessControl, AccessTime, ChatAccess, PairingAttempt};
+use crate::access::{
+    AccessConfig, AccessControl, AccessTime, ChatAccess, MAX_FAILED_PAIRINGS_PER_PROCESS,
+    PairingAttempt,
+};
 use crate::commands::{self, CommandAction, CommandContext, CommandReject, KnownCommand, Route};
 use crate::cost;
 use crate::memory::{self, ConversationMemory};
@@ -1778,8 +1781,19 @@ async fn handle_pair_attempt(
             )
             .await
         }
+        PairingAttempt::Disabled { just_disabled } => {
+            if just_disabled {
+                log::error!(
+                    target: "tellm::access",
+                    "pairing disabled after {MAX_FAILED_PAIRINGS_PER_PROCESS} wrong codes across all chats; last chat_id={chat_id} action=\"restart tellm to pair a new chat; owners can still add the bot to groups\""
+                );
+            }
+            send_command_reply(handles, chat_id, PAIRING_DISABLED_REPLY).await
+        }
     }
 }
+
+const PAIRING_DISABLED_REPLY: &str = "Pairing is turned off after too many wrong codes. The bot owner can restart tellm to turn it back on.";
 
 async fn persist_provisional_pair(
     chat_id: i64,

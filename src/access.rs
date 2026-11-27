@@ -7,6 +7,12 @@ pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const LOCKOUT_WINDOW: Duration = Duration::from_secs(5 * 60);
 pub const LOCKOUT_DURATION: Duration = Duration::from_secs(5 * 60);
 pub const MAX_PAIRING_ATTEMPTS: u8 = 5;
+/// Wrong pairing codes accepted across ALL chats in one process. Each chat
+/// has its own code and its own lockout, so without this cap an attacker's
+/// guesses would grow with the number of chats they can open. Past it,
+/// pairing stays off everywhere until tellm restarts; owners still add the
+/// bot to new groups without a code.
+pub const MAX_FAILED_PAIRINGS_PER_PROCESS: u32 = 20;
 pub const PRIVILEGED_COMMAND_STALE_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,8 +95,17 @@ pub enum ChatAccess {
 pub enum PairingAttempt {
     Paired,
     AlreadyAllowed,
-    Rejected { attempts_remaining: u8 },
-    LockedOut { until: AccessTime },
+    Rejected {
+        attempts_remaining: u8,
+    },
+    LockedOut {
+        until: AccessTime,
+    },
+    /// The process-wide cap on wrong codes is spent, so no code is checked.
+    /// `just_disabled` is true only for the attempt that spent it.
+    Disabled {
+        just_disabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +133,8 @@ pub struct AccessControl {
     owner_user_ids: BTreeSet<i64>,
     pending: BTreeMap<i64, PairingState>,
     attempts: BTreeMap<i64, AttemptState>,
+    /// Wrong codes across every chat since start; never reset.
+    failed_pairings: u32,
     hinted_unknown_chats: BTreeSet<i64>,
     code_generator: Box<dyn FnMut() -> String + Send>,
 }
@@ -136,6 +153,7 @@ impl AccessControl {
             owner_user_ids: config.owner_user_ids,
             pending: BTreeMap::new(),
             attempts: BTreeMap::new(),
+            failed_pairings: 0,
             hinted_unknown_chats: BTreeSet::new(),
             code_generator: Box::new(code_generator),
         }
@@ -155,7 +173,7 @@ impl AccessControl {
     /// for already-allowed chats. Codes rotate on expiry; `newly_issued`
     /// tells the runtime when to print the code to the console.
     pub fn arm_room(&mut self, chat_id: i64, now: AccessTime) -> Option<RoomPairing> {
-        if self.allowed_chat_ids.contains(&chat_id) {
+        if self.allowed_chat_ids.contains(&chat_id) || self.pairing_disabled() {
             return None;
         }
         let (code, newly_issued) = self.ensure_room_code(chat_id, now);
@@ -210,6 +228,14 @@ impl AccessControl {
     ) -> PairingAttempt {
         if self.allowed_chat_ids.contains(&chat_id) {
             return PairingAttempt::AlreadyAllowed;
+        }
+
+        // Checked before the code: once the cap is spent, even the right
+        // code must not pair, or the cap would bound nothing.
+        if self.pairing_disabled() {
+            return PairingAttempt::Disabled {
+                just_disabled: false,
+            };
         }
 
         if let Some(until) = self.locked_until(chat_id, now) {
@@ -293,7 +319,21 @@ impl AccessControl {
         }
     }
 
+    /// Whether the process-wide cap on wrong pairing codes is spent.
+    pub fn pairing_disabled(&self) -> bool {
+        self.failed_pairings >= MAX_FAILED_PAIRINGS_PER_PROCESS
+    }
+
     fn record_failed_attempt(&mut self, chat_id: i64, now: AccessTime) -> PairingAttempt {
+        self.failed_pairings = self.failed_pairings.saturating_add(1);
+        if self.pairing_disabled() {
+            // No code may match from here on, so drop the armed ones.
+            self.pending.clear();
+            return PairingAttempt::Disabled {
+                just_disabled: true,
+            };
+        }
+
         let attempt = self.attempts.entry(chat_id).or_insert(AttemptState {
             window_started_at: now,
             count: 0,
@@ -630,6 +670,62 @@ mod tests {
         assert_eq!(
             access.check_privileged(Some(7), 100, time(100)),
             PrivilegedAccess::Allowed
+        );
+    }
+
+    #[test]
+    fn wrong_codes_across_chats_spend_one_process_wide_budget() {
+        let mut access =
+            AccessControl::new_with_generator(AccessConfig::default(), || "123456".to_string());
+
+        // Each chat stops at its own 5-attempt lockout, so the attacker
+        // spreads guesses over many chats; the shared budget still runs out.
+        let mut now = 0;
+        let mut outcome = None;
+        'chats: for chat_id in 1..=100_i64 {
+            for _ in 0..MAX_PAIRING_ATTEMPTS {
+                now += 1;
+                let attempt = access.attempt_pair(chat_id, "000000", time(now));
+                if let PairingAttempt::Disabled { .. } = attempt {
+                    outcome = Some((chat_id, attempt));
+                    break 'chats;
+                }
+            }
+        }
+        assert_eq!(
+            outcome,
+            Some((
+                4,
+                PairingAttempt::Disabled {
+                    just_disabled: true
+                }
+            )),
+            "the 20th wrong code anywhere spends the budget"
+        );
+        assert!(access.pairing_disabled());
+
+        // The right code no longer pairs, in a used chat or a fresh one,
+        // and no new code is armed or printed.
+        assert_eq!(
+            access.attempt_pair(1, "123456", time(now + 1000)),
+            PairingAttempt::Disabled {
+                just_disabled: false
+            }
+        );
+        assert_eq!(access.arm_room(500, time(now + 1000)), None);
+        assert_eq!(
+            access.attempt_pair(500, "123456", time(now + 1000)),
+            PairingAttempt::Disabled {
+                just_disabled: false
+            }
+        );
+        assert!(!access.is_chat_allowed(500));
+
+        // Already-allowed chats and owners are untouched.
+        access.allow_chat(42);
+        assert_eq!(
+            access.attempt_pair(42, "000000", time(now + 1000)),
+            PairingAttempt::AlreadyAllowed
         );
     }
 
