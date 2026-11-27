@@ -874,8 +874,14 @@ async fn handle_command(
 ) -> Result<(), String> {
     match action {
         CommandAction::ResetHistory => {
-            let mut rooms = handles.rooms.lock().await;
-            rooms.get_or_default(chat_id).reset_history();
+            // Released before the send: every chat's worker needs this lock,
+            // and a slow Telegram call must not stall them all.
+            handles
+                .rooms
+                .lock()
+                .await
+                .get_or_default(chat_id)
+                .reset_history();
             handles
                 .telegram
                 .send_message(chat_id, "Started a new chat.")
@@ -3399,6 +3405,35 @@ mod tests {
         assert!(capabilities.web_search);
         assert!(!capabilities.image_generation);
         assert_eq!(capabilities.endpoint, "Meta Model API Responses");
+    }
+
+    #[tokio::test]
+    async fn new_chat_releases_the_rooms_lock_before_its_reply() {
+        let telegram = MockHttpServer::start_stalled();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = Arc::new(mock_handles(&telegram, &provider));
+        let command_handles = Arc::clone(&handles);
+        let command = tokio::spawn(async move {
+            handle_command(
+                42,
+                CommandAction::ResetHistory,
+                &command_handles,
+                &AtomicBool::new(false),
+            )
+            .await
+        });
+        // Wait until the reply is in flight to the stalled server.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while telegram.requests().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "reply never sent");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let rooms = tokio::time::timeout(Duration::from_millis(500), handles.rooms.lock())
+            .await
+            .expect("other chats can use the rooms while /new waits on Telegram");
+        drop(rooms);
+        command.abort();
     }
 
     /// Runtime handles for chat 42 with a keyless compat model, where both
