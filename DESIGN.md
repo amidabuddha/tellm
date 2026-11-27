@@ -617,7 +617,10 @@ notes the pin, and any stored `rooms.toml` model selection is ignored for that
 chat. Plain `/model KEY` is intentionally lighter-weight: it writes the room's
 selection to `rooms.toml` and leaves `telegram_chat_ids` empty. Use `/model pin
 KEY` only when a Telegram room should always be locked to that model across
-restart and local room-setting changes.
+restart and local room-setting changes. A stored selection whose model is no longer in
+config.toml (removed or renamed) is ignored the same way: the room uses
+`default_model`, and `/model` shows it as the default, until a model with
+that key is configured again.
 
 ## Access control (ported + hardened)
 

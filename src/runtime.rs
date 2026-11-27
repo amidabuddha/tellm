@@ -2488,10 +2488,19 @@ fn now_access_time() -> AccessTime {
     AccessTime::from_unix_seconds(seconds)
 }
 
+/// The room's model: its pin, else its own selection while that model is
+/// still configured, else the default. A selection whose model was removed
+/// from or renamed in config.toml falls back to the default rather than
+/// failing every message; it applies again if the model comes back.
 fn selected_model_key(config: &Config, room: &RoomState, chat_id: i64) -> String {
     pinned_model_key(config, chat_id)
         .map(str::to_string)
-        .or_else(|| room.settings.model_key.clone())
+        .or_else(|| {
+            room.settings
+                .model_key
+                .clone()
+                .filter(|key| config.models.contains_key(key))
+        })
         .unwrap_or_else(|| config.default_model.clone())
 }
 
@@ -3119,6 +3128,16 @@ mod tests {
         assert_eq!(pinned_model_key(&config, 42), Some("gpt"));
         assert_eq!(selected_model_key(&config, &room, 42), "gpt");
         assert_eq!(selected_model_key(&config, &room, 7), "claude");
+
+        let stale = RoomState::new(crate::rooms::RoomSettings {
+            model_key: Some("renamed-since".to_string()),
+            ..crate::rooms::RoomSettings::default()
+        });
+        assert_eq!(
+            selected_model_key(&config, &stale, 7),
+            "claude",
+            "a selection whose model is gone falls back to the default"
+        );
     }
 
     #[test]

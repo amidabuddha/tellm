@@ -15,6 +15,17 @@ pub struct CommandContext<'a> {
     pub capabilities: RoomCapabilities,
 }
 
+impl CommandContext<'_> {
+    /// The room's own model selection, ignored once its model is no longer
+    /// configured, as the runtime ignores it when it picks the model.
+    fn selected_model_key(&self) -> Option<String> {
+        self.settings
+            .model_key
+            .clone()
+            .filter(|key| self.model_keys.contains(key))
+    }
+}
+
 /// What the room's effective model can honor, statically known from its
 /// wire format plus provider endpoint checks. Toggling a capability ON in a
 /// room that can never honor it is refused at the toggle instead of arming
@@ -316,7 +327,7 @@ fn route_mode(args: &str, settings: &rooms::RoomSettings) -> CommandAction {
 
 fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
     let Some(value) = first_arg(args) else {
-        let selected = context.settings.model_key.clone();
+        let selected = context.selected_model_key();
         let pinned = context.pinned_model_key.map(str::to_string);
         return CommandAction::ShowModel {
             effective: pinned
@@ -587,7 +598,7 @@ fn route_model_pin(args: &str, context: &CommandContext<'_>) -> CommandAction {
         .nth(1)
         .map(str::to_string)
         .or_else(|| context.pinned_model_key.map(str::to_string))
-        .or_else(|| context.settings.model_key.clone())
+        .or_else(|| context.selected_model_key())
         .unwrap_or_else(|| context.default_model.to_string());
 
     if context.model_keys.contains(&key_arg) {
@@ -866,6 +877,42 @@ mod tests {
                 reason: CommandReject::UnknownMode {
                     value: "nope".to_string(),
                 },
+            })
+        );
+    }
+
+    #[test]
+    fn model_command_shows_the_default_when_the_selected_model_is_gone() {
+        let settings = rooms::RoomSettings {
+            model_key: Some("openai".to_string()),
+            ..rooms::RoomSettings::default()
+        };
+
+        assert_eq!(
+            route_command_with(
+                "/model",
+                settings.clone(),
+                None,
+                access::PrivilegedAccess::Allowed,
+                &["astra", "claude"],
+            ),
+            Route::Command(CommandAction::ShowModel {
+                selected: None,
+                effective: "claude".to_string(),
+                pinned: None,
+                available: vec!["astra".to_string(), "claude".to_string()],
+            })
+        );
+        assert_eq!(
+            route_command_with(
+                "/model pin",
+                settings,
+                None,
+                access::PrivilegedAccess::Allowed,
+                &["astra", "claude"],
+            ),
+            Route::Command(CommandAction::PinModel {
+                model_key: "claude".to_string(),
             })
         );
     }
