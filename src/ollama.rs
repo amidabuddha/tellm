@@ -333,19 +333,9 @@ fn loaded_models() -> &'static Mutex<BTreeSet<LoadedModel>> {
 }
 
 async fn tcp_connects(addr: String) -> Result<bool, String> {
-    spawn_blocking(move || {
-        let addrs = addr
-            .to_socket_addrs()
-            .map_err(|error| format!("invalid Ollama listen address {addr}: {error}"))?;
-        for socket_addr in addrs {
-            if TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT).is_ok() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    })
-    .await
-    .map_err(|error| format!("Ollama readiness check task failed: {error}"))?
+    spawn_blocking(move || Ok(try_connect_tcp(&addr)?.is_some()))
+        .await
+        .map_err(|error| format!("Ollama readiness check task failed: {error}"))?
 }
 
 async fn start_serve() -> Result<(), String> {
@@ -480,15 +470,19 @@ fn unload_model_blocking(addr: &str, model: &str) -> Result<UnloadOutcome, Strin
 }
 
 fn connect_tcp(addr: &str) -> Result<TcpStream, String> {
+    try_connect_tcp(addr)?
+        .ok_or_else(|| format!("could not connect to local Ollama endpoint {addr}"))
+}
+
+/// Tries every address `addr` resolves to. `None` means nothing answered;
+/// an error means `addr` is not a usable address at all.
+fn try_connect_tcp(addr: &str) -> Result<Option<TcpStream>, String> {
     let addrs = addr
         .to_socket_addrs()
         .map_err(|error| format!("invalid Ollama listen address {addr}: {error}"))?;
-    for socket_addr in addrs {
-        if let Ok(stream) = TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
-            return Ok(stream);
-        }
-    }
-    Err(format!("could not connect to local Ollama endpoint {addr}"))
+    Ok(addrs
+        .into_iter()
+        .find_map(|socket_addr| TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT).ok()))
 }
 
 fn unload_request(addr: &str, model: &str) -> String {
