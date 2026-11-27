@@ -161,7 +161,18 @@ enum TerminalCommand {
     Shutdown,
 }
 
-type TerminalSecretPrompts = Arc<StdMutex<Option<TerminalSecretPrompt>>>;
+type TerminalSecretPrompts = Arc<StdMutex<TerminalPromptSlot>>;
+
+/// The one terminal secret prompt that may be waiting, and whether the
+/// terminal can still answer it.
+#[derive(Default)]
+struct TerminalPromptSlot {
+    pending: Option<TerminalSecretPrompt>,
+    /// Set when the stdin reader stops: at end of input (tellm started
+    /// without a terminal, or Ctrl-D) or after `exit`. No prompt can be
+    /// answered from then on.
+    input_closed: bool,
+}
 
 #[derive(Clone)]
 struct TerminalSecretPrompt {
@@ -264,7 +275,7 @@ impl Runtime {
         print_group_privacy_hints(&group_chat_ids);
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(4);
-        let terminal_prompts = Arc::new(StdMutex::new(None));
+        let terminal_prompts = Arc::default();
 
         Ok(Self {
             telegram: Telegram::new(token),
@@ -2247,7 +2258,7 @@ fn spawn_terminal_controls(
                 ),
             }
         }
-        let _ = take_terminal_secret_prompt(&secret_prompts);
+        close_terminal_input(&secret_prompts);
     });
     receiver
 }
@@ -2269,15 +2280,18 @@ fn reserve_terminal_secret_prompt(
 ) -> Result<(mpsc::UnboundedReceiver<String>, TerminalPromptGuard), String> {
     let (line_tx, line_rx) = mpsc::unbounded_channel();
     {
-        let mut pending = secret_prompts
+        let mut slot = secret_prompts
             .lock()
             .map_err(|_| "terminal prompt lock poisoned".to_string())?;
-        if pending.is_some() {
+        if slot.input_closed {
+            return Err(TERMINAL_INPUT_CLOSED.to_string());
+        }
+        if slot.pending.is_some() {
             return Err(
                 "another terminal prompt is already waiting; complete it first".to_string(),
             );
         }
-        *pending = Some(TerminalSecretPrompt {
+        slot.pending = Some(TerminalSecretPrompt {
             secret_name: secret_name.clone(),
             line_tx,
         });
@@ -2292,27 +2306,36 @@ fn reserve_terminal_secret_prompt(
     ))
 }
 
+const TERMINAL_INPUT_CLOSED: &str =
+    "tellm's terminal input is closed, so no key can be entered there";
+
 fn current_terminal_secret_prompt(
     secret_prompts: &TerminalSecretPrompts,
 ) -> Option<TerminalSecretPrompt> {
-    secret_prompts.lock().ok()?.clone()
+    secret_prompts.lock().ok()?.pending.clone()
 }
 
-fn take_terminal_secret_prompt(
-    secret_prompts: &TerminalSecretPrompts,
-) -> Option<TerminalSecretPrompt> {
-    secret_prompts.lock().ok()?.take()
+/// Called when the stdin reader stops. Dropping a waiting prompt's sender
+/// ends that prompt; the flag fails every later one at once instead of
+/// leaving it to wait out its timeout for input that cannot come.
+fn close_terminal_input(secret_prompts: &TerminalSecretPrompts) {
+    let mut slot = secret_prompts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.input_closed = true;
+    slot.pending = None;
 }
 
 fn clear_terminal_secret_prompt(secret_prompts: &TerminalSecretPrompts, secret_name: &str) {
-    let Ok(mut pending) = secret_prompts.lock() else {
+    let Ok(mut slot) = secret_prompts.lock() else {
         return;
     };
-    if pending
+    if slot
+        .pending
         .as_ref()
         .is_some_and(|prompt| prompt.secret_name == secret_name)
     {
-        pending.take();
+        slot.pending = None;
     }
 }
 
@@ -2765,7 +2788,7 @@ mod tests {
             config: Arc::clone(&config),
             rooms: Arc::new(Mutex::new(RoomStates::default())),
             access: Arc::new(Mutex::new(AccessControl::new(AccessConfig::default()))),
-            terminal_prompts: Arc::new(StdMutex::new(None)),
+            terminal_prompts: Arc::default(),
             bot_username: None,
             shutdown_tx,
             persistence: persistence.clone(),
@@ -2845,7 +2868,7 @@ mod tests {
             config: Arc::clone(&config),
             rooms: Arc::new(Mutex::new(RoomStates::default())),
             access: Arc::new(Mutex::new(access)),
-            terminal_prompts: Arc::new(StdMutex::new(None)),
+            terminal_prompts: Arc::default(),
             bot_username: None,
             shutdown_tx,
             persistence: persistence.clone(),
@@ -2964,7 +2987,7 @@ mod tests {
             config: Arc::clone(&config),
             rooms: Arc::clone(&rooms),
             access: Arc::new(Mutex::new(access)),
-            terminal_prompts: Arc::new(StdMutex::new(None)),
+            terminal_prompts: Arc::default(),
             bot_username: None,
             shutdown_tx,
             persistence: persistence.clone(),
@@ -3213,6 +3236,32 @@ mod tests {
             store_prompted_secret("openai_api_key", "   ").unwrap(),
             PromptedSecret::Skipped
         ));
+    }
+
+    #[test]
+    fn terminal_prompts_fail_at_once_after_terminal_input_closes() {
+        let prompts: TerminalSecretPrompts = Arc::default();
+        let (mut waiting, _guard) =
+            reserve_terminal_secret_prompt(&prompts, "first_key".to_string()).unwrap();
+
+        close_terminal_input(&prompts);
+
+        assert!(
+            matches!(
+                waiting.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "a prompt that was waiting ends with the input"
+        );
+        let error = reserve_terminal_secret_prompt(&prompts, "second_key".to_string())
+            .err()
+            .expect("no new prompt once input is closed");
+        assert_eq!(error, TERMINAL_INPUT_CLOSED);
+        let reply = model_key_prompt_failed_reply("claude", "anthropic_api_key", &error);
+        assert!(
+            reply.contains("tellm secret set anthropic_api_key"),
+            "{reply}"
+        );
     }
 
     #[test]
@@ -3521,7 +3570,7 @@ mod tests {
             config: Arc::new(Mutex::new(config)),
             rooms: Arc::new(Mutex::new(RoomStates::default())),
             access: Arc::new(Mutex::new(access)),
-            terminal_prompts: Arc::new(StdMutex::new(None)),
+            terminal_prompts: Arc::default(),
             bot_username: None,
             shutdown_tx,
             persistence,

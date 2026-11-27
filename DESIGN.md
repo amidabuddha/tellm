@@ -575,7 +575,9 @@ calls a billing API and never fetches prices.
   only then performs Ollama unload/child cleanup. Draining provider turns could
   block exit for minutes, while unloading before their futures are gone can
   immediately reload a model. Closing stdin merely disables terminal controls;
-  it does not stop a daemonized runtime. Only the tellm-started Ollama child
+  it does not stop a daemonized runtime. It also ends any terminal key
+  prompt, and from then on `/model add` replies at once that no key can be
+  entered there and to run `tellm secret set NAME` instead. Only the tellm-started Ollama child
   gets automatic graceful cleanup (see § Configuration).
 
 ### Telegram commands (v1)
