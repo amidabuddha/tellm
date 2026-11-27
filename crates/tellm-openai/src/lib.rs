@@ -24,6 +24,9 @@
 //!   Meta Model API supports image understanding, not image generation.
 //!   Results come back as base64 in `image_generation_call` output items.
 //! - Files/images: `input_file` / `input_image` content parts.
+//! - `status: "incomplete"`: a partial answer gets a closing note, one
+//!   without text is an error, and `content_filter` is a refusal (checked
+//!   2026-11-27, see `incomplete_note`).
 //! - Context window: OpenAI's `error.code` `context_length_exceeded` becomes
 //!   `ProviderError::ContextWindowExceeded`; xAI and Meta document no code
 //!   for it (checked 2026-11-19, see [`CONTEXT_LENGTH_EXCEEDED`]).
@@ -44,8 +47,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tellm_core::{
-    ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
-    Usage, usage_count,
+    CUT_OFF_NOTE, ChatRequest, ChatResponse, ContentPart, GeneratedImage, OUTPUT_LIMIT_BEFORE_TEXT,
+    Provider, ProviderError, ThinkingLevel, Usage, usage_count,
 };
 
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -167,8 +170,11 @@ impl Provider for Responses {
             return Err(ProviderError::Refusal(refusal));
         }
 
-        let text = extract_text(&output);
+        let mut text = extract_text(&output);
         let images = extract_images(&output);
+        if let Some(note) = incomplete_note(&response_body, &text, &images)? {
+            text.push_str(note);
+        }
         let usage = usage_from_response(&response_body, &output);
         let mut turn_items = Vec::with_capacity(1 + output.len());
         turn_items.push(user_message);
@@ -181,6 +187,55 @@ impl Provider for Responses {
             usage,
         })
     }
+}
+
+/// Appended to a reply that stopped early for a reason other than the
+/// output limit. Like [`CUT_OFF_NOTE`], only the user sees it.
+pub const INCOMPLETE_NOTE: &str = "\n\n(Reply cut off before it finished.)";
+/// Refusal text for a reply the provider's content filter stopped.
+pub const CONTENT_FILTER_REFUSAL: &str = "the provider's content filter stopped the reply";
+
+/// The closing note for a reply with `status: "incomplete"`, or the error
+/// that replaces it.
+///
+/// Checked 2026-11-27 against developers.openai.com (reasoning guide;
+/// Responses reference): a reply that runs out of tokens has `status:
+/// "incomplete"` and `incomplete_details.reason: "max_output_tokens"`, which
+/// also covers reaching the context window, and its output can be partial or
+/// hold nothing but reasoning. The SDKs also name the reason
+/// `content_filter`. Without text or an image the turn is an error rather
+/// than an empty answer; a filtered reply is a refusal.
+fn incomplete_note(
+    body: &Value,
+    text: &str,
+    images: &[GeneratedImage],
+) -> Result<Option<&'static str>, ProviderError> {
+    if body.get("status").and_then(Value::as_str) != Some("incomplete") {
+        return Ok(None);
+    }
+    let reason = body
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if reason == "content_filter" {
+        return Err(ProviderError::Refusal(CONTENT_FILTER_REFUSAL.to_string()));
+    }
+    let output_limit = reason == "max_output_tokens";
+    if text.trim().is_empty() && images.is_empty() {
+        return Err(ProviderError::Api {
+            status: 200,
+            message: if output_limit {
+                OUTPUT_LIMIT_BEFORE_TEXT.to_string()
+            } else {
+                format!("the reply stopped before any answer text (incomplete: {reason})")
+            },
+        });
+    }
+    Ok(Some(if output_limit {
+        CUT_OFF_NOTE
+    } else {
+        INCOMPLETE_NOTE
+    }))
 }
 
 /// xAI's `cost_in_usd_ticks` unit: 10^10 ticks per US dollar (checked

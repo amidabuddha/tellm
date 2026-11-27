@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tellm_compat::Compat;
-use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
+use tellm_core::{
+    CUT_OFF_NOTE, ChatRequest, ContentPart, OUTPUT_LIMIT_BEFORE_TEXT, Provider, ProviderError,
+    ThinkingLevel,
+};
 use tellm_test_support::{MockHttpServer as MockCompat, MockResponse};
 use tokio::time::timeout;
 
@@ -222,6 +225,40 @@ async fn refusal_field_returns_refusal_error() {
 
     assert!(
         matches!(error, ProviderError::Refusal(message) if message == "I can't help with that.")
+    );
+}
+
+#[tokio::test]
+async fn length_finish_marks_the_reply_as_cut_off() {
+    let message = json!({ "role": "assistant", "content": "The first half" });
+    let mock = MockCompat::start(vec![MockResponse::json(
+        200,
+        json!({ "choices": [{ "message": message, "finish_reason": "length" }] }),
+    )]);
+
+    let response = client(&mock).chat(&request()).await.unwrap();
+
+    assert_eq!(response.text, format!("The first half{CUT_OFF_NOTE}"));
+    assert_eq!(response.turn_items[1], message);
+}
+
+#[tokio::test]
+async fn length_finish_before_any_text_is_an_error() {
+    let mock = MockCompat::start(vec![MockResponse::json(
+        200,
+        json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "", "reasoning": "Thinking..." },
+                "finish_reason": "length"
+            }]
+        }),
+    )]);
+
+    let error = client(&mock).chat(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::Api { status: 200, message } if message == OUTPUT_LIMIT_BEFORE_TEXT),
+        "{error:?}"
     );
 }
 

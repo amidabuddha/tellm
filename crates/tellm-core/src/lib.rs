@@ -217,6 +217,15 @@ pub trait Provider {
     ) -> impl Future<Output = Result<ChatResponse, ProviderError>> + Send;
 }
 
+/// Appended to the text of a reply that stopped at the provider's output
+/// limit, so a cut-off answer is not mistaken for a finished one. Only the
+/// user sees it: the stored `turn_items` keep the model's own content.
+pub const CUT_OFF_NOTE: &str = "\n\n(Reply cut off: it reached the output limit.)";
+/// Error message for a reply that reached the provider's output limit before
+/// any text. Storing such a turn would keep a question nobody saw answered.
+pub const OUTPUT_LIMIT_BEFORE_TEXT: &str =
+    "the reply reached the provider's output limit before any answer text";
+
 /// Reads a non-negative integer token count from a provider usage object.
 /// Missing, negative, or non-integer values count as zero, so a provider that
 /// omits a field never fails the reply it belongs to.

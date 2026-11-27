@@ -1,8 +1,11 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tellm_core::{ChatRequest, ContentPart, Provider, ProviderError, ThinkingLevel};
-use tellm_openai::Responses;
+use tellm_core::{
+    CUT_OFF_NOTE, ChatRequest, ContentPart, OUTPUT_LIMIT_BEFORE_TEXT, Provider, ProviderError,
+    ThinkingLevel,
+};
+use tellm_openai::{CONTENT_FILTER_REFUSAL, INCOMPLETE_NOTE, Responses};
 use tellm_test_support::{MockHttpServer as MockOpenAi, MockResponse};
 use tokio::time::timeout;
 
@@ -444,6 +447,87 @@ async fn refusal_content_returns_refusal_error() {
 
     assert!(
         matches!(error, ProviderError::Refusal(message) if message == "I can't help with that.")
+    );
+}
+
+fn incomplete(reason: &str, output: Value) -> MockResponse {
+    MockResponse::json(
+        200,
+        json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": reason },
+            "output": output
+        }),
+    )
+}
+
+fn partial_message() -> Value {
+    json!([
+        { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc" },
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "incomplete",
+            "content": [{ "type": "output_text", "text": "The first half" }]
+        }
+    ])
+}
+
+#[tokio::test]
+async fn incomplete_reply_at_the_output_limit_is_marked_as_cut_off() {
+    let mock = MockOpenAi::start(vec![incomplete("max_output_tokens", partial_message())]);
+    let mut req = request();
+    req.image_generation = false;
+
+    let response = client(&mock).chat(&req).await.unwrap();
+
+    assert_eq!(response.text, format!("The first half{CUT_OFF_NOTE}"));
+    assert_eq!(
+        response.turn_items[1..],
+        partial_message().as_array().unwrap()[..],
+        "stored history keeps the provider's own items"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_reply_with_only_reasoning_is_an_error() {
+    let mock = MockOpenAi::start(vec![incomplete(
+        "max_output_tokens",
+        json!([{ "type": "reasoning", "id": "rs_1", "summary": [] }]),
+    )]);
+    let mut req = request();
+    req.image_generation = false;
+
+    let error = client(&mock).chat(&req).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::Api { status: 200, message } if message == OUTPUT_LIMIT_BEFORE_TEXT),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_reply_for_another_reason_gets_a_general_note() {
+    let mock = MockOpenAi::start(vec![incomplete("something_new", partial_message())]);
+    let mut req = request();
+    req.image_generation = false;
+
+    let response = client(&mock).chat(&req).await.unwrap();
+
+    assert_eq!(response.text, format!("The first half{INCOMPLETE_NOTE}"));
+}
+
+#[tokio::test]
+async fn incomplete_reply_stopped_by_the_content_filter_is_a_refusal() {
+    let mock = MockOpenAi::start(vec![incomplete("content_filter", partial_message())]);
+    let mut req = request();
+    req.image_generation = false;
+
+    let error = client(&mock).chat(&req).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ProviderError::Refusal(message) if message == CONTENT_FILTER_REFUSAL),
+        "{error:?}"
     );
 }
 

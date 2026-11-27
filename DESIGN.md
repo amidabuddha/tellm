@@ -221,6 +221,15 @@ Notes:
   so, while the stored turn keeps the model's own content. A reply cut off
   before any text is a provider error, and the error reply suggests
   `/reasoning low` or a higher `max_output_tokens`.
+- The same rule holds on the other wire formats (checked 2026-11-27
+  against developers.openai.com, reasoning guide and API reference). A
+  Responses reply with `status: incomplete` and `incomplete_details.reason:
+  max_output_tokens` (which also covers a full context window) gets the
+  cut-off note, another reason gets a general one, and `content_filter` is
+  a refusal. A chat-completions reply with `finish_reason: length` gets the
+  cut-off note. Either one without text is a provider error whose reply
+  suggests `/reasoning low` or `/new summary`; `max_output_tokens` is named
+  only for Anthropic, the one wire format that takes it.
 - Handle Anthropic `stop_reason: model_context_window_exceeded` (checked
   2026-11-27 against platform.claude.com, handling stop reasons): the reply
   stopped because the chat filled the context window. A cut-off answer gets

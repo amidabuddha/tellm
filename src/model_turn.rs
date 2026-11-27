@@ -158,10 +158,13 @@ pub(crate) fn provider_error_reply(error: &TurnError) -> String {
         reply.push_str("\nTip: /imagegen off");
     } else if message.contains("web search") || message.contains("web_search") {
         reply.push_str("\nTip: /websearch off");
-    } else if message.contains("output limit") {
+    } else if message.contains("max_tokens output limit") {
+        // Anthropic: the only wire format that takes max_output_tokens.
         reply.push_str(
             "\nTip: /reasoning low, or raise max_output_tokens for this model in config.toml",
         );
+    } else if message.contains("output limit") {
+        reply.push_str("\nTip: /reasoning low, or /new summary if this chat is long");
     }
     reply
 }
@@ -565,6 +568,22 @@ mod tests {
 
         assert!(reply.contains("Tip: /reasoning low"), "{reply}");
         assert!(reply.contains("max_output_tokens"), "{reply}");
+    }
+
+    #[test]
+    fn output_limit_tip_names_max_output_tokens_only_for_anthropic() {
+        let error = TurnError::from(tellm_core::ProviderError::Api {
+            status: 200,
+            message: tellm_core::OUTPUT_LIMIT_BEFORE_TEXT.to_string(),
+        });
+
+        let reply = provider_error_reply(&error);
+
+        assert!(reply.contains("Tip: /reasoning low"), "{reply}");
+        assert!(
+            !reply.contains("max_output_tokens"),
+            "only the anthropic wire format accepts that setting: {reply}"
+        );
     }
 
     #[test]

@@ -27,14 +27,17 @@
 //!   the amount charged in credits, which are US dollars; it is trusted only
 //!   from openrouter.ai, because the field has no shared meaning in the
 //!   dialect.
+//! - `finish_reason: "length"`: a partial answer gets a closing note and one
+//!   without text is an error; `content_filter` is a refusal (checked
+//!   2026-11-27 against developers.openai.com, chat completions reference).
 
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tellm_core::{
-    ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError, ThinkingLevel,
-    Usage, usage_count,
+    CUT_OFF_NOTE, ChatRequest, ChatResponse, ContentPart, GeneratedImage, OUTPUT_LIMIT_BEFORE_TEXT,
+    Provider, ProviderError, ThinkingLevel, Usage, usage_count,
 };
 
 pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -133,7 +136,20 @@ impl Provider for Compat {
             ));
         }
 
-        let text = extract_text(&message);
+        let mut text = extract_text(&message);
+        // Checked 2026-11-27 against developers.openai.com (chat completions
+        // reference): `finish_reason: "length"` means the token limit was
+        // reached. tellm sends no limit, so it is the server's own or the
+        // context window (Ollama's `num_ctx`). Reasoning may have used it all.
+        if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+            if text.trim().is_empty() {
+                return Err(ProviderError::Api {
+                    status: 200,
+                    message: OUTPUT_LIMIT_BEFORE_TEXT.to_string(),
+                });
+            }
+            text.push_str(CUT_OFF_NOTE);
+        }
         let usage = usage_from_response(
             &response_body,
             is_openrouter_url(&self.chat_completions_url),

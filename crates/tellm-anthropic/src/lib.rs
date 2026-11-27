@@ -80,11 +80,10 @@ pub const MAX_TOKENS_PER_REQUEST_TIMEOUT: u32 = 21_333;
 /// config names another tier. Valid on every adaptive-thinking model.
 pub const DEFAULT_MAX_EFFORT: &str = "max";
 pub const MAX_PAUSE_TURN_CONTINUATIONS: usize = 5;
-/// Appended to the text of a reply that stopped at `max_tokens`, so a cut-off
-/// answer is not mistaken for a finished one. Only the user sees it: the
-/// stored `turn_items` keep the model's own content.
-pub const CUT_OFF_NOTE: &str = "\n\n(Reply cut off: it reached the output limit.)";
+pub use tellm_core::CUT_OFF_NOTE;
 /// Error message for a reply that stopped at `max_tokens` before any text.
+/// It names `max_tokens` because only Anthropic models take the
+/// `max_output_tokens` setting the runtime's tip points at.
 pub const OUTPUT_LIMIT_BEFORE_TEXT: &str =
     "the reply reached the max_tokens output limit before any answer text";
 /// Appended to a reply that stopped because the chat filled the model's
