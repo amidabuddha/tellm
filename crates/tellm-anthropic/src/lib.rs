@@ -337,6 +337,7 @@ pub fn usage_from_response(body: &Value) -> Option<Usage> {
         reasoning_tokens: 0,
         web_searches: usage_count(usage, "/server_tool_use/web_search_requests"),
         reported_cost_usd: None,
+        context_tokens: None,
     })
 }
 

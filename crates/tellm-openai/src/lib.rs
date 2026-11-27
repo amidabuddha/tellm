@@ -215,6 +215,7 @@ pub fn usage_from_response(body: &Value, output: &[Value]) -> Option<Usage> {
         reasoning_tokens: usage_count(usage, "/output_tokens_details/reasoning_tokens"),
         web_searches,
         reported_cost_usd,
+        context_tokens: None,
     })
 }
 

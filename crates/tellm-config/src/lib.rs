@@ -1518,6 +1518,7 @@ mod tests {
             reasoning_tokens: 400_000,
             web_searches: 3,
             reported_cost_usd: None,
+            context_tokens: None,
         };
         let full = ModelPrice {
             input: 8.0,

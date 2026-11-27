@@ -184,6 +184,7 @@ pub fn usage_from_response(body: &Value, trust_reported_cost: bool) -> Option<Us
         reasoning_tokens: usage_count(usage, "/completion_tokens_details/reasoning_tokens"),
         web_searches: 0,
         reported_cost_usd,
+        context_tokens: None,
     })
 }
 

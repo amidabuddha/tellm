@@ -125,6 +125,12 @@ pub struct Usage {
     /// The cost the provider says it charged for the reply, in US dollars,
     /// when the provider reports one (xAI, OpenRouter).
     pub reported_cost_usd: Option<f64>,
+    /// Tokens the conversation holds after this reply, when that is not its
+    /// input plus output: a reply that took several requests is billed for
+    /// all of them, but each request resent everything before it, so only
+    /// the last one measures the conversation. `None` means input plus
+    /// output; [`Usage::add`] sets it. Read it through [`Usage::context_size`].
+    pub context_tokens: Option<u64>,
 }
 
 impl Usage {
@@ -147,6 +153,14 @@ impl Usage {
             (Some(left), Some(right)) => Some(left + right),
             _ => None,
         };
+        // `other` came later and resent everything before it.
+        self.context_tokens = Some(other.context_size());
+    }
+
+    /// The conversation's size after this reply, in tokens.
+    pub fn context_size(&self) -> u64 {
+        self.context_tokens
+            .unwrap_or_else(|| self.total_input_tokens().saturating_add(self.output_tokens))
     }
 
     /// Every input token the reply was billed for, in any bucket.
@@ -170,7 +184,8 @@ pub struct ChatResponse {
     /// the opaque state (encrypted search results, reasoning items) the
     /// provider requires on later turns — do not filter or reshape it.
     pub turn_items: Vec<serde_json::Value>,
-    /// What the reply was billed for, summed over every request it took.
+    /// What the reply was billed for, summed over every request it took;
+    /// [`Usage::context_size`] gives the conversation's size after it.
     /// `None` when the provider sent no usage block.
     pub usage: Option<Usage>,
 }
@@ -226,6 +241,7 @@ mod tests {
             reasoning_tokens: 3,
             web_searches: 1,
             reported_cost_usd: Some(0.5),
+            context_tokens: None,
         };
         total.add(&Usage {
             input_tokens: 4,
@@ -235,6 +251,7 @@ mod tests {
             reasoning_tokens: 2,
             web_searches: 2,
             reported_cost_usd: Some(0.25),
+            context_tokens: None,
         });
         assert_eq!(total.input_tokens, 14);
         assert_eq!(total.cached_input_tokens, 7);
@@ -247,6 +264,26 @@ mod tests {
 
         total.add(&Usage::default());
         assert_eq!(total.reported_cost_usd, None);
+    }
+
+    #[test]
+    fn context_size_is_the_last_requests_input_and_output() {
+        let mut usage = Usage {
+            input_tokens: 10,
+            cached_input_tokens: 100,
+            output_tokens: 5,
+            ..Usage::default()
+        };
+        assert_eq!(usage.context_size(), 115, "one request: input plus output");
+
+        usage.add(&Usage {
+            input_tokens: 20,
+            cached_input_tokens: 110,
+            output_tokens: 7,
+            ..Usage::default()
+        });
+        assert_eq!(usage.total_input_tokens(), 240, "billing sums both");
+        assert_eq!(usage.context_size(), 137, "size comes from the later one");
     }
 
     #[test]

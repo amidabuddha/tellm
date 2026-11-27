@@ -352,7 +352,9 @@ calls a billing API and never fetches prices.
   Disjoint buckets matter because the shapes differ: OpenAI-style APIs count
   cache reads and writes inside their input total, while Anthropic reports
   them beside it. Each wire-format crate converts its own shape; a reply made
-  of several requests (Anthropic `pause_turn`) sums them. `usage` is `None`
+  of several requests (Anthropic `pause_turn`) sums them for cost, and
+  records the last request's input plus output as the conversation's size,
+  since each request resent everything before it. `usage` is `None`
   when the provider sent no usage block, and missing fields count as zero.
 - Field mappings (checked 2026-11-18):
   - Anthropic Messages: `input_tokens` is input outside the cache;
@@ -487,7 +489,8 @@ calls a billing API and never fetches prices.
 - Budget: after each committed chat-mode reply the room records the
   conversation's size, that reply's input tokens in every bucket (ordinary,
   cache reads, cache writes) plus its output tokens, as the provider
-  reported them. Unknown usage records no size, and message mode records
+  reported them; for a reply that took several requests, the last one's.
+  Unknown usage records no size, and message mode records
   none. When the size reaches `CONTEXT_SUMMARY_TOKENS` (150,000), or the
   history passes the 4 MiB cap, tellm sends a short notice and runs the
   summary right after delivering that reply, while the provider's cache

@@ -210,6 +210,7 @@ pub fn usage_from_response(body: &Value) -> Option<Usage> {
         reasoning_tokens: thought_tokens,
         web_searches,
         reported_cost_usd: None,
+        context_tokens: None,
     })
 }
 

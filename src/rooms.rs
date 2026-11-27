@@ -203,11 +203,7 @@ impl RoomState {
     /// conversation, so it has no size to record.
     pub fn record_context(&mut self, usage: Option<&Usage>) {
         self.context_tokens = match self.settings.mode {
-            ChatMode::Chat => usage.map(|usage| {
-                usage
-                    .total_input_tokens()
-                    .saturating_add(usage.output_tokens)
-            }),
+            ChatMode::Chat => usage.map(Usage::context_size),
             ChatMode::Message => None,
         };
     }

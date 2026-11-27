@@ -318,6 +318,7 @@ mod tests {
             reasoning_tokens: 0,
             web_searches: searches,
             reported_cost_usd: None,
+            context_tokens: None,
         }
     }
 

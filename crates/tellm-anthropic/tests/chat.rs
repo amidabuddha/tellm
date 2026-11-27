@@ -674,6 +674,12 @@ async fn usage_keeps_cache_buckets_apart_and_sums_pause_turn_requests() {
     assert_eq!(usage.output_tokens, 493);
     assert_eq!(usage.web_searches, 2);
     assert_eq!(usage.reported_cost_usd, None);
+    assert_eq!(
+        usage.context_size(),
+        30 + 188086 + 100,
+        "the conversation's size is the last request's, which resent the first; \
+         the billed sum would count the cached prompt twice"
+    );
 }
 
 #[tokio::test]
