@@ -47,6 +47,20 @@ tellm
 Replace an installed binary this way rather than copying over it: macOS can
 kill a binary that was rewritten in place.
 
+On macOS, the release binaries are not signed with an Apple developer
+certificate or notarized by Apple. If you downloaded the archive with a web
+browser, macOS may refuse to start tellm, saying it can't verify the
+developer. Clear the download mark once:
+
+```sh
+xattr -d com.apple.quarantine "$HOME/.local/bin/tellm"
+```
+
+or allow it under System Settings → Privacy & Security → Open Anyway. For
+the same reason, after each upgrade macOS asks once for your login password
+for each key tellm stored in the keychain; choose Always Allow and it stays
+quiet until the next upgrade.
+
 On first run, a wizard asks for a Telegram bot token and one provider API key,
 then prints a pairing code. Send `/pair CODE` to your bot and you're done.
 
@@ -61,6 +75,20 @@ git clone https://github.com/amidabuddha/tellm.git
 cd tellm
 cargo build --locked --release   # binary: target/release/tellm
 ```
+
+On macOS, each new build makes the keychain ask again for every stored key.
+To keep an Always Allow across rebuilds, sign each build with your own Apple
+Development certificate, which any Apple Account can create free in Xcode →
+Settings → Accounts → Manage Certificates → + → Apple Development:
+
+```sh
+codesign --force --sign "Apple Development" --identifier tellm target/release/tellm
+```
+
+If `codesign` finds no valid identity although Xcode lists the certificate,
+add Apple's
+[WWDR G3 intermediate certificate](https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer)
+to your login keychain.
 
 The checks CI runs before every merge:
 
@@ -260,7 +288,11 @@ second paid request.
   BotFather (`/setprivacy`) and add the bot to the group again.
 - **Keychain prompts at startup:** tellm reads each configured key once at
   startup, so the prompts come before your first message rather than in the
-  middle of a chat.
+  middle of a chat. On macOS they return after each upgrade or rebuild,
+  because the new binary has a new signature; see
+  [Install](#install) and [Build from source](#build-from-source).
+- **macOS says it can't verify the developer:** the release binaries aren't
+  notarized; clear the download mark as shown under [Install](#install).
 - **Logs:** each update is logged with its chat id and route, never with the
   message content.
 

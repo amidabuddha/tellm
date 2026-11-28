@@ -887,6 +887,16 @@ are written. Network fallback chains get a small mocked-Telegram harness.
   Linux GNU x86_64/arm64, Windows x86_64) plus SHA-256 checksums. rustls keeps
   provider transport free of OpenSSL linkage; the GNU Linux builds retain their
   normal glibc runtime dependency and are not described as fully static.
+- The macOS binaries carry no Developer ID signature and are not notarized:
+  the Apple Silicon one has only the linker's ad-hoc signature and the Intel
+  one is unsigned. macOS therefore blocks a browser-downloaded copy until the
+  user clears its quarantine mark or allows it in System Settings, and the
+  keychain asks once per stored secret after each upgrade, because a binary
+  without a Team ID is identified by its cdhash. Signing and notarizing
+  would need a paid Apple Developer Program membership and the certificate
+  in the release workflow's secrets. Local builds can avoid the keychain
+  prompts with a free Apple Development certificate (README § Build from
+  source).
 - Brew tap once there's traction. A sample Dockerfile may exist but is never
   the headline (binary-first, not anti-Docker).
 
