@@ -100,12 +100,22 @@ async fn get_updates_posts_long_poll_payload_and_parses_messages() {
                 "old_chat_member": { "status": "left" },
                 "new_chat_member": { "status": "member" }
             }
+        },
+        {
+            "update_id": 14,
+            "callback_query": {
+                "id": "q7",
+                "from": { "id": 7, "is_bot": false, "first_name": "Owner" },
+                "message": { "message_id": 3, "chat": { "id": -900, "type": "group" }, "date": 0 },
+                "chat_instance": "c",
+                "data": "/model claude"
+            }
         }
     ]))]);
 
     let updates = client(&mock).get_updates(99, 5).await.unwrap();
 
-    assert_eq!(updates.len(), 3);
+    assert_eq!(updates.len(), 4);
     assert_eq!(updates[0].update_id, 11);
     assert_eq!(updates[0].message.as_ref().unwrap().chat.id, 42);
     assert_eq!(updates[0].message.as_ref().unwrap().message_id, 5);
@@ -124,6 +134,12 @@ async fn get_updates_posts_long_poll_payload_and_parses_messages() {
     assert_eq!(membership.chat.id, -900);
     assert_eq!(membership.chat.label(), "'Grok Chat' (-900)");
     assert_eq!(membership.new_chat_member.status, "member");
+    assert!(!membership.old_chat_member.is_present());
+    assert!(membership.new_chat_member.is_present());
+    let press = updates[3].callback_query.as_ref().unwrap();
+    assert_eq!(press.data.as_deref(), Some("/model claude"));
+    let pressed = press.message.as_ref().unwrap();
+    assert_eq!((pressed.chat.id, pressed.message_id), (-900, 3));
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 1);
@@ -134,7 +150,7 @@ async fn get_updates_posts_long_poll_payload_and_parses_messages() {
         json!({
             "offset": 99,
             "timeout": 5,
-            "allowed_updates": ["message", "my_chat_member"]
+            "allowed_updates": ["message", "my_chat_member", "callback_query"]
         })
     );
 }
@@ -317,19 +333,22 @@ async fn send_chat_action_posts_typing() {
 }
 
 #[tokio::test]
-async fn model_picker_sends_full_commands_in_a_compact_reply_keyboard() {
+async fn model_picker_sends_a_button_per_model_with_the_current_one_checked() {
     let mock = MockTelegram::start(vec![MockResponse::json_ok(json!({ "message_id": 7 }))]);
     let models = vec![
         "claude".to_string(),
         "gemini".to_string(),
         "openai".to_string(),
+        "x".repeat(60),
     ];
 
     client(&mock)
-        .send_model_picker(42, "Choose a model:", &models)
+        .send_model_picker(42, "Choose a model:", &models, Some("gemini"))
         .await
         .unwrap();
 
+    let button =
+        |text: &str, key: &str| json!({ "text": text, "callback_data": format!("/model {key}") });
     let requests = mock.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].path, format!("/bot{TOKEN}/sendMessage"));
@@ -339,15 +358,42 @@ async fn model_picker_sends_full_commands_in_a_compact_reply_keyboard() {
             "chat_id": 42,
             "text": "Choose a model:",
             "reply_markup": {
-                "keyboard": [
-                    ["/model claude", "/model gemini"],
-                    ["/model openai"]
-                ],
-                "resize_keyboard": true,
-                "one_time_keyboard": true
+                "inline_keyboard": [
+                    [button("claude", "claude"), button("✓ gemini", "gemini")],
+                    [button("openai", "openai")]
+                ]
             }
-        })
+        }),
+        "a key too long for a button's data is left out"
     );
+}
+
+#[tokio::test]
+async fn a_button_press_is_answered_with_a_short_text() {
+    let mock = MockTelegram::start(vec![
+        MockResponse::json_ok(json!(true)),
+        MockResponse::json_ok(json!(true)),
+    ]);
+
+    client(&mock)
+        .answer_button("q1", None, false)
+        .await
+        .unwrap();
+    client(&mock)
+        .answer_button("q2", Some(&"a".repeat(250)), true)
+        .await
+        .unwrap();
+
+    let requests = mock.requests();
+    assert_eq!(requests[0].path, format!("/bot{TOKEN}/answerCallbackQuery"));
+    assert_eq!(
+        requests[0].json_body(),
+        json!({ "callback_query_id": "q1" })
+    );
+    let body = requests[1].json_body();
+    assert_eq!(body["show_alert"], json!(true));
+    assert_eq!(body["text"].as_str().unwrap().chars().count(), 200);
+    assert!(body["text"].as_str().unwrap().ends_with('…'));
 }
 
 #[tokio::test]
@@ -355,7 +401,7 @@ async fn empty_model_picker_is_rejected_without_an_http_request() {
     let mock = MockTelegram::start(Vec::new());
 
     let error = client(&mock)
-        .send_model_picker(42, "Choose a model:", &[])
+        .send_model_picker(42, "Choose a model:", &[], None)
         .await
         .unwrap_err();
 
@@ -372,7 +418,7 @@ async fn rejected_model_keyboard_falls_back_to_text_commands() {
     let models = vec!["claude".to_string(), "openai".to_string()];
 
     client(&mock)
-        .send_model_picker(42, "Choose a model:", &models)
+        .send_model_picker(42, "Choose a model:", &models, None)
         .await
         .unwrap();
 

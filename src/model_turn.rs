@@ -804,6 +804,7 @@ mod tests {
             media_group_id: None,
             album: Vec::new(),
             split_parts: 0,
+            button_press: None,
             reply_to_message: None,
             new_chat_members: Vec::new(),
         };
@@ -1092,6 +1093,7 @@ mod tests {
             media_group_id: Some("album".to_string()),
             album: Vec::new(),
             split_parts: 0,
+            button_press: None,
             reply_to_message: None,
             new_chat_members: Vec::new(),
         }

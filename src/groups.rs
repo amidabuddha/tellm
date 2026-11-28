@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use tellm_config::Config;
-use tellm_telegram::{IncomingMessage, User};
+use tellm_telegram::{Button, IncomingMessage, User};
 
 /// Who besides the bot can read a chat, as far as tellm is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,11 +206,30 @@ pub fn status_reply(kind: ChatKind, changed: bool) -> String {
     }
 }
 
-/// Added to the room-setup reply when a new group is approved: every group
-/// starts shared.
-pub const NEW_GROUP_NOTE: &str = "This group is shared: I answer only messages that @mention me \
-    or reply to me, each on its own, and only the bot's owners can use commands. If it's just \
-    you, send /group private.";
+/// Asked when a group is approved, with [`group_buttons`] under it: every
+/// group starts shared until an owner chooses.
+pub const GROUP_QUESTION: &str = "Who will use this group?\n\n\
+- Just me: I answer every message here as one conversation.\n\
+- Others too: I answer only messages that @mention me or reply to me, each on its own, and only \
+the bot's owners can use commands.\n\n\
+Until an owner chooses, it's shared.";
+
+/// "Just me" and "Others too", standing for `/group private` and `/group
+/// shared`, the group's current choice checked.
+pub fn group_buttons(kind: ChatKind) -> Vec<Vec<Button>> {
+    let button = |label: &str, command: &str, current: bool| Button {
+        label: if current {
+            format!("✓ {label}")
+        } else {
+            label.to_string()
+        },
+        data: command.to_string(),
+    };
+    vec![vec![
+        button("Just me", "/group private", kind == ChatKind::PrivateGroup),
+        button("Others too", "/group shared", kind == ChatKind::SharedGroup),
+    ]]
+}
 
 #[cfg(test)]
 mod tests {
@@ -251,6 +270,7 @@ mod tests {
             new_chat_members: Vec::new(),
             album: Vec::new(),
             split_parts: 0,
+            button_press: None,
         }
     }
 

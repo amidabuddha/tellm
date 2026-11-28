@@ -267,7 +267,10 @@ Save facts once and every new conversation starts with them:
 
 To give each model its own group, turn off privacy mode once in BotFather
 (`/setprivacy`), then add the bot to each group from your owner account. Groups
-you add are approved automatically and show a model picker.
+you add are approved automatically and show a model picker, then ask who will
+use the group: tap **Just me** for a private room, or **Others too**. If someone
+else adds the bot to a group and nobody approves it within 10 minutes, the bot
+leaves.
 
 - `/model KEY` switches the chat's model.
 - `/model pin KEY` locks it until `/model unpin`.
@@ -281,8 +284,8 @@ stored. Each answer quotes the question it answers, and a reply to the bot
 includes the message it replies to, so follow-ups still make sense. The cost
 line is off there unless you send `/cost on`. Only owners can use commands
 there, except `/help` and `/id`. If a
-group is just you, send `/group private` to make it a normal room; it then
-answers every message as one conversation. If someone who isn't an owner
+group is just you, tap **Just me** or send `/group private` to make it a
+normal room; it then answers every message as one conversation. If someone who isn't an owner
 joins a private group, tellm says so in the group, and `/group shared` makes
 it shared again.
 

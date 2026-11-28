@@ -47,6 +47,18 @@ pub enum TelegramError {
     EmptyModelPicker,
 }
 
+/// The most bytes a button's callback data may have. Checked 2026-11-28
+/// against core.telegram.org/bots/api#inlinekeyboardbutton.
+pub const MAX_BUTTON_DATA: usize = 64;
+
+/// A button under a message. Pressing it sends `data` back to the bot in a
+/// callback query; tellm's buttons carry the command they stand for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Button {
+    pub label: String,
+    pub data: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Update {
     pub update_id: i64,
@@ -56,6 +68,27 @@ pub struct Update {
     /// how tellm notices being added to a group — checked 2026-07-05 against
     /// core.telegram.org/bots/api#chatmemberupdated.
     pub my_chat_member: Option<ChatMemberUpdated>,
+    /// Someone pressed a button under one of the bot's messages.
+    pub callback_query: Option<CallbackQuery>,
+}
+
+/// A button press. Checked 2026-11-28 against
+/// core.telegram.org/bots/api#callbackquery: `message` is present for the
+/// bot's own messages under the default `callback_query_mode`, and an
+/// inaccessible (too old or deleted) message still carries its chat and id.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub from: User,
+    pub message: Option<CallbackMessage>,
+    pub data: Option<String>,
+}
+
+/// The message whose button was pressed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallbackMessage {
+    pub message_id: i64,
+    pub chat: Chat,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +164,12 @@ pub struct IncomingMessage {
     /// text arrived as one message.
     #[serde(skip)]
     pub split_parts: usize,
+    /// Not from Telegram: set when tellm queued a button press as a message
+    /// carrying the button's command, to the callback query's id, which the
+    /// press must be answered with. `message_id` is then the id of the
+    /// message the button is under.
+    #[serde(skip)]
+    pub button_press: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -297,7 +336,7 @@ impl Telegram {
             &json!({
                 "offset": offset,
                 "timeout": timeout_s,
-                "allowed_updates": ["message", "my_chat_member"],
+                "allowed_updates": ["message", "my_chat_member", "callback_query"],
             }),
             Duration::from_secs(u64::from(timeout_s)) + TELEGRAM_LONG_POLL_GRACE,
         )
@@ -351,56 +390,106 @@ impl Telegram {
         Ok(())
     }
 
-    /// Send a compact Telegram reply keyboard whose buttons submit complete
-    /// `/model KEY` commands. This deliberately uses a separate plain
-    /// `sendMessage` request so normal rich-message delivery keeps its current
-    /// fallback semantics.
-    pub async fn send_model_picker(
+    /// Send text with rows of buttons under it, as a plain `sendMessage` so
+    /// normal rich-message delivery keeps its fallback semantics. If the
+    /// buttons are refused, the text goes out with each button's command on
+    /// its own line instead.
+    pub async fn send_buttons(
         &self,
-        chat_id: i64,
+        target: impl Into<Target>,
         text: &str,
-        model_keys: &[String],
+        rows: &[Vec<Button>],
     ) -> Result<(), TelegramError> {
-        if model_keys.is_empty() {
-            return Err(TelegramError::EmptyModelPicker);
-        }
-
-        let keyboard = model_keys
-            .chunks(2)
-            .map(|row| {
-                row.iter()
-                    .map(|key| format!("/model {key}"))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        // Checked 2026-07-10 against core.telegram.org/bots/api#sendmessage,
-        // #replykeyboardmarkup, and #keyboardbutton.
-        let picker = self
+        let target = target.into();
+        // Checked 2026-11-28 against core.telegram.org/bots/api#sendmessage,
+        // #inlinekeyboardmarkup and #inlinekeyboardbutton.
+        let sent = self
             .post_json::<Value>(
                 "sendMessage",
-                &json!({
-                    "chat_id": chat_id,
+                &target.payload(json!({
                     "text": text,
-                    "reply_markup": {
-                        "keyboard": keyboard,
-                        "resize_keyboard": true,
-                        "one_time_keyboard": true,
-                    },
-                }),
+                    "reply_markup": inline_keyboard(rows),
+                })),
             )
             .await;
-        match picker {
+        match sent {
             Ok(_) => Ok(()),
             Err(error) => {
                 log::warn!(
                     target: "tellm::telegram",
-                    "model picker failed; sending text fallback error=\"{error}\""
+                    "buttons failed; sending text fallback error=\"{error}\""
                 );
-                self.send_message(chat_id, &model_picker_fallback_text(text, model_keys))
+                self.send_message(target, &buttons_fallback_text(text, rows))
                     .await
             }
         }
+    }
+
+    /// Send a model picker: a button per model, two to a row, each standing
+    /// for `/model KEY`, with the room's current model checked. A key too
+    /// long for a button's data is left out.
+    pub async fn send_model_picker(
+        &self,
+        target: impl Into<Target>,
+        text: &str,
+        model_keys: &[String],
+        current: Option<&str>,
+    ) -> Result<(), TelegramError> {
+        let rows = model_picker_rows(model_keys, current);
+        if rows.is_empty() {
+            return Err(TelegramError::EmptyModelPicker);
+        }
+        self.send_buttons(target, text, &rows).await
+    }
+
+    /// Replace the buttons under one of the bot's messages; no rows removes
+    /// them. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#editmessagereplymarkup.
+    pub async fn edit_buttons(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        rows: &[Vec<Button>],
+    ) -> Result<(), TelegramError> {
+        self.post_json::<Value>(
+            "editMessageReplyMarkup",
+            &json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": inline_keyboard(rows),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Answer a button press, which stops its loading indicator. `text`
+    /// shows briefly at the top of the chat, or in a dialog with `alert`;
+    /// only the person who pressed sees it. Telegram allows 200 characters,
+    /// so a longer text is cut. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#answercallbackquery.
+    pub async fn answer_button(
+        &self,
+        query_id: &str,
+        text: Option<&str>,
+        alert: bool,
+    ) -> Result<(), TelegramError> {
+        let mut payload = json!({ "callback_query_id": query_id });
+        if let Some(text) = text {
+            payload["text"] = json!(cut_to_chars(text, 200));
+            payload["show_alert"] = json!(alert);
+        }
+        self.post_json::<Value>("answerCallbackQuery", &payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Leave a group. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#leavechat.
+    pub async fn leave_chat(&self, chat_id: i64) -> Result<(), TelegramError> {
+        self.post_json::<Value>("leaveChat", &json!({ "chat_id": chat_id }))
+            .await?;
+        Ok(())
     }
 
     pub async fn send_chat_action(&self, chat_id: i64) -> Result<(), TelegramError> {
@@ -635,13 +724,53 @@ impl Telegram {
     }
 }
 
-fn model_picker_fallback_text(text: &str, model_keys: &[String]) -> String {
-    let commands = model_keys
+fn inline_keyboard(rows: &[Vec<Button>]) -> Value {
+    let rows = rows
         .iter()
-        .map(|key| format!("- /model {key}"))
+        .map(|row| {
+            row.iter()
+                .map(|button| json!({ "text": button.label, "callback_data": button.data }))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    json!({ "inline_keyboard": rows })
+}
+
+fn buttons_fallback_text(text: &str, rows: &[Vec<Button>]) -> String {
+    let commands = rows
+        .iter()
+        .flatten()
+        .map(|button| format!("- {}", button.data))
         .collect::<Vec<_>>()
         .join("\n");
     format!("{text}\n\n{commands}")
+}
+
+/// The model picker's buttons, two to a row, the current model checked.
+pub fn model_picker_rows(model_keys: &[String], current: Option<&str>) -> Vec<Vec<Button>> {
+    let buttons = model_keys
+        .iter()
+        .map(|key| Button {
+            label: if current == Some(key.as_str()) {
+                format!("✓ {key}")
+            } else {
+                key.clone()
+            },
+            data: format!("/model {key}"),
+        })
+        .filter(|button| button.data.len() <= MAX_BUTTON_DATA)
+        .collect::<Vec<_>>();
+    buttons.chunks(2).map(<[Button]>::to_vec).collect()
+}
+
+/// The first `max` characters of `text`, ending in "…" when cut.
+fn cut_to_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 #[derive(Debug, Deserialize)]

@@ -623,10 +623,26 @@ calls a billing API and never fetches prices.
   joined text as, for example, `input=text(5100,2 parts)`.
 - Edited-message updates are deliberately ignored so correcting a Telegram
   message cannot silently trigger a second billed model call.
+- Buttons: each button's callback data is the command it stands for, such
+  as `/model claude` (at most 64 bytes; checked 2026-11-28 against
+  core.telegram.org/bots/api#inlinekeyboardbutton), and `getUpdates` asks
+  for `callback_query` updates. A press in an approved chat is queued for
+  the chat's worker as a message with that command from the presser, so it
+  runs in order and under the same rules as the typed command (a shared
+  group's owner-only commands, owner gates, pins). It is answered in the
+  press itself where it can: a refusal shows only to the presser, as a
+  dialog, and "already" as a brief note. A choice that changes something
+  removes the message's buttons, which would be stale, and replies as the
+  command does. A press in a chat that isn't approved, or under a message
+  Telegram no longer names, gets "This button no longer works." The model
+  picker has a button per model, two to a row, the current model checked;
+  a key too long for the callback data is left out.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with
   chunking at 32000/3900 chars. Fallback triggers ported from the Python
-  implementation's error-marker list. Model selection uses a one-time Telegram
-  reply keyboard with a text-command fallback. Generated images preserve their
+  implementation's error-marker list. Choices (the model picker, a group's
+  private or shared marking) are buttons under the message (see Buttons
+  below), with a text-command fallback if Telegram refuses them. Generated
+  images preserve their
   provider MIME type when uploaded. Telegram transport and API errors strip
   token-bearing request URLs and redact any echoed bot token before the error can
   reach logs or operator-facing output.
@@ -697,7 +713,11 @@ that key is configured again.
   an unknown chat — a message, or the bot being added to a group (heard via
   `my_chat_member`) — arms a 6-digit code for THAT room, printed to the
   terminal only (never sent over Telegram) and announced with the group
-  title. `/pair CODE` typed in the room approves it. Constant-time compare,
+  title. `/pair CODE` typed in the room approves it. A group the bot was
+  added to that isn't approved within one code lifetime (10 minutes) is
+  left with `leaveChat` (checked 2026-11-28 against
+  core.telegram.org/bots/api#leavechat), so it never stays in a group
+  nobody claimed. Constant-time compare,
   10-minute per-room rotation, per-chat 5-attempt / 5-minute lockout.
   Because every chat has its own code and lockout, an attacker who opens
   many chats would otherwise get guesses in proportion to them, and a match
@@ -732,7 +752,8 @@ that key is configured again.
   impossible. Caveat: Telegram anonymous-admin mode hides `from` — owners must
   post non-anonymously (or use a private chat) for privileged commands.
 - After approval the room replies with its current model and the /model /
-  /model pin next steps plus a one-time model reply keyboard. While privacy
+  /model pin next steps, with the model picker's buttons under it; a shared
+  group is then asked who will use it (§ Shared groups). While privacy
   mode is on (getMe's `can_read_all_group_messages` is false; checked
   2026-11-28 against core.telegram.org/bots/api#user), a group's setup
   message and the console say so: unless the bot is an admin there, it gets
@@ -782,9 +803,12 @@ itself.
   groups. `/group` shows whether the chat is shared or private (anyone);
   `/group private` and `/group shared` are owner-gated like `/allow` and
   persist the config. Direct chats (positive chat ids) are always private.
-  A group's room setup message says it starts shared and how to mark it
-  private. The room's conversation is kept when the marking changes: a shared
-  group neither reads nor writes it.
+  When a group is approved, after the model picker it is asked "Who will use
+  this group?" with two buttons, "Just me" (`/group private`) and "Others
+  too" (`/group shared`); until an owner chooses, it is shared. `/group` in
+  a group shows the same buttons, the current choice checked. The room's
+  conversation is kept when the marking changes: a shared group neither
+  reads nor writes it.
 - Addressed messages only: a message goes to the model only when its text or
   any caption mentions the bot (`@username` as a whole word, ignoring ASCII
   case, as Telegram compares usernames; checked 2026-11-28 against

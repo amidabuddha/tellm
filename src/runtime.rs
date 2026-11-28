@@ -14,7 +14,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::access::{
     AccessConfig, AccessControl, AccessTime, ChatAccess, MAX_FAILED_PAIRINGS_PER_PROCESS,
-    PairingAttempt,
+    PAIRING_CODE_TTL, PairingAttempt,
 };
 use crate::commands::{self, CommandAction, CommandContext, CommandReject, KnownCommand, Route};
 use crate::cost;
@@ -177,6 +177,7 @@ impl Drop for QueueFullNoticeGuard {
 enum UpdateKind {
     Message,
     EditedMessage,
+    ButtonPress,
 }
 
 impl UpdateKind {
@@ -184,6 +185,7 @@ impl UpdateKind {
         match self {
             Self::Message => "message",
             Self::EditedMessage => "edited_message",
+            Self::ButtonPress => "callback_query",
         }
     }
 }
@@ -431,6 +433,8 @@ impl Runtime {
                                 offset = offset.max(update.update_id + 1);
                                 if let Some(membership) = update.my_chat_member.take() {
                                     handle_membership_change(membership, &handles).await;
+                                } else if let Some(press) = update.callback_query.take() {
+                                    handle_button_press(press, &handles, &mut dispatchers).await;
                                 } else if let Some(message) = dispatchable_message(&mut update) {
                                     self.handle_update(message, &handles, &mut dispatchers).await;
                                 } else if let Some(message) = update.edited_message {
@@ -641,15 +645,43 @@ async fn handle_membership_change(
         Some(pairing) => {
             log::info!(
                 target: "tellm::access",
-                "added to chat chat={label:?} pairing_code={} action=\"send /pair {} in that chat, or /allow {chat_id} from an owner\"",
+                "added to chat chat={label:?} pairing_code={} action=\"send /pair {} in that chat, or /allow {chat_id} from an owner, within {} minutes, or the bot leaves\"",
                 pairing.code,
                 pairing.code,
+                PAIRING_CODE_TTL.as_secs() / 60,
             );
             warn_privacy_mode(chat_id, handles);
+            if chat_id < 0 {
+                tokio::spawn(leave_unless_approved(
+                    chat_id,
+                    handles.clone(),
+                    PAIRING_CODE_TTL,
+                ));
+            }
         }
         None => log::info!(
             target: "tellm::access",
             "added to already-allowed chat chat={label:?}"
+        ),
+    }
+}
+
+/// Someone who isn't an owner added the bot to a group. Unless the group is
+/// approved within `wait`, one pairing code's lifetime, the bot leaves
+/// rather than stay in a group nobody claimed.
+async fn leave_unless_approved(chat_id: i64, handles: RuntimeHandles, wait: Duration) {
+    sleep(wait).await;
+    if chat_is_allowed(chat_id, &handles).await {
+        return;
+    }
+    match handles.telegram.leave_chat(chat_id).await {
+        Ok(()) => log::info!(
+            target: "tellm::access",
+            "left a group nobody approved chat_id={chat_id}"
+        ),
+        Err(error) => log::warn!(
+            target: "tellm::access",
+            "leaving a group nobody approved failed chat_id={chat_id} error=\"{error}\""
         ),
     }
 }
@@ -1122,6 +1154,9 @@ async fn handle_allowed_message(
     handles: &RuntimeHandles,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
+    if let Some(query_id) = message.button_press.clone() {
+        return handle_button(chat_id, message, &query_id, handles, cancelled).await;
+    }
     if let Some(text) = model_turn::message_text(&message) {
         match route_command(
             chat_id,
@@ -1189,6 +1224,106 @@ async fn announce_newcomers(
     if worker_can_reply(chat_id, handles, cancelled).await {
         send_best_effort(handles, chat_id, &groups::join_notice(&names)).await;
     }
+}
+
+/// A button press, queued as a message carrying the button's command. It
+/// runs as if its presser had typed the command, but answers in the press
+/// itself where it can: a refusal or "already" shows only to the presser,
+/// and a choice that changes something removes the buttons, which would be
+/// stale, and replies as the command does.
+async fn handle_button(
+    chat_id: i64,
+    message: IncomingMessage,
+    query_id: &str,
+    handles: &RuntimeHandles,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let route = match message.text.as_deref() {
+        Some(command) => {
+            let presser = message.from.as_ref().map(|user| user.id);
+            route_command(chat_id, command, message.date, presser, handles).await?
+        }
+        None => Route::Ignore,
+    };
+    log_update_route(&message, UpdateKind::ButtonPress, UpdateRoute::Command);
+    let (answer, alert) = match route {
+        Route::Command(
+            action @ (CommandAction::SetModel { .. } | CommandAction::SetGroupPrivate { .. }),
+        ) => {
+            let _ = handles.telegram.answer_button(query_id, None, false).await;
+            if let Err(error) = handles
+                .telegram
+                .edit_buttons(chat_id, message.message_id, &[])
+                .await
+            {
+                log::debug!(
+                    target: "tellm::telegram",
+                    "removing pressed buttons failed chat_id={chat_id} error=\"{error}\""
+                );
+            }
+            return handle_command(chat_id, action, handles, cancelled).await;
+        }
+        Route::Command(CommandAction::ModelUnchanged { model_key }) => {
+            (format!("Already using {model_key}."), false)
+        }
+        Route::Command(CommandAction::Reject { reason }) => (button_reject_text(reason), true),
+        _ => ("This button no longer works.".to_string(), false),
+    };
+    handles
+        .telegram
+        .answer_button(query_id, Some(&answer), alert)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn button_reject_text(reason: CommandReject) -> String {
+    match reason {
+        CommandReject::SharedGroupOwnerOnly
+        | CommandReject::OwnerNotAllowed
+        | CommandReject::OwnerStale => "Only the bot's owner can use these buttons.".to_string(),
+        reason => format_reject(reason),
+    }
+}
+
+/// Queues a button press for its chat's worker, so it runs in order with
+/// the chat's messages. A press in a chat that isn't approved, or under a
+/// message Telegram no longer names, is answered right away.
+async fn handle_button_press(
+    press: tellm_telegram::CallbackQuery,
+    handles: &RuntimeHandles,
+    dispatchers: &mut BTreeMap<i64, ChatDispatcher>,
+) {
+    let allowed = match &press.message {
+        Some(pressed) => chat_is_allowed(pressed.chat.id, handles).await,
+        None => false,
+    };
+    let Some(pressed) = press.message.filter(|_| allowed) else {
+        let telegram = handles.telegram.clone();
+        tokio::spawn(async move {
+            let _ = telegram
+                .answer_button(&press.id, Some("This button no longer works."), false)
+                .await;
+        });
+        return;
+    };
+    let chat_id = pressed.chat.id;
+    let message = IncomingMessage {
+        message_id: pressed.message_id,
+        chat: pressed.chat,
+        from: Some(press.from),
+        date: unix_now(),
+        text: press.data,
+        caption: None,
+        photo: None,
+        document: None,
+        media_group_id: None,
+        reply_to_message: None,
+        new_chat_members: Vec::new(),
+        album: Vec::new(),
+        split_parts: 0,
+        button_press: Some(press.id),
+    };
+    send_to_chat_worker(chat_id, message, handles, dispatchers);
 }
 
 async fn route_command(
@@ -1313,11 +1448,12 @@ async fn handle_command(
             available,
         } => {
             let show_picker = pinned.is_none();
+            let current = effective.clone();
             let reply = format_model_status(selected, effective, pinned, available.clone());
             if show_picker {
                 handles
                     .telegram
-                    .send_model_picker(chat_id, &reply, &available)
+                    .send_model_picker(chat_id, &reply, &available, Some(&current))
                     .await
                     .map_err(|error| error.to_string())
             } else {
@@ -1634,7 +1770,15 @@ async fn handle_command(
                 .map_err(|error| error.to_string())
         }
         CommandAction::ShowGroup { kind } => {
-            send_command_reply(handles, chat_id, &groups::status_reply(kind, false)).await
+            let reply = groups::status_reply(kind, false);
+            if kind == ChatKind::Direct {
+                return send_command_reply(handles, chat_id, &reply).await;
+            }
+            handles
+                .telegram
+                .send_buttons(chat_id, &reply, &groups::group_buttons(kind))
+                .await
+                .map_err(|error| error.to_string())
         }
         CommandAction::SetGroupPrivate { private } => {
             // The room's conversation is kept either way: a shared group never
@@ -2702,6 +2846,10 @@ fn model_key_prompt_failed_reply(model_key: &str, secret_name: &str, error: &str
 struct RoomSetupReply {
     text: String,
     model_keys: Option<Vec<String>>,
+    /// The room's model, checked in the picker.
+    model_key: String,
+    /// A shared group is asked who will use it.
+    ask_group: bool,
 }
 
 /// The in-room setup prompt after a room is approved (via /pair or /allow):
@@ -2724,10 +2872,7 @@ async fn room_setup_reply(
         )
     };
     let mut setup = build_room_setup_reply(&model_key, pinned.as_deref(), available, became_owner);
-    if kind == ChatKind::SharedGroup {
-        setup.text.push_str("\n\n");
-        setup.text.push_str(groups::NEW_GROUP_NOTE);
-    }
+    setup.ask_group = kind == ChatKind::SharedGroup;
     if chat_id < 0 && handles.privacy_mode == Some(true) {
         setup.text.push_str("\n\n");
         setup.text.push_str(PRIVACY_MODE_NOTE);
@@ -2760,6 +2905,8 @@ fn build_room_setup_reply(
     RoomSetupReply {
         text: reply,
         model_keys: pinned.is_none().then_some(available),
+        model_key: model_key.to_string(),
+        ask_group: false,
     }
 }
 
@@ -2774,11 +2921,23 @@ async fn send_room_setup(
     match setup.model_keys {
         Some(model_keys) => handles
             .telegram
-            .send_model_picker(chat_id, &setup.text, &model_keys)
+            .send_model_picker(chat_id, &setup.text, &model_keys, Some(&setup.model_key))
             .await
-            .map_err(|error| error.to_string()),
-        None => send_command_reply(handles, chat_id, &setup.text).await,
+            .map_err(|error| error.to_string())?,
+        None => send_command_reply(handles, chat_id, &setup.text).await?,
     }
+    if setup.ask_group {
+        handles
+            .telegram
+            .send_buttons(
+                chat_id,
+                groups::GROUP_QUESTION,
+                &groups::group_buttons(ChatKind::SharedGroup),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 async fn send_command_reply(
@@ -3137,6 +3296,14 @@ fn format_log_duration(duration: Duration) -> String {
         return format!("{}s", millis / 1_000);
     }
     format!("{}.{:03}s", millis / 1_000, millis % 1_000)
+}
+
+fn unix_now() -> i64 {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    i64::try_from(seconds).unwrap_or(i64::MAX)
 }
 
 fn now_access_time() -> AccessTime {
@@ -3804,6 +3971,7 @@ mod tests {
             media_group_id: None,
             album: Vec::new(),
             split_parts: 0,
+            button_press: None,
             reply_to_message: None,
             new_chat_members: Vec::new(),
         };
@@ -3812,6 +3980,7 @@ mod tests {
             message: None,
             edited_message: Some(edited),
             my_chat_member: None,
+            callback_query: None,
         };
 
         assert!(dispatchable_message(&mut update).is_none());
@@ -4711,15 +4880,15 @@ mod tests {
         .unwrap()
     }
 
-    async fn wait_for_sent(telegram: &MockHttpServer) -> Vec<String> {
+    async fn wait_for_sent(telegram: &MockHttpServer, count: usize) -> Vec<String> {
         for _ in 0..200 {
             let sent = sent_requests(telegram);
-            if !sent.is_empty() {
+            if sent.len() >= count {
                 return sent;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        Vec::new()
+        sent_requests(telegram)
     }
 
     /// Every message-sending request, by method name.
@@ -4774,39 +4943,157 @@ mod tests {
         );
 
         handle_membership_change(membership(7, "left", "member"), &handles).await;
-        assert_eq!(wait_for_sent(&telegram).await, ["sendMessage"]);
+        assert_eq!(
+            wait_for_sent(&telegram, 2).await,
+            ["sendMessage", "sendMessage"]
+        );
         assert!(chat_is_allowed(GROUP, &handles).await);
-        let welcome = telegram.requests()[0].json_body()["text"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(welcome.contains(groups::NEW_GROUP_NOTE), "{welcome}");
+        assert_eq!(
+            telegram.requests()[1].json_body()["text"],
+            serde_json::json!(groups::GROUP_QUESTION),
+            "added back, the group starts shared and is asked again"
+        );
     }
 
     #[tokio::test]
-    async fn a_new_group_is_told_it_starts_shared() {
+    async fn a_new_group_gets_a_model_picker_and_is_asked_who_uses_it() {
         let telegram = telegram_mock();
         let provider = MockHttpServer::start(Vec::new());
         let shared = group_handles(&telegram, &provider, false).await;
-        assert!(
-            room_setup_reply(GROUP, false, &shared)
-                .await
-                .text
-                .ends_with(groups::NEW_GROUP_NOTE)
+        let setup = room_setup_reply(GROUP, false, &shared).await;
+        send_room_setup(GROUP, setup, &shared).await.unwrap();
+
+        let requests = telegram.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].json_body()["reply_markup"]["inline_keyboard"][0][0],
+            serde_json::json!({ "text": "✓ local", "callback_data": "/model local" })
         );
+        assert_eq!(
+            requests[1].json_body(),
+            serde_json::json!({
+                "chat_id": GROUP,
+                "text": groups::GROUP_QUESTION,
+                "reply_markup": { "inline_keyboard": [[
+                    { "text": "Just me", "callback_data": "/group private" },
+                    { "text": "✓ Others too", "callback_data": "/group shared" }
+                ]] }
+            })
+        );
+
         let private = group_handles(&telegram, &provider, true).await;
+        assert!(!room_setup_reply(GROUP, false, &private).await.ask_group);
         assert!(
-            !room_setup_reply(GROUP, false, &private)
-                .await
-                .text
-                .contains("shared")
-        );
-        assert!(
-            !room_setup_reply(42, false, &private)
-                .await
-                .text
-                .contains("shared"),
+            !room_setup_reply(42, false, &private).await.ask_group,
             "a direct chat isn't a group"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_a_stranger_added_is_left_unless_approved_in_time() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = group_handles(&telegram, &provider, false).await;
+
+        leave_unless_approved(GROUP, handles.clone(), Duration::ZERO).await;
+        assert!(telegram.requests().is_empty(), "an approved group is kept");
+
+        handles.access.lock().await.deny_chat(GROUP);
+        leave_unless_approved(GROUP, handles.clone(), Duration::ZERO).await;
+        assert_eq!(
+            request_bodies(&telegram, "leaveChat"),
+            [serde_json::json!({ "chat_id": GROUP })]
+        );
+    }
+
+    /// A press of a button under message 30, as the worker gets it.
+    fn button_press(from: i64, command: &str) -> IncomingMessage {
+        let mut press = group_message(from, command);
+        press.message_id = 30;
+        press.button_press = Some(format!("query-{from}"));
+        press
+    }
+
+    fn request_bodies(telegram: &MockHttpServer, method: &str) -> Vec<serde_json::Value> {
+        telegram
+            .requests()
+            .iter()
+            .filter(|request| request.path.ends_with(&format!("/{method}")))
+            .map(|request| request.json_body())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_button_runs_its_command_as_its_presser_and_answers_in_the_press() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = group_handles(&telegram, &provider, false).await;
+        let cancelled = AtomicBool::new(false);
+
+        handle_allowed_message(
+            GROUP,
+            button_press(8, "/group private"),
+            &handles,
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        assert!(
+            handles
+                .config
+                .lock()
+                .await
+                .telegram
+                .private_group_ids
+                .is_empty()
+        );
+        assert_eq!(
+            request_bodies(&telegram, "answerCallbackQuery"),
+            [serde_json::json!({
+                "callback_query_id": "query-8",
+                "text": "Only the bot's owner can use these buttons.",
+                "show_alert": true
+            })],
+            "a member who isn't an owner gets a dialog, and the chat gets nothing"
+        );
+        assert!(sent_texts(&telegram).is_empty());
+
+        handle_allowed_message(GROUP, button_press(7, "/model local"), &handles, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_bodies(&telegram, "answerCallbackQuery")[1]["text"],
+            serde_json::json!("Already using local.")
+        );
+
+        handle_allowed_message(
+            GROUP,
+            button_press(7, "/group private"),
+            &handles,
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            handles.config.lock().await.telegram.private_group_ids,
+            vec![GROUP]
+        );
+        assert_eq!(
+            request_bodies(&telegram, "answerCallbackQuery")[2],
+            serde_json::json!({ "callback_query_id": "query-7" })
+        );
+        assert_eq!(
+            request_bodies(&telegram, "editMessageReplyMarkup"),
+            [serde_json::json!({
+                "chat_id": GROUP,
+                "message_id": 30,
+                "reply_markup": { "inline_keyboard": [] }
+            })],
+            "the chosen buttons go away"
+        );
+        assert_eq!(
+            sent_texts(&telegram),
+            [groups::status_reply(ChatKind::PrivateGroup, true)]
         );
     }
 
@@ -5385,6 +5672,7 @@ mod tests {
             media_group_id: None,
             album: Vec::new(),
             split_parts: 0,
+            button_press: None,
             reply_to_message: None,
             new_chat_members: Vec::new(),
         }
