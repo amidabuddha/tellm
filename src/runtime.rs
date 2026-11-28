@@ -97,6 +97,18 @@ struct RuntimeHandles {
 type MenuCache = Arc<StdMutex<BTreeMap<CommandScope, Vec<(String, String)>>>>;
 
 impl RuntimeHandles {
+    /// The handles to answer `message` with: for a message in a forum topic,
+    /// everything sent to its chat goes to that topic.
+    fn for_message(&self, message: &IncomingMessage) -> Self {
+        let mut handles = self.clone();
+        if message.is_topic_message
+            && let Some(topic_id) = message.message_thread_id
+        {
+            handles.telegram = self.telegram.in_topic(message.chat.id, topic_id);
+        }
+        handles
+    }
+
     fn bot(&self) -> groups::Bot<'_> {
         groups::Bot {
             user_id: self.bot_user_id,
@@ -532,6 +544,10 @@ impl Runtime {
         dispatchers: &mut BTreeMap<i64, ChatDispatcher>,
     ) {
         let chat_id = message.chat.id;
+        if let Some((old, new)) = migration(&message) {
+            handle_migration(old, new, handles).await;
+            return;
+        }
         let access = {
             let mut access = self.access.lock().await;
             access.check_chat(chat_id)
@@ -540,6 +556,28 @@ impl Runtime {
         match access {
             ChatAccess::Allowed => {
                 send_to_chat_worker(chat_id, message, handles, dispatchers);
+            }
+            ChatAccess::Unknown { .. } if is_owner_direct_chat(&message, handles).await => {
+                // An owner writing to the bot directly needs no code, as a
+                // group an owner adds it to doesn't.
+                match approve_chat(chat_id, handles).await {
+                    Ok(_) => {
+                        log::info!(
+                            target: "tellm::access",
+                            "owner's direct chat auto-approved chat_id={chat_id}"
+                        );
+                        let setup = room_setup_reply(chat_id, false, handles).await;
+                        let setup_handles = handles.clone();
+                        tokio::spawn(async move {
+                            let _ = send_room_setup(chat_id, setup, &setup_handles).await;
+                        });
+                        send_to_chat_worker(chat_id, message, handles, dispatchers);
+                    }
+                    Err(error) => log::error!(
+                        target: "tellm::persistence",
+                        "auto-approved chat save failed chat_id={chat_id} error={error:?}"
+                    ),
+                }
             }
             ChatAccess::Unknown { send_hint } => {
                 // Arm (or refresh) this room's pairing code on any contact;
@@ -614,12 +652,7 @@ async fn handle_membership_change(
         None => false,
     };
     if let Some(user_id) = adder.filter(|_| trusted_adder) {
-        let persisted = update_config(handles, move |config| {
-            let changed = allow_chat_in_config(config, chat_id);
-            (changed, changed)
-        })
-        .await;
-        let changed = match persisted {
+        let changed = match approve_chat(chat_id, handles).await {
             Ok(changed) => changed,
             Err(error) => {
                 log::error!(
@@ -629,10 +662,6 @@ async fn handle_membership_change(
                 return;
             }
         };
-        {
-            let mut access = handles.access.lock().await;
-            access.allow_chat(chat_id);
-        }
         log::info!(
             target: "tellm::access",
             "chat auto-approved chat={label:?} owner_user_id={user_id} changed={changed}"
@@ -713,6 +742,116 @@ async fn handle_removed(chat_id: i64, label: &str, handles: &RuntimeHandles) {
             "removed from chat; clearing it failed chat={label:?} error={error:?}"
         ),
     }
+}
+
+/// Approves a chat: config.toml, then the live access check. Returns
+/// whether it was newly approved.
+async fn approve_chat(chat_id: i64, handles: &RuntimeHandles) -> Result<bool, String> {
+    let changed = update_config(handles, move |config| {
+        let changed = allow_chat_in_config(config, chat_id);
+        (changed, changed)
+    })
+    .await?;
+    handles.access.lock().await.allow_chat(chat_id);
+    Ok(changed)
+}
+
+/// A message from an owner in their own direct chat with the bot, whose id
+/// is their user id.
+async fn is_owner_direct_chat(message: &IncomingMessage, handles: &RuntimeHandles) -> bool {
+    let chat_id = message.chat.id;
+    chat_id > 0
+        && message.from.as_ref().map(|user| user.id) == Some(chat_id)
+        && handles
+            .config
+            .lock()
+            .await
+            .telegram
+            .owner_user_ids
+            .contains(&chat_id)
+}
+
+/// (old id, new id) when the message says a group became a supergroup.
+fn migration(message: &IncomingMessage) -> Option<(i64, i64)> {
+    message
+        .migrate_to_chat_id
+        .map(|new| (message.chat.id, new))
+        .or_else(|| {
+            message
+                .migrate_from_chat_id
+                .map(|old| (old, message.chat.id))
+        })
+}
+
+/// A group became a supergroup with a new id, as when topics are turned
+/// on. Telegram tells both chats; whichever message arrives first moves
+/// what tellm keeps for the group to the new id: its approval, private
+/// marking and model pin in config.toml, its room, and its menus. The
+/// second finds the old id no longer approved and does nothing.
+async fn handle_migration(old: i64, new: i64, handles: &RuntimeHandles) {
+    if !chat_is_allowed(old, handles).await {
+        log::debug!(
+            target: "tellm::access",
+            "group became a supergroup; nothing to move old_chat_id={old} new_chat_id={new}"
+        );
+        return;
+    }
+    let persisted = update_config(handles, move |config| {
+        let changed = migrate_chat_in_config(config, old, new);
+        (changed, changed)
+    })
+    .await;
+    if let Err(error) = persisted {
+        log::error!(
+            target: "tellm::persistence",
+            "moving a group to its new id failed old_chat_id={old} new_chat_id={new} error={error:?}"
+        );
+        return;
+    }
+    {
+        let mut access = handles.access.lock().await;
+        access.allow_chat(new);
+        access.deny_chat(old);
+    }
+    // The old chat can't be written to any more.
+    cancel_chat_worker(&handles.workers, old, true);
+    if let Err(error) = handles
+        .persistence
+        .move_room(&handles.rooms, old, new)
+        .await
+    {
+        log::error!(
+            target: "tellm::persistence",
+            "moving a group's room failed old_chat_id={old} new_chat_id={new} error={error:?}"
+        );
+    }
+    clear_menus(old, handles).await;
+    sync_menus(new, handles).await;
+    log::info!(
+        target: "tellm::access",
+        "group became a supergroup; its room moved old_chat_id={old} new_chat_id={new}"
+    );
+}
+
+/// Replaces `old` with `new` in every chat list of the config. Returns
+/// whether anything changed.
+fn migrate_chat_in_config(config: &mut Config, old: i64, new: i64) -> bool {
+    fn replace(list: &mut Vec<i64>, old: i64, new: i64) -> bool {
+        if !list.contains(&old) {
+            return false;
+        }
+        list.retain(|chat_id| *chat_id != old);
+        if !list.contains(&new) {
+            list.push(new);
+        }
+        true
+    }
+    let mut changed = replace(&mut config.telegram.allowed_chat_ids, old, new);
+    changed |= replace(&mut config.telegram.private_group_ids, old, new);
+    for model in config.models.values_mut() {
+        changed |= replace(&mut model.telegram_chat_ids, old, new);
+    }
+    changed
 }
 
 fn dispatchable_message(update: &mut tellm_telegram::Update) -> Option<IncomingMessage> {
@@ -1016,6 +1155,7 @@ fn spawn_chat_worker(
                     let _ = worker_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                         Some(n.saturating_sub(parts))
                     });
+                    let handles = handles.for_message(&message);
                     if let Err(error) =
                         handle_allowed_message(chat_id, message, &handles, &worker_cancelled).await
                     {
@@ -1339,6 +1479,10 @@ async fn handle_button_press(
         album: Vec::new(),
         split_parts: 0,
         button_press: Some(press.id),
+        migrate_to_chat_id: None,
+        migrate_from_chat_id: None,
+        message_thread_id: pressed.message_thread_id,
+        is_topic_message: pressed.is_topic_message,
     };
     send_to_chat_worker(chat_id, message, handles, dispatchers);
 }
@@ -4088,6 +4232,10 @@ mod tests {
             album: Vec::new(),
             split_parts: 0,
             button_press: None,
+            migrate_to_chat_id: None,
+            migrate_from_chat_id: None,
+            message_thread_id: None,
+            is_topic_message: false,
             reply_to_message: None,
             new_chat_members: Vec::new(),
         };
@@ -5198,6 +5346,126 @@ mod tests {
         assert!(sent[1].contains("- /group private|shared"), "{}", sent[1]);
     }
 
+    #[tokio::test]
+    async fn a_group_that_becomes_a_supergroup_keeps_its_room_under_the_new_id() {
+        const SUPERGROUP: i64 = -1_009;
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = group_handles(&telegram, &provider, true).await;
+        handles
+            .config
+            .lock()
+            .await
+            .models
+            .get_mut("local")
+            .unwrap()
+            .telegram_chat_ids = vec![GROUP];
+        handles
+            .rooms
+            .lock()
+            .await
+            .get_or_default(GROUP)
+            .settings
+            .role = Some("Be brief.".to_string());
+
+        let mut moved = group_message(7, "");
+        moved.text = None;
+        moved.migrate_to_chat_id = Some(SUPERGROUP);
+        assert_eq!(migration(&moved), Some((GROUP, SUPERGROUP)));
+        let mut arrived = group_message(7, "");
+        arrived.chat.id = SUPERGROUP;
+        arrived.migrate_from_chat_id = Some(GROUP);
+        assert_eq!(migration(&arrived), Some((GROUP, SUPERGROUP)));
+
+        handle_migration(GROUP, SUPERGROUP, &handles).await;
+        handle_migration(GROUP, SUPERGROUP, &handles).await;
+
+        {
+            let config = handles.config.lock().await;
+            assert_eq!(config.telegram.allowed_chat_ids, vec![42, SUPERGROUP]);
+            assert_eq!(config.telegram.private_group_ids, vec![SUPERGROUP]);
+            assert_eq!(config.models["local"].telegram_chat_ids, vec![SUPERGROUP]);
+        }
+        assert!(chat_is_allowed(SUPERGROUP, &handles).await);
+        assert!(!chat_is_allowed(GROUP, &handles).await);
+        let rooms = handles.rooms.lock().await;
+        assert!(rooms.get(GROUP).is_none());
+        assert_eq!(
+            rooms.get(SUPERGROUP).unwrap().settings.role.as_deref(),
+            Some("Be brief.")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_writing_directly_needs_no_pairing_code() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = group_handles(&telegram, &provider, false).await;
+        let mut message = group_message(7, "hi");
+        message.chat.id = 7;
+        assert!(is_owner_direct_chat(&message, &handles).await);
+        message.from.as_mut().unwrap().id = 8;
+        assert!(
+            !is_owner_direct_chat(&message, &handles).await,
+            "someone else in the owner's chat id"
+        );
+        let mut stranger = group_message(8, "hi");
+        stranger.chat.id = 8;
+        assert!(!is_owner_direct_chat(&stranger, &handles).await);
+
+        assert!(approve_chat(7, &handles).await.unwrap());
+        assert!(chat_is_allowed(7, &handles).await);
+        assert!(
+            handles
+                .config
+                .lock()
+                .await
+                .telegram
+                .allowed_chat_ids
+                .contains(&7)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_in_a_forum_topic_is_answered_in_that_topic() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(vec![completion("In May.", 10, 5)]);
+        let handles = group_handles(&telegram, &provider, true).await;
+        let mut question = group_message(7, "when?");
+        question.message_thread_id = Some(12);
+        question.is_topic_message = true;
+
+        let scoped = handles.for_message(&question);
+        handle_allowed_message(GROUP, question, &scoped, &AtomicBool::new(false))
+            .await
+            .unwrap();
+
+        let answers = sent_message_bodies(&telegram);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0]["message_thread_id"], serde_json::json!(12));
+        for typing in request_bodies(&telegram, "sendChatAction") {
+            assert_eq!(typing["message_thread_id"], serde_json::json!(12));
+        }
+
+        let mut reply = group_message(7, "and?");
+        reply.message_thread_id = Some(3);
+        assert!(
+            handles
+                .for_message(&reply)
+                .telegram
+                .clone()
+                .send_message(GROUP, "x")
+                .await
+                .is_ok()
+        );
+        assert!(
+            sent_message_bodies(&telegram)[1]
+                .get("message_thread_id")
+                .is_none(),
+            "a reply thread outside a forum topic isn't a topic"
+        );
+    }
+
     /// A press of a button under message 30, as the worker gets it.
     fn button_press(from: i64, command: &str) -> IncomingMessage {
         let mut press = group_message(from, command);
@@ -5866,6 +6134,10 @@ mod tests {
             album: Vec::new(),
             split_parts: 0,
             button_press: None,
+            migrate_to_chat_id: None,
+            migrate_from_chat_id: None,
+            message_thread_id: None,
+            is_topic_message: false,
             reply_to_message: None,
             new_chat_members: Vec::new(),
         }

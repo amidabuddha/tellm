@@ -271,6 +271,10 @@ mod tests {
             album: Vec::new(),
             split_parts: 0,
             button_press: None,
+            migrate_to_chat_id: None,
+            migrate_from_chat_id: None,
+            message_thread_id: None,
+            is_topic_message: false,
         }
     }
 

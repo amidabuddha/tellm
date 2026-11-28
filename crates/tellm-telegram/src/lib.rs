@@ -115,6 +115,10 @@ pub struct CallbackQuery {
 pub struct CallbackMessage {
     pub message_id: i64,
     pub chat: Chat,
+    /// As on [`IncomingMessage`]: the forum topic the message is in.
+    pub message_thread_id: Option<i64>,
+    #[serde(default)]
+    pub is_topic_message: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +185,18 @@ pub struct IncomingMessage {
     /// core.telegram.org/bots/features#privacy-mode.
     #[serde(default)]
     pub new_chat_members: Vec<User>,
+    /// Service messages for a group that became a supergroup with a new id:
+    /// the old chat gets `migrate_to_chat_id`, the new one
+    /// `migrate_from_chat_id`. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#message.
+    pub migrate_to_chat_id: Option<i64>,
+    pub migrate_from_chat_id: Option<i64>,
+    /// The forum topic the message belongs to, when `is_topic_message` is
+    /// set; other threads (such as replies) carry an id too. Checked
+    /// 2026-11-28 against core.telegram.org/bots/api#message.
+    pub message_thread_id: Option<i64>,
+    #[serde(default)]
+    pub is_topic_message: bool,
     /// Not from Telegram: the album's other items, in order, once tellm has
     /// gathered an album into its first message.
     #[serde(skip)]
@@ -283,15 +299,6 @@ impl Target {
         }
         fields
     }
-
-    /// A send request: the target's fields plus the method's own.
-    fn payload(self, rest: Value) -> Value {
-        let mut payload = self.fields();
-        if let Value::Object(rest) = rest {
-            payload.extend(rest);
-        }
-        Value::Object(payload)
-    }
 }
 
 impl From<i64> for Target {
@@ -310,6 +317,9 @@ pub struct Telegram {
     api_base_url: String,
     file_base_url: String,
     request_timeout: Duration,
+    /// (chat id, topic id): what this client sends to that chat goes to the
+    /// topic.
+    topic: Option<(i64, i64)>,
 }
 
 impl Telegram {
@@ -346,7 +356,40 @@ impl Telegram {
             api_base_url: trim_trailing_slash(api_base_url.into()),
             file_base_url: trim_trailing_slash(file_base_url.into()),
             request_timeout,
+            topic: None,
         }
+    }
+
+    /// A client whose messages and chat actions for `chat_id` go to the
+    /// forum topic `topic_id`, for answering a message sent in a topic.
+    /// Checked 2026-11-28 against core.telegram.org/bots/api#sendmessage
+    /// and #sendchataction (`message_thread_id`).
+    pub fn in_topic(&self, chat_id: i64, topic_id: i64) -> Self {
+        Self {
+            topic: Some((chat_id, topic_id)),
+            ..self.clone()
+        }
+    }
+
+    /// A send request's fields for the target, with the topic when the
+    /// target is this client's topic chat.
+    fn target_fields(&self, target: Target) -> serde_json::Map<String, Value> {
+        let mut fields = target.fields();
+        if let Some((chat_id, topic_id)) = self.topic
+            && chat_id == target.chat_id
+        {
+            fields.insert("message_thread_id".to_string(), json!(topic_id));
+        }
+        fields
+    }
+
+    /// A send request: the target's fields plus the method's own.
+    fn payload(&self, target: Target, rest: Value) -> Value {
+        let mut payload = self.target_fields(target);
+        if let Value::Object(rest) = rest {
+            payload.extend(rest);
+        }
+        Value::Object(payload)
     }
 
     /// Long-poll for updates. `timeout_s` stays modest so terminal controls
@@ -396,7 +439,7 @@ impl Telegram {
             let result = self
                 .post_json::<Value>(
                     "sendRichMessage",
-                    &target.payload(json!({ "rich_message": { "markdown": part } })),
+                    &self.payload(target, json!({ "rich_message": { "markdown": part } })),
                 )
                 .await;
 
@@ -432,10 +475,13 @@ impl Telegram {
         let sent = self
             .post_json::<Value>(
                 "sendMessage",
-                &target.payload(json!({
-                    "text": text,
-                    "reply_markup": inline_keyboard(rows),
-                })),
+                &self.payload(
+                    target,
+                    json!({
+                        "text": text,
+                        "reply_markup": inline_keyboard(rows),
+                    }),
+                ),
             )
             .await;
         match sent {
@@ -548,10 +594,7 @@ impl Telegram {
         // Checked 2026-07-04 against core.telegram.org/bots/api#sendchataction.
         self.post_json::<Value>(
             "sendChatAction",
-            &json!({
-                "chat_id": chat_id,
-                "action": "typing",
-            }),
+            &self.payload(Target::from(chat_id), json!({ "action": "typing" })),
         )
         .await?;
         Ok(())
@@ -573,7 +616,7 @@ impl Telegram {
             .mime_str(media_type.content_type())
             .map_err(|error| self.http_error(error))?;
         let mut form = Form::new();
-        for (name, value) in target.fields() {
+        for (name, value) in self.target_fields(target) {
             let value = match value {
                 Value::String(text) => text,
                 other => other.to_string(),
@@ -653,19 +696,25 @@ impl Telegram {
         let html_result = self
             .post_json::<Value>(
                 "sendMessage",
-                &target.payload(json!({
-                    "text": markdown_to_html(part),
-                    "parse_mode": "HTML",
-                    "link_preview_options": { "is_disabled": true },
-                })),
+                &self.payload(
+                    target,
+                    json!({
+                        "text": markdown_to_html(part),
+                        "parse_mode": "HTML",
+                        "link_preview_options": { "is_disabled": true },
+                    }),
+                ),
             )
             .await;
 
         match html_result {
             Ok(_) => Ok(()),
             Err(error) if should_fallback_from_html_message_error(&error) => {
-                self.post_json::<Value>("sendMessage", &target.payload(json!({ "text": part })))
-                    .await?;
+                self.post_json::<Value>(
+                    "sendMessage",
+                    &self.payload(target, json!({ "text": part })),
+                )
+                .await?;
                 Ok(())
             }
             Err(error) => Err(error),

@@ -112,6 +112,24 @@ impl Persistence {
         self.save_rooms(settings).await
     }
 
+    /// Moves a room to a new chat id, as when a group becomes a supergroup,
+    /// and persists the new snapshot. A failed save leaves the move in
+    /// memory; a later room mutation retries the complete snapshot.
+    pub(crate) async fn move_room(
+        &self,
+        rooms: &Mutex<RoomStates>,
+        from: i64,
+        to: i64,
+    ) -> Result<(), String> {
+        let _transaction = self.room_mutations.lock().await;
+        let settings = {
+            let mut rooms = rooms.lock().await;
+            rooms.rename(from, to);
+            rooms.settings()
+        };
+        self.save_rooms(settings).await
+    }
+
     async fn save_rooms(&self, settings: BTreeMap<i64, RoomSettings>) -> Result<(), String> {
         let (reply, result) = oneshot::channel();
         self.sender

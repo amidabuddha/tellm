@@ -573,6 +573,12 @@ calls a billing API and never fetches prices.
 - After each committed reply, the chat's worker checks the conversation's
   budget (§ Summaries) before it takes the next message, and summarizes the
   chat into a new one when it is due.
+- Forum topics: a group with topics is still one room with one
+  conversation, but everything sent while handling a message from a topic
+  (`is_topic_message` with its `message_thread_id`) goes to that topic,
+  typing included, so answers appear where the question was asked.
+  Messages in the General topic, or replies outside topics, go to the chat
+  as usual.
 - A reply quotes the message it answers when more messages wait in the
   room's queue behind it, so it is clear which one it answers; otherwise it
   is a plain message. Each worker counts the messages queued for it that it
@@ -754,6 +760,18 @@ that key is configured again.
   `new_chat_member` (checked 2026-11-28 against
   core.telegram.org/bots/api#chatmemberupdated) are compared, so a change
   while the bot stays in the chat, such as becoming an admin, sends nothing.
+- An owner's own direct chat (chat id equals the sender's user id, which
+  is in `owner_user_ids`) is approved on its first message without a code,
+  like a group an owner adds the bot to; it gets the room setup and the
+  message is answered.
+- **Migration**: when a group becomes a supergroup it gets a new id (as
+  when topics are turned on), and Telegram sends service messages to both:
+  `migrate_to_chat_id` in the old chat, `migrate_from_chat_id` in the new
+  one (checked 2026-11-28 against core.telegram.org/bots/api#message).
+  Whichever arrives first moves what tellm keeps for the group to the new
+  id: approval, private marking and model pin in `config.toml`, the room in
+  `rooms.toml` with its conversation, and the menus. The other finds the old
+  id no longer approved and does nothing.
 - **Removal**: when the bot leaves or is removed from an approved chat, the
   chat is revoked as `/deny` does it (below), so adding the bot back starts
   over: pairing or owner approval, shared by default, a fresh room.

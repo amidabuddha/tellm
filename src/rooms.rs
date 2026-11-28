@@ -488,6 +488,14 @@ impl RoomStates {
     pub fn remove(&mut self, chat_id: i64) -> Option<RoomState> {
         self.rooms.remove(&chat_id)
     }
+
+    /// Moves the room under `from`, if any, to `to`, replacing what was
+    /// there.
+    pub fn rename(&mut self, from: i64, to: i64) {
+        if let Some(room) = self.rooms.remove(&from) {
+            self.rooms.insert(to, room);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

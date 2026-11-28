@@ -293,6 +293,11 @@ normal room; it then answers every message as one conversation. If someone who i
 joins a private group, tellm says so in the group, and `/group shared` makes
 it shared again.
 
+A group with topics is one room: the bot answers in the topic where it was
+asked, but the conversation is shared across topics. Turning topics on gives a
+group a new id; tellm moves the room's settings and conversation to it. Your
+own direct chat with the bot works without pairing.
+
 **Ollama:** for `localhost:11434`, tellm starts `ollama serve` when needed.
 On shutdown it unloads the models this session used and stops the server again
 if it started it. Images are sent only to models whose `ollama show` lists
