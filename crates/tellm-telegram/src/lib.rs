@@ -51,6 +51,32 @@ pub enum TelegramError {
 /// against core.telegram.org/bots/api#inlinekeyboardbutton.
 pub const MAX_BUTTON_DATA: usize = 64;
 
+/// Who a command menu is for. Telegram shows a group member the first list
+/// set among: that member in the chat, the chat, then wider scopes down to
+/// the default; in a direct chat, the chat, then the default. Checked
+/// 2026-11-28 against core.telegram.org/bots/api#determining-list-of-commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandScope {
+    /// Every chat without a list of its own.
+    Default,
+    /// Everyone in one chat.
+    Chat(i64),
+    /// One member of a group.
+    ChatMember { chat_id: i64, user_id: i64 },
+}
+
+impl CommandScope {
+    fn json(self) -> Value {
+        match self {
+            Self::Default => json!({ "type": "default" }),
+            Self::Chat(chat_id) => json!({ "type": "chat", "chat_id": chat_id }),
+            Self::ChatMember { chat_id, user_id } => {
+                json!({ "type": "chat_member", "chat_id": chat_id, "user_id": user_id })
+            }
+        }
+    }
+}
+
 /// A button under a message. Pressing it sends `data` back to the bot in a
 /// callback query; tellm's buttons carry the command they stand for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,6 +507,32 @@ impl Telegram {
         }
         self.post_json::<Value>("answerCallbackQuery", &payload)
             .await?;
+        Ok(())
+    }
+
+    /// Set the command menu for a scope: (name without the slash,
+    /// description) pairs. No commands deletes the scope's list, so a wider
+    /// scope's shows instead. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#setmycommands and #deletemycommands.
+    pub async fn set_commands(
+        &self,
+        scope: CommandScope,
+        commands: &[(String, String)],
+    ) -> Result<(), TelegramError> {
+        if commands.is_empty() {
+            self.post_json::<Value>("deleteMyCommands", &json!({ "scope": scope.json() }))
+                .await?;
+            return Ok(());
+        }
+        let commands = commands
+            .iter()
+            .map(|(command, description)| json!({ "command": command, "description": description }))
+            .collect::<Vec<_>>();
+        self.post_json::<Value>(
+            "setMyCommands",
+            &json!({ "commands": commands, "scope": scope.json() }),
+        )
+        .await?;
         Ok(())
     }
 

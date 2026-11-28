@@ -6,6 +6,7 @@ mod console;
 mod cost;
 mod groups;
 mod memory;
+mod menu;
 mod model_turn;
 mod ollama;
 mod persistence;

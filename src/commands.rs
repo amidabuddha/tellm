@@ -170,8 +170,9 @@ pub enum CommandAction {
     SetGroupPrivate {
         private: bool,
     },
+    /// `/help`: the commands that apply in the room for its sender.
     Help {
-        pinned_model_key: Option<String>,
+        owner: bool,
     },
     Reject {
         reason: CommandReject,
@@ -325,7 +326,10 @@ pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) 
         KnownCommand::Shutdown => route_shutdown(context.privileged_access),
         KnownCommand::Group => route_group(args, context),
         KnownCommand::Help => CommandAction::Help {
-            pinned_model_key: context.pinned_model_key.map(str::to_string),
+            owner: !matches!(
+                context.privileged_access,
+                access::PrivilegedAccess::NotOwner
+            ),
         },
     }
 }
@@ -970,9 +974,7 @@ mod tests {
                 access::PrivilegedAccess::Allowed,
                 &["claude"],
             ),
-            Route::Command(CommandAction::Help {
-                pinned_model_key: None,
-            })
+            Route::Command(CommandAction::Help { owner: true })
         );
         assert_eq!(
             route_command_with(
@@ -1021,9 +1023,7 @@ mod tests {
         );
         assert_eq!(
             route_command("/help"),
-            Route::Command(CommandAction::Help {
-                pinned_model_key: None,
-            })
+            Route::Command(CommandAction::Help { owner: true })
         );
     }
 
@@ -1217,9 +1217,7 @@ mod tests {
                 &["claude", "gpt"],
                 Some("gpt"),
             ),
-            Route::Command(CommandAction::Help {
-                pinned_model_key: Some("gpt".to_string()),
-            })
+            Route::Command(CommandAction::Help { owner: true })
         );
     }
 

@@ -666,6 +666,21 @@ calls a billing API and never fetches prices.
 Dropped as waste:
 `/webfetch` (fold into websearch decision later), assistants, AI-managed mode,
 MCP tooling.
+Menu and help: one list in `menu.rs` decides which commands apply in a room
+for a viewer, and feeds both the Telegram command menu (the "/" button) and
+`/help`, so they never disagree. Other members of a shared group get `/id`
+and `/help`; a shared group shows no `/new`, `/mode` or memory commands;
+`/websearch`, `/imagegen` and `/ollama unload` show only when the room's
+model has them; `/remember` and `/forget` only where memory is on; `/new
+summary` only in chat mode; owner commands only to owners. A command left
+out still works when typed. tellm sets the menus with `setMyCommands`
+(checked 2026-11-28 against core.telegram.org/bots/api#setmycommands and
+#determining-list-of-commands): for unapproved chats the default scope
+holds only `/pair`; each approved chat gets a `chat` scope for everyone in
+it, and a group a `chat_member` scope for each owner. Menus are set at
+startup, after approval, and after each command or button press in the
+chat; one that hasn't changed since tellm last set it isn't sent again. A
+revoked chat's menus are deleted, so it falls back to the default.
 Known commands accept Telegram's group form (`/cmd@BotName`); commands
 addressed to a different bot are ignored. An unknown command (a name of
 Telegram's command shape: 1–32 letters, digits or underscores, such as a

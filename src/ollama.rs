@@ -115,6 +115,12 @@ enum UnloadOutcome {
     NotLoaded,
 }
 
+/// Whether `base_url` is the local Ollama endpoint tellm manages, the only
+/// one `/ollama unload` reaches.
+pub(crate) fn is_local(base_url: &str) -> bool {
+    local_addr(base_url).is_some()
+}
+
 pub(crate) async fn ensure_ready(base_url: &str) -> Result<(), String> {
     let Some(addr) = local_addr(base_url) else {
         return Ok(());

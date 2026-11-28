@@ -6,7 +6,7 @@ use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use tellm_config::{Config, WireFormat, secrets};
 use tellm_core::{ChatRequest, ChatResponse, ContentPart};
-use tellm_telegram::{IncomingMessage, Target, Telegram, TelegramError};
+use tellm_telegram::{CommandScope, IncomingMessage, Target, Telegram, TelegramError};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -20,6 +20,7 @@ use crate::commands::{self, CommandAction, CommandContext, CommandReject, KnownC
 use crate::cost;
 use crate::groups::{self, ChatKind};
 use crate::memory::{self, ConversationMemory};
+use crate::menu;
 use crate::model_turn::{self, PreparedChatRequest};
 use crate::ollama;
 use crate::persistence::{self, Persistence};
@@ -87,7 +88,13 @@ struct RuntimeHandles {
     persistence: Persistence,
     workers: WorkerRegistry,
     queue_full_notices: Arc<StdMutex<BTreeSet<i64>>>,
+    /// The command menus tellm last set, so an unchanged one isn't sent
+    /// again.
+    menus: MenuCache,
 }
+
+/// Each scope's command list as tellm last set it: (name, description).
+type MenuCache = Arc<StdMutex<BTreeMap<CommandScope, Vec<(String, String)>>>>;
 
 impl RuntimeHandles {
     fn bot(&self) -> groups::Bot<'_> {
@@ -381,7 +388,9 @@ impl Runtime {
             persistence,
             workers: Arc::clone(&workers),
             queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
+            menus: Arc::default(),
         };
+        tokio::spawn(sync_all_menus(handles.clone()));
         let mut dispatchers = BTreeMap::new();
         let mut offset = 0_i64;
         let mut get_updates_log = GetUpdatesLogState::default();
@@ -1169,7 +1178,11 @@ async fn handle_allowed_message(
         {
             Route::Command(action) => {
                 log_update_route(&message, UpdateKind::Message, UpdateRoute::Command);
-                return handle_command(chat_id, action, handles, cancelled).await;
+                let handled = handle_command(chat_id, action, handles, cancelled).await;
+                if worker_can_reply(chat_id, handles, cancelled).await {
+                    sync_menus(chat_id, handles).await;
+                }
+                return handled;
             }
             Route::Ignore => {
                 log_update_route(&message, UpdateKind::Message, UpdateRoute::Ignored);
@@ -1261,7 +1274,11 @@ async fn handle_button(
                     "removing pressed buttons failed chat_id={chat_id} error=\"{error}\""
                 );
             }
-            return handle_command(chat_id, action, handles, cancelled).await;
+            let handled = handle_command(chat_id, action, handles, cancelled).await;
+            if worker_can_reply(chat_id, handles, cancelled).await {
+                sync_menus(chat_id, handles).await;
+            }
+            return handled;
         }
         Route::Command(CommandAction::ModelUnchanged { model_key }) => {
             (format!("Already using {model_key}."), false)
@@ -1802,13 +1819,140 @@ async fn handle_command(
             };
             send_command_reply(handles, chat_id, &groups::status_reply(kind, changed)).await
         }
-        CommandAction::Help { pinned_model_key } => {
-            let help = help_text(pinned_model_key.as_deref());
-            send_command_reply(handles, chat_id, &help).await
+        CommandAction::Help { owner } => {
+            let context = menu_context(chat_id, owner, handles).await;
+            send_command_reply(handles, chat_id, &menu::help_text(&context)).await
         }
         CommandAction::Reject { reason } => {
             send_command_reply(handles, chat_id, &format_reject(reason)).await
         }
+    }
+}
+
+/// What decides a room's command list for one viewer.
+async fn menu_context(chat_id: i64, owner: bool, handles: &RuntimeHandles) -> menu::Context {
+    let config = handles.config.lock().await;
+    let mut rooms = handles.rooms.lock().await;
+    let room = rooms.get_or_default(chat_id);
+    let kind = groups::chat_kind(&config, chat_id);
+    let capabilities = room_capabilities(&config, room, chat_id);
+    let ollama = config
+        .models
+        .get(&selected_model_key(&config, room, chat_id))
+        .is_some_and(|model| {
+            model.wire_format == WireFormat::Compat
+                && model.base_url.as_deref().is_some_and(ollama::is_local)
+        });
+    menu::Context {
+        kind,
+        owner,
+        pinned: pinned_model_key(&config, chat_id).map(str::to_string),
+        mode: room.settings.mode,
+        memory: kind != ChatKind::SharedGroup
+            && memory::enabled_in(
+                room.settings.memory,
+                chat_id,
+                &config.telegram.owner_user_ids,
+            ),
+        web_search: capabilities.web_search,
+        image_generation: capabilities.image_generation,
+        ollama,
+    }
+}
+
+/// The menus a chat needs: one for everyone in it, and in a group one for
+/// each owner, who can do more. In a direct chat the only viewer is the
+/// person it is with.
+fn menu_scopes(chat_id: i64, owners: &[i64]) -> Vec<(CommandScope, bool)> {
+    if chat_id > 0 {
+        return vec![(CommandScope::Chat(chat_id), owners.contains(&chat_id))];
+    }
+    std::iter::once((CommandScope::Chat(chat_id), false))
+        .chain(
+            owners
+                .iter()
+                .map(|&user_id| (CommandScope::ChatMember { chat_id, user_id }, true)),
+        )
+        .collect()
+}
+
+/// Brings the chat's command menus in line with the room, sending only the
+/// ones that changed. A failure is logged and retried with the next change.
+async fn sync_menus(chat_id: i64, handles: &RuntimeHandles) {
+    let owners = handles.config.lock().await.telegram.owner_user_ids.clone();
+    for (scope, owner) in menu_scopes(chat_id, &owners) {
+        let context = menu_context(chat_id, owner, handles).await;
+        let commands = menu::commands(&context)
+            .into_iter()
+            .map(|command| (command.name.to_string(), command.menu.to_string()))
+            .collect::<Vec<_>>();
+        set_menu(scope, commands, handles).await;
+    }
+}
+
+async fn set_menu(scope: CommandScope, commands: Vec<(String, String)>, handles: &RuntimeHandles) {
+    let unchanged = handles
+        .menus
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&scope)
+        .is_some_and(|current| *current == commands);
+    if unchanged {
+        return;
+    }
+    match handles.telegram.set_commands(scope, &commands).await {
+        Ok(()) => {
+            handles
+                .menus
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(scope, commands);
+        }
+        Err(error) => log::warn!(
+            target: "tellm::telegram",
+            "command menu update failed scope={scope:?} error=\"{error}\""
+        ),
+    }
+}
+
+/// A revoked chat falls back to the menu for chats tellm hasn't approved.
+/// After the bot was removed, Telegram may refuse to change the chat's
+/// menus, which no longer matter, so that is only logged quietly.
+async fn clear_menus(chat_id: i64, handles: &RuntimeHandles) {
+    let owners = handles.config.lock().await.telegram.owner_user_ids.clone();
+    for (scope, _) in menu_scopes(chat_id, &owners) {
+        handles
+            .menus
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&scope);
+        if let Err(error) = handles.telegram.set_commands(scope, &[]).await {
+            log::debug!(
+                target: "tellm::telegram",
+                "command menu removal failed scope={scope:?} error=\"{error}\""
+            );
+        }
+    }
+}
+
+/// At startup: the menu for unapproved chats, then each approved chat's.
+async fn sync_all_menus(handles: RuntimeHandles) {
+    let unapproved = menu::UNAPPROVED
+        .iter()
+        .map(|(name, description)| (name.to_string(), description.to_string()))
+        .collect();
+    set_menu(CommandScope::Default, unapproved, &handles).await;
+    let chat_ids = {
+        let config = handles.config.lock().await;
+        let access = AccessConfig::from_config(&config);
+        access
+            .allowed_chat_ids
+            .union(&access.pinned_chat_ids)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    for chat_id in chat_ids {
+        sync_menus(chat_id, &handles).await;
     }
 }
 
@@ -2377,6 +2521,7 @@ async fn revoke_chat(
         result
     };
 
+    clear_menus(target_chat_id, handles).await;
     if let Err(error) = handles
         .persistence
         .remove_room(&handles.rooms, target_chat_id)
@@ -2937,6 +3082,7 @@ async fn send_room_setup(
             .await
             .map_err(|error| error.to_string())?;
     }
+    sync_menus(chat_id, handles).await;
     Ok(())
 }
 
@@ -3581,39 +3727,6 @@ fn command_name(command: KnownCommand) -> &'static str {
     }
 }
 
-fn help_text(pinned_model_key: Option<&str>) -> String {
-    let mut text = HELP_TEXT.to_string();
-    if let Some(model_key) = pinned_model_key {
-        text.push_str(&format!(
-            "\n- This room is pinned to {model_key}; /model changes are disabled"
-        ));
-    }
-    text
-}
-
-const HELP_TEXT: &str = "\
-- /new [summary] - start a new chat, or carry a summary of this one into it
-- /id - show this Telegram chat id
-- /mode chat|message - show or set conversation mode
-- /model KEY - show or set model
-- /model pin KEY | /model unpin - lock or release this room's model (owner)
-- /model add [KEY] - list the provider catalog or add a preset (owner)
-- /role TEXT|clear - show, set, or clear the system role
-- /reasoning default|off|low|medium|high|max - show or set reasoning level
-- /websearch on|off|status - toggle, set, or show web search
-- /imagegen on|off|status - toggle, set, or show image generation
-- /cost on|off - show this chat's cost, or show or hide the cost line under each reply
-- /memory on|off - list your saved facts, or use them in this chat or not (owner)
-- /remember TEXT - save a fact for new chats (owner)
-- /forget N - remove saved fact N (owner)
-- /allow CHAT_ID - allow a chat (owner)
-- /deny CHAT_ID - deny a chat and clear its room state (owner)
-- /pair CODE - pair a new chat
-- /ollama unload - unload local Ollama models used by this session (owner)
-- /group private|shared - show or set whether this group is a private room or shared (owner)
-- /shutdown - stop tellm (owner)
-- /help - show commands";
-
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc as std_mpsc;
@@ -3666,6 +3779,7 @@ mod tests {
             persistence: persistence.clone(),
             workers: Arc::new(StdMutex::new(BTreeMap::new())),
             queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
+            menus: Arc::default(),
         };
 
         assert!(persist_paired_chat(42, Some(7), &handles).await.unwrap());
@@ -3748,6 +3862,7 @@ mod tests {
             persistence: persistence.clone(),
             workers: Arc::new(StdMutex::new(BTreeMap::new())),
             queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
+            menus: Arc::default(),
         };
 
         let error = persist_provisional_pair(42, Some(7), &handles)
@@ -3872,6 +3987,7 @@ mod tests {
             persistence: persistence.clone(),
             workers,
             queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
+            menus: Arc::default(),
         };
 
         let task_handles = handles.clone();
@@ -4237,10 +4353,6 @@ mod tests {
                 vec!["claude".to_string(), "gpt".to_string()],
             ),
             "Model: gpt (pinned room: gpt; selected: claude ignored). Available: claude, gpt."
-        );
-        assert!(
-            help_text(Some("gpt"))
-                .contains("This room is pinned to gpt; /model changes are disabled")
         );
         assert_eq!(
             format_reject(CommandReject::PinnedModel {
@@ -4949,7 +5061,7 @@ mod tests {
         );
         assert!(chat_is_allowed(GROUP, &handles).await);
         assert_eq!(
-            telegram.requests()[1].json_body()["text"],
+            request_bodies(&telegram, "sendMessage")[1]["text"],
             serde_json::json!(groups::GROUP_QUESTION),
             "added back, the group starts shared and is asked again"
         );
@@ -4963,14 +5075,14 @@ mod tests {
         let setup = room_setup_reply(GROUP, false, &shared).await;
         send_room_setup(GROUP, setup, &shared).await.unwrap();
 
-        let requests = telegram.requests();
+        let requests = request_bodies(&telegram, "sendMessage");
         assert_eq!(requests.len(), 2);
         assert_eq!(
-            requests[0].json_body()["reply_markup"]["inline_keyboard"][0][0],
+            requests[0]["reply_markup"]["inline_keyboard"][0][0],
             serde_json::json!({ "text": "✓ local", "callback_data": "/model local" })
         );
         assert_eq!(
-            requests[1].json_body(),
+            requests[1],
             serde_json::json!({
                 "chat_id": GROUP,
                 "text": groups::GROUP_QUESTION,
@@ -5004,6 +5116,86 @@ mod tests {
             request_bodies(&telegram, "leaveChat"),
             [serde_json::json!({ "chat_id": GROUP })]
         );
+    }
+
+    #[tokio::test]
+    async fn each_group_member_gets_the_menu_that_applies_and_it_follows_the_room() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = group_handles(&telegram, &provider, false).await;
+        let menu_names = |body: &serde_json::Value| {
+            body["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|command| command["command"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        sync_menus(GROUP, &handles).await;
+        let menus = request_bodies(&telegram, "setMyCommands");
+        assert_eq!(menus.len(), 2);
+        assert_eq!(
+            menus[0]["scope"],
+            serde_json::json!({ "type": "chat", "chat_id": GROUP })
+        );
+        assert_eq!(
+            menu_names(&menus[0]),
+            ["id", "help"],
+            "members of a shared group"
+        );
+        assert_eq!(
+            menus[1]["scope"],
+            serde_json::json!({ "type": "chat_member", "chat_id": GROUP, "user_id": 7 })
+        );
+        assert!(menu_names(&menus[1]).contains(&"group".to_string()));
+        assert!(!menu_names(&menus[1]).contains(&"new".to_string()));
+
+        sync_menus(GROUP, &handles).await;
+        assert_eq!(
+            request_bodies(&telegram, "setMyCommands").len(),
+            2,
+            "unchanged menus aren't sent again"
+        );
+
+        // A command that changes the room updates its menus.
+        handle_allowed_message(
+            GROUP,
+            group_message(7, "/group private"),
+            &handles,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        let menus = request_bodies(&telegram, "setMyCommands");
+        assert_eq!(menus.len(), 4);
+        assert!(menu_names(&menus[2]).contains(&"new".to_string()));
+        assert!(menu_names(&menus[3]).contains(&"new".to_string()));
+
+        clear_menus(GROUP, &handles).await;
+        assert_eq!(request_bodies(&telegram, "deleteMyCommands").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn help_lists_what_applies_to_its_sender() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = group_handles(&telegram, &provider, false).await;
+        let cancelled = AtomicBool::new(false);
+
+        handle_allowed_message(GROUP, group_message(8, "/help"), &handles, &cancelled)
+            .await
+            .unwrap();
+        handle_allowed_message(GROUP, group_message(7, "/help"), &handles, &cancelled)
+            .await
+            .unwrap();
+
+        let sent = sent_texts(&telegram);
+        assert_eq!(
+            sent[0],
+            "- /id - show this Telegram chat id\n- /help - show commands"
+        );
+        assert!(sent[1].contains("- /group private|shared"), "{}", sent[1]);
     }
 
     /// A press of a button under message 30, as the worker gets it.
@@ -5460,6 +5652,7 @@ mod tests {
             persistence,
             workers: Arc::new(StdMutex::new(BTreeMap::new())),
             queue_full_notices: Arc::new(StdMutex::new(BTreeSet::new())),
+            menus: Arc::default(),
         }
     }
 
@@ -5994,20 +6187,5 @@ mod tests {
             max_output_tokens: None,
             price: None,
         }
-    }
-
-    #[test]
-    fn help_text_is_markdown_bullets_without_raw_angle_placeholders() {
-        assert!(HELP_TEXT.lines().all(|line| line.starts_with("- /")));
-        assert!(HELP_TEXT.contains("- /new [summary] - start a new chat"));
-        assert!(HELP_TEXT.contains("- /id - show this Telegram chat id"));
-        assert!(HELP_TEXT.contains("- /allow CHAT_ID - allow a chat (owner)"));
-        assert!(
-            HELP_TEXT.contains("- /deny CHAT_ID - deny a chat and clear its room state (owner)")
-        );
-        assert!(HELP_TEXT.contains("- /pair CODE - pair a new chat"));
-        assert!(HELP_TEXT.contains("- /ollama unload - unload local Ollama models"));
-        assert!(!HELP_TEXT.contains('<'));
-        assert!(!HELP_TEXT.contains('>'));
     }
 }

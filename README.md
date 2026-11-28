@@ -111,6 +111,10 @@ All direct, with no middleware.
 
 ## Commands
 
+Telegram's command menu (the "/" button) and `/help` list only what applies
+in that chat and to you: for example web search only for models that have it,
+and owner commands only for owners. Every command:
+
 | Command | Does |
 |---|---|
 | `/help` | List commands |
