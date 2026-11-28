@@ -466,8 +466,11 @@ calls a billing API and never fetches prices.
 - Only the owner writes it, with `/remember` and `/forget` or by hand. Models
   get no tool to write it (see Non-goals), so it never collects a model's
   guesses.
-- Size limit: 2,000 characters of facts (bullets and comments don't count),
-  about 500 tokens per request. `/remember` refuses to go over it. A
+- Size limit: 4,096 characters of facts (bullets and comments don't count),
+  counted as Telegram counts text (UTF-16 code units), so the facts fit one
+  Telegram message (checked 2026-11-28 against
+  core.telegram.org/bots/api#sendmessage): about 1,000 tokens per request.
+  `/remember` refuses to go over it. A
   hand-edited file over the limit, or one that can't be read, is not used: the
   conversation starts without memory and the chat gets a notice saying why.
 - Where it applies: the room setting `memory` in `rooms.toml`. Unset, it is on

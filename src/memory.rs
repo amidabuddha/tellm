@@ -14,9 +14,11 @@ use std::sync::Mutex;
 use tokio::task::spawn_blocking;
 
 pub const MEMORY_FILE: &str = "memory.md";
-/// Characters of facts, bullets and comments not counted: roughly 500 tokens
-/// added to every request in a room that uses memory.
-pub const MAX_MEMORY_CHARS: usize = 2_000;
+/// Characters of facts as Telegram counts them (UTF-16 code units), bullets
+/// and comments not counted: one Telegram message's worth (its text limit is
+/// 4,096, checked 2026-11-28 against core.telegram.org/bots/api#sendmessage),
+/// roughly 1,000 tokens added to every request in a room that uses memory.
+pub const MAX_MEMORY_CHARS: usize = 4_096;
 
 const NEW_FILE_HEADER: &str =
     "# tellm memory: one fact per line. Lines starting with # are ignored.";
@@ -75,9 +77,10 @@ impl Memory {
             .collect()
     }
 
-    /// Characters of facts, the measure the size limit applies to.
+    /// Characters of facts as Telegram counts them, the measure the size
+    /// limit applies to.
     pub fn used_chars(&self) -> usize {
-        self.facts().iter().map(|fact| fact.chars().count()).sum()
+        self.facts().iter().map(|fact| telegram_len(fact)).sum()
     }
 
     pub fn over_limit(&self) -> bool {
@@ -94,7 +97,7 @@ impl Memory {
             return Remembered::AlreadySaved { number: index + 1 };
         }
         let used = self.used_chars();
-        let adding = fact.chars().count();
+        let adding = telegram_len(&fact);
         if used + adding > MAX_MEMORY_CHARS {
             return Remembered::Full { used, adding };
         }
@@ -160,6 +163,12 @@ fn fact_text(line: &str) -> Option<&str> {
             .trim(),
     };
     (!fact.is_empty()).then_some(fact)
+}
+
+/// A text's length as Telegram counts it: UTF-16 code units, so an emoji
+/// outside the Basic Multilingual Plane counts as two.
+fn telegram_len(text: &str) -> usize {
+    text.encode_utf16().count()
 }
 
 /// A fact is one line: whitespace, line breaks included, collapses to single
@@ -365,6 +374,13 @@ mod tests {
     }
 
     #[test]
+    fn facts_are_measured_the_way_telegram_counts_text() {
+        // Cyrillic is one unit per letter, like ASCII; an emoji is two.
+        let memory = Memory::parse("- София\n- 🎉\n");
+        assert_eq!(memory.used_chars(), 5 + 2);
+    }
+
+    #[test]
     fn remember_appends_a_bullet_and_keeps_the_owners_layout() {
         let mut memory = Memory::parse("# Family\n- Two kids\n\n# Work\n");
 
@@ -495,7 +511,7 @@ mod tests {
         assert_eq!(over.prompt, None);
         assert!(
             over.notice
-                .is_some_and(|notice| notice.contains("2,001 characters"))
+                .is_some_and(|notice| notice.contains("4,097 characters"))
         );
 
         let unreadable = for_new_conversation(Some(Err("couldn't read memory.md".to_string())));
@@ -547,7 +563,7 @@ mod tests {
 
         assert_eq!(
             status_reply(&memory, true, "/cfg/memory.md"),
-            "Memory is on in this chat: 2 facts, 16 of 2,000 characters.\n\
+            "Memory is on in this chat: 2 facts, 16 of 4,096 characters.\n\
              1. I am 41.\n2. Two kids\n\
              /forget N removes one. Changes take effect in your next chat (/new).\n\
              File: /cfg/memory.md"
@@ -572,7 +588,7 @@ mod tests {
                 },
                 true
             ),
-            "Remembered as #3 (1,234 of 2,000 characters). \
+            "Remembered as #3 (1,234 of 4,096 characters). \
              It takes effect in your next chat (/new starts one)."
         );
         assert!(
@@ -582,12 +598,12 @@ mod tests {
         assert_eq!(
             remember_reply(
                 &Remembered::Full {
-                    used: 1_990,
+                    used: 4_086,
                     adding: 20
                 },
                 true
             ),
-            "Not saved: memory would hold 2,010 of 2,000 characters. \
+            "Not saved: memory would hold 4,106 of 4,096 characters. \
              Remove a fact with /forget N first."
         );
         assert_eq!(

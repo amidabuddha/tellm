@@ -257,7 +257,8 @@ Save facts once and every new conversation starts with them:
 - Memory is on in your direct chat with the bot. In groups and other people's
   chats it stays off until you send `/memory on` there.
 - Changes take effect in your next chat (`/new`).
-- The limit is 2,000 characters, about 500 tokens per message. The facts go to
+- The limit is 4,096 characters (one Telegram message), about 1,000 tokens per
+  message. Most emoji count as two characters, as in Telegram. The facts go to
   the chat's provider with every message, so save only what you'd tell it.
 
 ## Model rooms
