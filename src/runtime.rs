@@ -1152,9 +1152,7 @@ fn spawn_chat_worker(
                     };
                     read_ahead = next;
                     let parts = message_parts(&message);
-                    let _ = worker_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                        Some(n.saturating_sub(parts))
-                    });
+                    saturating_sub(&worker_waiting, parts);
                     let handles = handles.for_message(&message);
                     if let Err(error) =
                         handle_allowed_message(chat_id, message, &handles, &worker_cancelled).await
@@ -1209,6 +1207,19 @@ fn spawn_chat_worker(
         done: Some(done_rx),
         previous,
         waiting,
+    }
+}
+
+/// Lowers the counter by `n`, stopping at zero.
+fn saturating_sub(counter: &AtomicUsize, n: usize) {
+    let mut current = counter.load(Ordering::Acquire);
+    while let Err(actual) = counter.compare_exchange_weak(
+        current,
+        current.saturating_sub(n),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        current = actual;
     }
 }
 
@@ -5464,6 +5475,15 @@ mod tests {
                 .is_none(),
             "a reply thread outside a forum topic isn't a topic"
         );
+    }
+
+    #[test]
+    fn the_waiting_count_stops_at_zero() {
+        let waiting = AtomicUsize::new(3);
+        saturating_sub(&waiting, 2);
+        assert_eq!(waiting.load(Ordering::Acquire), 1);
+        saturating_sub(&waiting, 2);
+        assert_eq!(waiting.load(Ordering::Acquire), 0);
     }
 
     /// A press of a button under message 30, as the worker gets it.
