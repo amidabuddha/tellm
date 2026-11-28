@@ -99,6 +99,11 @@ pub enum CommandAction {
     SetModel {
         model_key: String,
     },
+    /// `/model KEY` for the model the room already uses: switching would
+    /// only end the conversation, so nothing changes.
+    ModelUnchanged {
+        model_key: String,
+    },
     PinModel {
         model_key: String,
     },
@@ -447,6 +452,14 @@ fn route_model(args: &str, context: &CommandContext<'_>) -> CommandAction {
     }
 
     if context.model_keys.contains(value) {
+        let current = context
+            .selected_model_key()
+            .unwrap_or_else(|| context.default_model.to_string());
+        if current == value {
+            return CommandAction::ModelUnchanged {
+                model_key: value.to_string(),
+            };
+        }
         return CommandAction::SetModel {
             model_key: value.to_string(),
         };
@@ -1113,6 +1126,32 @@ mod tests {
             Route::Command(CommandAction::SetModel {
                 model_key: "claude".to_string(),
             })
+        );
+        assert_eq!(
+            route_command_with(
+                "/model gpt",
+                settings.clone(),
+                None,
+                access::PrivilegedAccess::Allowed,
+                &["claude", "gpt"],
+            ),
+            Route::Command(CommandAction::ModelUnchanged {
+                model_key: "gpt".to_string(),
+            }),
+            "the room's own model"
+        );
+        assert_eq!(
+            route_command_with(
+                "/model claude",
+                rooms::RoomSettings::default(),
+                None,
+                access::PrivilegedAccess::Allowed,
+                &["claude", "gpt"],
+            ),
+            Route::Command(CommandAction::ModelUnchanged {
+                model_key: "claude".to_string(),
+            }),
+            "the default model, when the room has no selection"
         );
         assert_eq!(
             route_command_with(

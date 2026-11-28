@@ -63,12 +63,33 @@ pub struct ChatMemberUpdated {
     pub chat: Chat,
     /// The user who performed the membership change (e.g. added the bot).
     pub from: Option<User>,
+    /// The member's status before the change, so an add can be told from a
+    /// promotion. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#chatmemberupdated.
+    pub old_chat_member: ChatMember,
     pub new_chat_member: ChatMember,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMember {
     pub status: String,
+    /// Sent only for the `restricted` status: whether the restricted user is
+    /// in the chat. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#chatmemberrestricted.
+    #[serde(default)]
+    pub is_member: Option<bool>,
+}
+
+impl ChatMember {
+    /// Whether the member is in the chat, as an owner, admin, member, or a
+    /// restricted user who hasn't left.
+    pub fn is_present(&self) -> bool {
+        match self.status.as_str() {
+            "creator" | "administrator" | "member" => true,
+            "restricted" => self.is_member.unwrap_or(true),
+            _ => false,
+        }
+    }
 }
 
 /// The subset of Telegram's `Message` that tellm consumes.
@@ -134,6 +155,11 @@ pub struct User {
     pub is_bot: bool,
     pub first_name: String,
     pub username: Option<String>,
+    /// Whether privacy mode is off, so the bot gets every group message.
+    /// Returned only by getMe; checked 2026-11-28 against
+    /// core.telegram.org/bots/api#user.
+    #[serde(default)]
+    pub can_read_all_group_messages: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +176,66 @@ pub struct Document {
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
     pub file_size: Option<i64>,
+}
+
+/// Where a message goes: a chat, and the message in it that this one
+/// answers, if any. A chat id alone converts into a target without a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target {
+    pub chat_id: i64,
+    pub reply_to: Option<i64>,
+}
+
+impl Target {
+    /// A message that answers `message_id` in the chat.
+    pub fn reply(chat_id: i64, message_id: i64) -> Self {
+        Self {
+            chat_id,
+            reply_to: Some(message_id),
+        }
+    }
+
+    /// The same chat without the reply, for the messages that follow the
+    /// first one of an answer.
+    pub fn without_reply(self) -> Self {
+        Self {
+            reply_to: None,
+            ..self
+        }
+    }
+
+    /// The target's fields of a send request. The reply still goes out if
+    /// the message it answers was deleted meanwhile. Checked 2026-11-28
+    /// against core.telegram.org/bots/api#replyparameters.
+    fn fields(self) -> serde_json::Map<String, Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("chat_id".to_string(), json!(self.chat_id));
+        if let Some(message_id) = self.reply_to {
+            fields.insert(
+                "reply_parameters".to_string(),
+                json!({ "message_id": message_id, "allow_sending_without_reply": true }),
+            );
+        }
+        fields
+    }
+
+    /// A send request: the target's fields plus the method's own.
+    fn payload(self, rest: Value) -> Value {
+        let mut payload = self.fields();
+        if let Value::Object(rest) = rest {
+            payload.extend(rest);
+        }
+        Value::Object(payload)
+    }
+}
+
+impl From<i64> for Target {
+    fn from(chat_id: i64) -> Self {
+        Self {
+            chat_id,
+            reply_to: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -225,7 +311,13 @@ impl Telegram {
     }
 
     /// Deliver text via the rich → HTML → plain fallback chain, chunked.
-    pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), TelegramError> {
+    /// Only the first message of a long text carries the target's reply.
+    pub async fn send_message(
+        &self,
+        target: impl Into<Target>,
+        text: &str,
+    ) -> Result<(), TelegramError> {
+        let mut target = target.into();
         let text = text.trim();
         let text = if text.is_empty() {
             "(empty response)"
@@ -234,14 +326,12 @@ impl Telegram {
         };
 
         for part in chunk_text(text, RICH_CHUNK_SIZE) {
-            // Checked 2026-07-04 against core.telegram.org/bots/api#sendrichmessage.
+            // Checked 2026-07-04 against core.telegram.org/bots/api#sendrichmessage;
+            // reply_parameters checked 2026-11-28 on the same page.
             let result = self
                 .post_json::<Value>(
                     "sendRichMessage",
-                    &json!({
-                        "chat_id": chat_id,
-                        "rich_message": { "markdown": part },
-                    }),
+                    &target.payload(json!({ "rich_message": { "markdown": part } })),
                 )
                 .await;
 
@@ -249,11 +339,13 @@ impl Telegram {
                 Ok(_) => {}
                 Err(error) if should_fallback_from_rich_message_error(&error) => {
                     for legacy_part in chunk_text(&part, TEXT_CHUNK_SIZE) {
-                        self.send_legacy_message_part(chat_id, &legacy_part).await?;
+                        self.send_legacy_message_part(target, &legacy_part).await?;
+                        target = target.without_reply();
                     }
                 }
                 Err(error) => return Err(error),
             }
+            target = target.without_reply();
         }
 
         Ok(())
@@ -326,10 +418,11 @@ impl Telegram {
 
     pub async fn send_photo(
         &self,
-        chat_id: i64,
+        target: impl Into<Target>,
         image_bytes: Vec<u8>,
         media_type: &str,
     ) -> Result<(), TelegramError> {
+        let target = target.into();
         // Checked 2026-07-10 against core.telegram.org/bots/api#sendphoto and
         // #sending-files. The whitelist also prevents caller-controlled MIME
         // values from entering multipart headers.
@@ -338,9 +431,15 @@ impl Telegram {
             .file_name(media_type.filename())
             .mime_str(media_type.content_type())
             .map_err(|error| self.http_error(error))?;
-        let form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("photo", photo);
+        let mut form = Form::new();
+        for (name, value) in target.fields() {
+            let value = match value {
+                Value::String(text) => text,
+                other => other.to_string(),
+            };
+            form = form.text(name, value);
+        }
+        let form = form.part("photo", photo);
         self.post_multipart::<Value>("sendPhoto", form).await?;
         Ok(())
     }
@@ -405,7 +504,7 @@ impl Telegram {
 
     async fn send_legacy_message_part(
         &self,
-        chat_id: i64,
+        target: Target,
         part: &str,
     ) -> Result<(), TelegramError> {
         // Checked 2026-07-04 against core.telegram.org/bots/api#sendmessage and
@@ -413,26 +512,19 @@ impl Telegram {
         let html_result = self
             .post_json::<Value>(
                 "sendMessage",
-                &json!({
-                    "chat_id": chat_id,
+                &target.payload(json!({
                     "text": markdown_to_html(part),
                     "parse_mode": "HTML",
                     "link_preview_options": { "is_disabled": true },
-                }),
+                })),
             )
             .await;
 
         match html_result {
             Ok(_) => Ok(()),
             Err(error) if should_fallback_from_html_message_error(&error) => {
-                self.post_json::<Value>(
-                    "sendMessage",
-                    &json!({
-                        "chat_id": chat_id,
-                        "text": part,
-                    }),
-                )
-                .await?;
+                self.post_json::<Value>("sendMessage", &target.payload(json!({ "text": part })))
+                    .await?;
                 Ok(())
             }
             Err(error) => Err(error),

@@ -573,6 +573,11 @@ calls a billing API and never fetches prices.
 - After each committed reply, the chat's worker checks the conversation's
   budget (§ Summaries) before it takes the next message, and summarizes the
   chat into a new one when it is due.
+- A reply quotes the message it answers when more messages wait in the
+  room's queue behind it, so it is clear which one it answers; otherwise it
+  is a plain message. Each worker counts the messages queued for it that it
+  hasn't started (an album or split text counts as its parts). Only the
+  first message of a long or multi-part reply quotes.
 - In-memory conversations; **room settings persist** across restarts
   (model pin, mode, role, optional thinking override, web-search toggle,
   image-generation toggle, cost-line toggle, memory toggle) in `config_dir()/rooms.toml` — runtime state
@@ -647,21 +652,26 @@ Dropped as waste:
 MCP tooling.
 Known commands accept Telegram's group form (`/cmd@BotName`); commands
 addressed to a different bot are ignored. An unknown command (a name of
-Telegram's command shape: 1–32 letters, digits or underscores, such as
-`/start` or a typo) gets "Unknown command /NAME. Send /help for the list."
+Telegram's command shape: 1–32 letters, digits or underscores, such as a
+typo) gets "Unknown command /NAME. Send /help for the list."
 instead of a billed model reply that answers the command as if it were a
 question. Text that only starts with `/`, such as a path, stays model input.
+`/start`, which Telegram sends when someone first opens a direct chat with the
+bot, works as `/help` in a direct chat; in a group it is most likely another
+bot's, so it stays unknown there.
 Argument semantics: `/new [summary]` starts a new conversation, and with
 `summary` carries a summary of this one into it (§ Summaries); any other
 argument is refused, so a mistyped `summary` never ends a conversation. `/id`
 replies with the current Telegram chat id,
-`/mode [chat|message]`, `/model [key]`, `/role [text]`
+`/mode [chat|message]`, `/model [key]` (the model the room already uses
+changes nothing, so the conversation goes on), `/role [text]`
 with `clear|off|none|reset` clearing the role, `/reasoning
 [default|off|low|medium|high|max]`, `/websearch [on|off|status]` (no argument
 toggles), `/imagegen [on|off|status]` (no argument toggles), `/cost
 [on|off|status]` (no argument or `status` shows the conversation's running
 cost, token breakdown, cache hit rate and size; `on`/`off` shows or hides
-the cost line under each reply, on by default), `/memory [on|off|status]` (no
+the cost line under each reply; unset, it is on except in a shared group),
+`/memory [on|off|status]` (no
 argument or `status` lists the saved facts with numbers, the characters used,
 whether memory is on in this room, and the file's path; `on`/`off` sets the
 room's memory setting),
@@ -705,6 +715,13 @@ that key is configured again.
   adds the bot to a chat (`my_chat_member.from`), the room is auto-approved
   and receives the model picker immediately — one pairing code per bot
   lifetime, not per room. Unknown adders still get the per-room code gate.
+  An add is a change from absent to present: `old_chat_member` and
+  `new_chat_member` (checked 2026-11-28 against
+  core.telegram.org/bots/api#chatmemberupdated) are compared, so a change
+  while the bot stays in the chat, such as becoming an admin, sends nothing.
+- **Removal**: when the bot leaves or is removed from an approved chat, the
+  chat is revoked as `/deny` does it (below), so adding the bot back starts
+  over: pairing or owner approval, shared by default, a fresh room.
 - **Privilege belongs to users, not chats.** There is no
   `admin_chat_ids`. `owner_user_ids` is the single privilege concept:
   recorded on code pairing (console access = ownership proof), checked
@@ -715,12 +732,16 @@ that key is configured again.
   impossible. Caveat: Telegram anonymous-admin mode hides `from` — owners must
   post non-anonymously (or use a private chat) for privileged commands.
 - After approval the room replies with its current model and the /model /
-  /model pin next steps plus a one-time model reply keyboard; on group approval
-  the console prints the privacy-mode hint.
+  /model pin next steps plus a one-time model reply keyboard. While privacy
+  mode is on (getMe's `can_read_all_group_messages` is false; checked
+  2026-11-28 against core.telegram.org/bots/api#user), a group's setup
+  message and the console say so: unless the bot is an admin there, it gets
+  only commands and replies to its messages.
 - Registered owners can approve or revoke rooms from any chat they are in:
   `/allow CHAT_ID` adds the
   chat to `allowed_chat_ids`, persists config, and takes effect immediately;
-  `/deny CHAT_ID` removes `allowed_chat_ids` and model pins for the chat,
+  `/deny CHAT_ID` removes `allowed_chat_ids`, the private marking and model
+  pins for the chat,
   cancels and drops that room's queued/in-flight work, clears its room state,
   persists config/rooms, and takes effect before any stale result can be sent
   or committed. Live revocation and worker cancellation happen before waiting
@@ -739,10 +760,10 @@ that key is configured again.
   id (`none` when Telegram names no sender), update kind, and route
   (`command` / `model` / `ignored`) only; never message content. The message
   id tells a second message from one delivered twice, and the sender tells
-  the owner's messages from another group member's. Negative
-  allowed or pinned chat ids produce one aggregated group-privacy warning plus
-  a debug id list at startup because Telegram privacy mode can filter plain
-  group text before tellm receives it. Repeated identical `getUpdates`
+  the owner's messages from another group member's. While privacy mode is
+  on, negative allowed or pinned chat ids produce one aggregated
+  privacy-mode warning plus a debug id list at startup, because privacy mode
+  filters group text before tellm receives it. Repeated identical `getUpdates`
   failures are reported on the first failure and at most every 30 seconds;
   changed failures are reported immediately, followed by an `INFO` recovery
   record. Interactive prompts and explicit subcommand output are not log
@@ -751,9 +772,11 @@ that key is configured again.
 ## Shared groups
 
 A group is a private room only when an owner says so; every other group is
-shared, since tellm can't tell who else reads it. Privacy mode stays off (it
-is one setting for the whole bot, and private rooms need plain text), so
-tellm does the filtering itself.
+shared, since tellm can't tell who else reads it. Privacy mode stays off:
+with it on, a group where the bot isn't an admin sends it only commands and
+replies to its messages, not @mentions (checked 2026-11-28 against
+core.telegram.org/bots/features#privacy-mode). So tellm does the filtering
+itself.
 
 - Marking: `telegram.private_group_ids` in `config.toml` lists the private
   groups. `/group` shows whether the chat is shared or private (anyone);
@@ -775,8 +798,11 @@ tellm does the filtering itself.
   mentions of the bot are removed from the text. A reply carries the text or
   caption of the message it replies to, quoted under "Replying to your
   earlier message:" or "Replying to NAME:" (never that message's photo or
-  file). Only the turn's cost joins the room's total; the cost line has no
-  chat size, and no summary runs.
+  file). Only the turn's cost joins the room's total, and no summary runs.
+  The answer quotes the message it answers (`reply_parameters`), so the
+  group sees whose question it is. The cost line is off unless an owner
+  turns it on with `/cost on`, since everyone would read what each answer
+  costs; when on, it has no chat size.
 - Commands: only `owner_user_ids` use them, except `/help` and `/id`; anyone
   else gets a refusal. An unknown command is ignored rather than refused,
   since it is most likely another bot's. Owners' commands work as anywhere

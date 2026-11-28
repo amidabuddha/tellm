@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use tellm_config::{Config, WireFormat, secrets};
 use tellm_core::{ChatRequest, ChatResponse, ContentPart};
-use tellm_telegram::{IncomingMessage, Telegram, TelegramError};
+use tellm_telegram::{IncomingMessage, Target, Telegram, TelegramError};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -80,6 +80,9 @@ struct RuntimeHandles {
     bot_username: Option<String>,
     /// The bot's own user id, from getMe, to tell replies to its messages.
     bot_user_id: Option<i64>,
+    /// Whether the bot's privacy mode is on, from getMe: then groups where
+    /// it isn't an admin send it only commands and replies to it.
+    privacy_mode: Option<bool>,
     shutdown_tx: mpsc::Sender<ShutdownReason>,
     persistence: Persistence,
     workers: WorkerRegistry,
@@ -106,6 +109,8 @@ struct ChatDispatcher {
     /// The worker this one replaced, which may still be finishing messages
     /// it had queued. Kept so shutdown aborts and joins it too.
     previous: Option<JoinHandle<()>>,
+    /// Messages queued for the worker that it hasn't started handling.
+    waiting: Arc<AtomicUsize>,
 }
 
 type WorkerRegistry = Arc<StdMutex<BTreeMap<i64, WorkerRegistration>>>;
@@ -114,6 +119,9 @@ struct WorkerRegistration {
     worker_id: u64,
     cancelled: Arc<AtomicBool>,
     abort_handle: tokio::task::AbortHandle,
+    /// Messages queued for the worker that it hasn't started handling,
+    /// including one read ahead while gathering an album or a split text.
+    waiting: Arc<AtomicUsize>,
 }
 
 struct WorkerRegistryGuard {
@@ -314,12 +322,9 @@ impl Runtime {
             )
         })?;
         let room_settings = rooms::load_settings()?;
-        let access_config = AccessConfig::from_config(&config);
-        let group_chat_ids = allowed_group_chat_ids(&access_config);
-        let access = AccessControl::new(access_config);
+        let access = AccessControl::new(AccessConfig::from_config(&config));
         model_turn::warm_configured_provider_secrets(&config);
         print_startup_notice(access.startup_notice());
-        print_group_privacy_hints(&group_chat_ids);
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(4);
         let terminal_prompts = Arc::default();
@@ -354,6 +359,11 @@ impl Runtime {
             );
         }
 
+        if bot.can_read_all_group_messages == Some(false) {
+            let config = self.config.lock().await;
+            print_group_privacy_hints(&allowed_group_chat_ids(&AccessConfig::from_config(&config)));
+        }
+
         let workers = Arc::new(StdMutex::new(BTreeMap::new()));
         let (persistence, persistence_thread) = persistence::spawn()?;
         let handles = RuntimeHandles {
@@ -364,6 +374,7 @@ impl Runtime {
             terminal_prompts: Arc::clone(&self.terminal_prompts),
             bot_username,
             bot_user_id: Some(bot.id),
+            privacy_mode: bot.can_read_all_group_messages.map(|reads_all| !reads_all),
             shutdown_tx: self.shutdown_tx.clone(),
             persistence,
             workers: Arc::clone(&workers),
@@ -419,7 +430,7 @@ impl Runtime {
                             for mut update in updates {
                                 offset = offset.max(update.update_id + 1);
                                 if let Some(membership) = update.my_chat_member.take() {
-                                    self.handle_membership_change(membership, &handles).await;
+                                    handle_membership_change(membership, &handles).await;
                                 } else if let Some(message) = dispatchable_message(&mut update) {
                                     self.handle_update(message, &handles, &mut dispatchers).await;
                                 } else if let Some(message) = update.edited_message {
@@ -501,93 +512,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// The bot's own membership changed in a chat: being added to an unknown
-    /// group arms a pairing code and announces it on the console unless a
-    /// proven owner did the adding.
-    async fn handle_membership_change(
-        &self,
-        membership: tellm_telegram::ChatMemberUpdated,
-        handles: &RuntimeHandles,
-    ) {
-        let chat_id = membership.chat.id;
-        let label = membership.chat.label();
-        match membership.new_chat_member.status.as_str() {
-            "member" | "administrator" | "restricted" => {
-                let adder = membership.from.as_ref().map(|user| user.id);
-                let trusted_adder = match adder {
-                    Some(user_id) => {
-                        let config = self.config.lock().await;
-                        config.telegram.owner_user_ids.contains(&user_id)
-                    }
-                    None => false,
-                };
-                if let Some(user_id) = adder.filter(|_| trusted_adder) {
-                    let persisted = update_config(handles, move |config| {
-                        let changed = allow_chat_in_config(config, chat_id);
-                        (changed, changed)
-                    })
-                    .await;
-                    let changed = match persisted {
-                        Ok(changed) => changed,
-                        Err(error) => {
-                            log::error!(
-                                target: "tellm::persistence",
-                                "auto-approved chat save failed chat_id={chat_id} error={error:?}"
-                            );
-                            return;
-                        }
-                    };
-                    {
-                        let mut access = self.access.lock().await;
-                        access.allow_chat(chat_id);
-                    }
-                    log::info!(
-                        target: "tellm::access",
-                        "chat auto-approved chat={label:?} owner_user_id={user_id} changed={changed}"
-                    );
-                    if chat_id < 0 {
-                        log::warn!(target: "tellm::telegram", "{}", group_privacy_hint(chat_id));
-                    }
-                    let setup = room_setup_reply(chat_id, false, handles).await;
-                    let handles = handles.clone();
-                    tokio::spawn(async move {
-                        let _ = send_room_setup(chat_id, setup, &handles).await;
-                    });
-                    return;
-                }
-
-                let pairing = {
-                    let mut access = self.access.lock().await;
-                    access.arm_room(chat_id, now_access_time())
-                };
-                match pairing {
-                    Some(pairing) => {
-                        log::info!(
-                            target: "tellm::access",
-                            "added to chat chat={label:?} pairing_code={} action=\"send /pair {} in that chat, or /allow {chat_id} from an owner\"",
-                            pairing.code,
-                            pairing.code,
-                        );
-                        if chat_id < 0 {
-                            log::warn!(target: "tellm::telegram", "{}", group_privacy_hint(chat_id));
-                        }
-                    }
-                    None => log::info!(
-                        target: "tellm::access",
-                        "added to already-allowed chat chat={label:?}"
-                    ),
-                }
-            }
-            "left" | "kicked" => {
-                log::info!(
-                    target: "tellm::access",
-                    "removed from chat chat={label:?} action=\"an owner can use /deny {chat_id} to clear access and room state\""
-                );
-            }
-            _ => {}
-        }
-    }
-
     async fn handle_update(
         &self,
         message: IncomingMessage,
@@ -639,6 +563,114 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+/// The bot's own membership changed in a chat. Being added by an owner
+/// approves the chat; being added by anyone else arms a pairing code and
+/// announces it on the console. Being removed ends the chat's access as
+/// `/deny` does, so adding the bot back starts over. Any other change,
+/// such as becoming an admin, changes nothing.
+async fn handle_membership_change(
+    membership: tellm_telegram::ChatMemberUpdated,
+    handles: &RuntimeHandles,
+) {
+    let chat_id = membership.chat.id;
+    let label = membership.chat.label();
+    let was_in = membership.old_chat_member.is_present();
+    let is_in = membership.new_chat_member.is_present();
+    if was_in && !is_in {
+        handle_removed(chat_id, &label, handles).await;
+        return;
+    }
+    if was_in || !is_in {
+        log::debug!(
+            target: "tellm::access",
+            "membership changed chat={label:?} status={}",
+            membership.new_chat_member.status
+        );
+        return;
+    }
+
+    let adder = membership.from.as_ref().map(|user| user.id);
+    let trusted_adder = match adder {
+        Some(user_id) => {
+            let config = handles.config.lock().await;
+            config.telegram.owner_user_ids.contains(&user_id)
+        }
+        None => false,
+    };
+    if let Some(user_id) = adder.filter(|_| trusted_adder) {
+        let persisted = update_config(handles, move |config| {
+            let changed = allow_chat_in_config(config, chat_id);
+            (changed, changed)
+        })
+        .await;
+        let changed = match persisted {
+            Ok(changed) => changed,
+            Err(error) => {
+                log::error!(
+                    target: "tellm::persistence",
+                    "auto-approved chat save failed chat_id={chat_id} error={error:?}"
+                );
+                return;
+            }
+        };
+        {
+            let mut access = handles.access.lock().await;
+            access.allow_chat(chat_id);
+        }
+        log::info!(
+            target: "tellm::access",
+            "chat auto-approved chat={label:?} owner_user_id={user_id} changed={changed}"
+        );
+        warn_privacy_mode(chat_id, handles);
+        let setup = room_setup_reply(chat_id, false, handles).await;
+        let handles = handles.clone();
+        tokio::spawn(async move {
+            let _ = send_room_setup(chat_id, setup, &handles).await;
+        });
+        return;
+    }
+
+    let pairing = {
+        let mut access = handles.access.lock().await;
+        access.arm_room(chat_id, now_access_time())
+    };
+    match pairing {
+        Some(pairing) => {
+            log::info!(
+                target: "tellm::access",
+                "added to chat chat={label:?} pairing_code={} action=\"send /pair {} in that chat, or /allow {chat_id} from an owner\"",
+                pairing.code,
+                pairing.code,
+            );
+            warn_privacy_mode(chat_id, handles);
+        }
+        None => log::info!(
+            target: "tellm::access",
+            "added to already-allowed chat chat={label:?}"
+        ),
+    }
+}
+
+/// The bot left or was removed from a chat: it can't read or answer
+/// there any more, and a chat it is added back to should start over
+/// rather than come back approved or marked private.
+async fn handle_removed(chat_id: i64, label: &str, handles: &RuntimeHandles) {
+    if !chat_is_allowed(chat_id, handles).await {
+        log::info!(target: "tellm::access", "removed from chat chat={label:?}");
+        return;
+    }
+    match revoke_chat(chat_id, true, handles).await {
+        Ok(_) => log::info!(
+            target: "tellm::access",
+            "removed from chat; access and room settings cleared chat={label:?}"
+        ),
+        Err(error) => log::error!(
+            target: "tellm::access",
+            "removed from chat; clearing it failed chat={label:?} error={error:?}"
+        ),
     }
 }
 
@@ -792,6 +824,7 @@ fn send_to_chat_worker(
 
     let message = match dispatcher.sender.try_send(message) {
         Ok(()) => {
+            dispatcher.waiting.fetch_add(1, Ordering::AcqRel);
             if let Some(secret_name) =
                 reserve_prompt_wait_notice(&handles.terminal_prompts, chat_id)
             {
@@ -892,6 +925,8 @@ fn spawn_chat_worker(
         None => (None, None),
     };
     let worker_id = NEXT_CHAT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
+    let waiting = Arc::new(AtomicUsize::new(0));
+    let worker_waiting = Arc::clone(&waiting);
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let workers = Arc::clone(&handles.workers);
@@ -936,6 +971,10 @@ fn spawn_chat_worker(
                         gather_split_text(message, &mut receiver, settle).await
                     };
                     read_ahead = next;
+                    let parts = message_parts(&message);
+                    let _ = worker_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                        Some(n.saturating_sub(parts))
+                    });
                     if let Err(error) =
                         handle_allowed_message(chat_id, message, &handles, &worker_cancelled).await
                     {
@@ -977,6 +1016,7 @@ fn spawn_chat_worker(
                 worker_id,
                 cancelled: Arc::clone(&cancelled),
                 abort_handle: handle.abort_handle(),
+                waiting: Arc::clone(&waiting),
             },
         );
 
@@ -987,7 +1027,24 @@ fn spawn_chat_worker(
         cancelled,
         done: Some(done_rx),
         previous,
+        waiting,
     }
+}
+
+/// How many queued messages one handled message stands for: an album's
+/// items, or the parts of a text a Telegram app split.
+fn message_parts(message: &IncomingMessage) -> usize {
+    (1 + message.album.len()).max(message.split_parts)
+}
+
+/// Whether the chat has messages queued behind the one being answered.
+fn messages_waiting(handles: &RuntimeHandles, chat_id: i64) -> bool {
+    handles
+        .workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&chat_id)
+        .is_some_and(|worker| worker.waiting.load(Ordering::Acquire) > 0)
 }
 
 fn remove_worker_registration(workers: &WorkerRegistry, chat_id: i64, worker_id: u64) {
@@ -1146,6 +1203,9 @@ async fn route_command(
     }
     let (command, args) = match commands::parse(text, handles.bot_username.as_deref()) {
         commands::ParsedRoute::Command { command, args } => (command, args),
+        // Telegram sends /start when someone first opens a direct chat with
+        // the bot. In a group it is most likely another bot's.
+        commands::ParsedRoute::Unknown { name: "start" } if chat_id > 0 => (KnownCommand::Help, ""),
         commands::ParsedRoute::Unknown { name } => {
             // In a shared group a command tellm doesn't know is most likely
             // another bot's, and a reply to each would only add noise.
@@ -1263,6 +1323,9 @@ async fn handle_command(
             } else {
                 send_command_reply(handles, chat_id, &reply).await
             }
+        }
+        CommandAction::ModelUnchanged { model_key } => {
+            send_command_reply(handles, chat_id, &model_unchanged_reply(&model_key)).await
         }
         CommandAction::SetModel { model_key } => {
             let capabilities = {
@@ -1490,9 +1553,10 @@ async fn handle_command(
                     .models
                     .get(&model_key)
                     .is_some_and(|model| model.price.is_some());
+                let shared = groups::chat_kind(&config, chat_id) == ChatKind::SharedGroup;
                 cost::summary(
                     &room.cost,
-                    room.settings.show_cost,
+                    room.settings.shows_cost(shared),
                     &model_key,
                     has_price,
                     room.context_tokens,
@@ -1504,7 +1568,7 @@ async fn handle_command(
             handles
                 .persistence
                 .mutate_room(&handles.rooms, chat_id, |room| {
-                    room.settings.show_cost = enabled;
+                    room.settings.show_cost = Some(enabled);
                 })
                 .await?;
             let state = if enabled { "on" } else { "off" };
@@ -1638,6 +1702,7 @@ async fn run_model_turn(
     cancelled: &AtomicBool,
     kind: TurnKind,
 ) -> Result<(), String> {
+    let message_id = message.message_id;
     let input = model_turn::content_parts_from_message(&handles.telegram, &message).await?;
     if input.is_empty() {
         return Ok(());
@@ -1688,23 +1753,36 @@ async fn run_model_turn(
                             room.cost.record(&reply_cost);
                             room.record_context(reply_cost.usage.as_ref());
                             room.memory = prepared.memory.clone();
-                            room.settings.show_cost.then(|| {
+                            room.settings.shows_cost(false).then(|| {
                                 cost::cost_line(&reply_cost, &room.cost, room.context_tokens)
                             })
                         }),
-                    // No conversation grows, so the cost line has no chat size.
+                    // No conversation grows, so the cost line has no chat size;
+                    // a standalone turn runs only in a shared group.
                     TurnKind::Standalone => (room.generation() == prepared.generation).then(|| {
                         room.cost.record(&reply_cost);
                         room.settings
-                            .show_cost
+                            .shows_cost(true)
                             .then(|| cost::cost_line(&reply_cost, &room.cost, None))
                     }),
                 })
             };
             match committed {
                 Some(cost_line) if worker_can_reply(chat_id, handles, cancelled).await => {
+                    // In a shared group the answer shows whose question it
+                    // answers; elsewhere only when newer messages wait, so
+                    // it is clear which one it answers.
+                    let quote = match kind {
+                        TurnKind::Standalone => true,
+                        TurnKind::Conversation => messages_waiting(handles, chat_id),
+                    };
+                    let target = if quote {
+                        Target::reply(chat_id, message_id)
+                    } else {
+                        Target::from(chat_id)
+                    };
                     let delivered =
-                        model_turn::send_response(&handles.telegram, chat_id, response, cost_line)
+                        model_turn::send_response(&handles.telegram, target, response, cost_line)
                             .await;
                     if kind == TurnKind::Standalone {
                         return delivered;
@@ -1910,7 +1988,7 @@ async fn summarize_into_new_chat(
                 room.record_context(reply_cost.usage.as_ref());
                 let cost_line = room
                     .settings
-                    .show_cost
+                    .shows_cost(false)
                     .then(|| cost::cost_line(&reply_cost, &room.cost, room.context_tokens));
                 room.continue_from_summary(summary.clone());
                 cost_line
@@ -2069,13 +2147,7 @@ async fn handle_allow_chat(
         access.allow_chat(target_chat_id);
     }
 
-    if target_chat_id < 0 {
-        log::warn!(
-            target: "tellm::telegram",
-            "{}",
-            group_privacy_hint(target_chat_id)
-        );
-    }
+    warn_privacy_mode(target_chat_id, handles);
 
     // The approved room gets the setup prompt too — approval via /allow must
     // feel the same as approval via /pair (best-effort: the bot may not be a
@@ -2098,6 +2170,25 @@ async fn handle_deny_chat(
     target_chat_id: i64,
     handles: &RuntimeHandles,
 ) -> Result<(), String> {
+    // A command that denies its own chat is allowed to finish the
+    // confirmation reply; its worker exits before dequeuing anything else.
+    let result = revoke_chat(target_chat_id, target_chat_id != requester_chat_id, handles).await?;
+    send_command_reply(
+        handles,
+        requester_chat_id,
+        &format_deny_chat_reply(target_chat_id, &result),
+    )
+    .await
+}
+
+/// Ends a chat's access: config (allowed, private marking, model pins),
+/// the live access check, its worker, and its room. `abort_worker` is false
+/// only when the chat's own worker is running this, so it can still reply.
+async fn revoke_chat(
+    target_chat_id: i64,
+    abort_worker: bool,
+    handles: &RuntimeHandles,
+) -> Result<DenyChatConfigResult, String> {
     let config_result = {
         let mut config = handles.config.lock().await;
         let before = config.clone();
@@ -2113,14 +2204,8 @@ async fn handle_deny_chat(
             was_allowed
         };
         // Flip the cancellation flag before aborting so even a provider future
-        // racing its final commit sees revocation synchronously. A command that
-        // denies its own chat is allowed to finish the confirmation reply; its
-        // worker exits before dequeuing anything else.
-        cancel_chat_worker(
-            &handles.workers,
-            target_chat_id,
-            target_chat_id != requester_chat_id,
-        );
+        // racing its final commit sees revocation synchronously.
+        cancel_chat_worker(&handles.workers, target_chat_id, abort_worker);
 
         // The file gets the same change, applied to it as it is on disk.
         if result.changed()
@@ -2138,7 +2223,7 @@ async fn handle_deny_chat(
             // Only a self-deny leaves the task alive. Restore its flag so
             // the normal worker error reply can report the failed save;
             // an aborted target worker and its queued work stay dropped.
-            if target_chat_id == requester_chat_id {
+            if !abort_worker {
                 reactivate_chat_worker(&handles.workers, target_chat_id);
             }
             return Err(format!(
@@ -2160,13 +2245,7 @@ async fn handle_deny_chat(
             "chat {target_chat_id} was denied, but its room cleanup could not be persisted: {error}"
         ));
     }
-
-    send_command_reply(
-        handles,
-        requester_chat_id,
-        &format_deny_chat_reply(target_chat_id, &config_result),
-    )
-    .await
+    Ok(config_result)
 }
 
 async fn handle_pair_attempt(
@@ -2240,9 +2319,7 @@ async fn finish_pair_attempt(
                 let mut access = handles.access.lock().await;
                 access.add_owner(user_id);
             }
-            if chat_id < 0 {
-                log::warn!(target: "tellm::telegram", "{}", group_privacy_hint(chat_id));
-            }
+            warn_privacy_mode(chat_id, handles);
             let setup = room_setup_reply(chat_id, became_owner, handles).await;
             send_room_setup(chat_id, setup, handles).await
         }
@@ -2651,6 +2728,10 @@ async fn room_setup_reply(
         setup.text.push_str("\n\n");
         setup.text.push_str(groups::NEW_GROUP_NOTE);
     }
+    if chat_id < 0 && handles.privacy_mode == Some(true) {
+        setup.text.push_str("\n\n");
+        setup.text.push_str(PRIVACY_MODE_NOTE);
+    }
     setup
 }
 
@@ -2904,6 +2985,7 @@ fn print_startup_notice(notice: crate::access::StartupNotice) {
     }
 }
 
+/// Privacy mode is on: name the groups it limits, once at startup.
 fn print_group_privacy_hints(chat_ids: &BTreeSet<i64>) {
     if chat_ids.is_empty() {
         return;
@@ -2911,7 +2993,7 @@ fn print_group_privacy_hints(chat_ids: &BTreeSet<i64>) {
 
     log::warn!(
         target: "tellm::telegram",
-        "group chats detected count={} action=\"if plain text is ignored, disable privacy mode with BotFather /setprivacy and re-add the bot\"",
+        "privacy mode is on groups={} action=\"{PRIVACY_MODE_ACTION}\"",
         chat_ids.len(),
     );
     log::debug!(
@@ -2925,10 +3007,23 @@ fn print_group_privacy_hints(chat_ids: &BTreeSet<i64>) {
     );
 }
 
+const PRIVACY_MODE_ACTION: &str = "unless the bot is an admin in a group, it gets only commands and replies to its messages there; turn privacy mode off with BotFather /setprivacy, then remove the bot from each group and add it again";
+
+/// The group-chat line in the room setup message while privacy mode is on.
+const PRIVACY_MODE_NOTE: &str = "My privacy mode is on, so unless I'm an admin here I only see \
+commands and replies to my messages, not @mentions or anything else. To fix it, turn privacy \
+mode off in BotFather (/setprivacy), then remove me from this group and add me again.";
+
+/// Logs that a group the bot joined is limited by privacy mode, when getMe
+/// said it is on.
+fn warn_privacy_mode(chat_id: i64, handles: &RuntimeHandles) {
+    if chat_id < 0 && handles.privacy_mode == Some(true) {
+        log::warn!(target: "tellm::telegram", "{}", group_privacy_hint(chat_id));
+    }
+}
+
 fn group_privacy_hint(chat_id: i64) -> String {
-    format!(
-        "group chat detected chat_id={chat_id} action=\"if plain text is ignored, disable privacy mode with BotFather /setprivacy and re-add the bot\""
-    )
+    format!("privacy mode is on chat_id={chat_id} action=\"{PRIVACY_MODE_ACTION}\"")
 }
 
 fn unknown_chat_hint(chat_id: i64) -> String {
@@ -3079,12 +3174,13 @@ fn allow_chat_in_config(config: &mut Config, chat_id: i64) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DenyChatConfigResult {
     allowed_removed: bool,
+    private_removed: bool,
     removed_model_pins: Vec<String>,
 }
 
 impl DenyChatConfigResult {
     fn changed(&self) -> bool {
-        self.allowed_removed || !self.removed_model_pins.is_empty()
+        self.allowed_removed || self.private_removed || !self.removed_model_pins.is_empty()
     }
 }
 
@@ -3095,6 +3191,12 @@ fn deny_chat_in_config(config: &mut Config, chat_id: i64) -> DenyChatConfigResul
         .allowed_chat_ids
         .retain(|allowed| *allowed != chat_id);
     let allowed_removed = config.telegram.allowed_chat_ids.len() != before_allowed;
+    let before_private = config.telegram.private_group_ids.len();
+    config
+        .telegram
+        .private_group_ids
+        .retain(|private| *private != chat_id);
+    let private_removed = config.telegram.private_group_ids.len() != before_private;
 
     let mut removed_model_pins = Vec::new();
     for (model_key, model) in &mut config.models {
@@ -3107,6 +3209,7 @@ fn deny_chat_in_config(config: &mut Config, chat_id: i64) -> DenyChatConfigResul
 
     DenyChatConfigResult {
         allowed_removed,
+        private_removed,
         removed_model_pins,
     }
 }
@@ -3178,6 +3281,10 @@ fn model_set_reply(model_key: &str) -> String {
     format!(
         "Model set to {model_key}. Chat history reset. This room now uses the model's configured reasoning default; /reasoning can override it. Owners can lock it into config.toml with /model pin {model_key}."
     )
+}
+
+fn model_unchanged_reply(model_key: &str) -> String {
+    format!("Already using {model_key}. Nothing changed.")
 }
 
 fn chat_id_reply(chat_id: i64) -> String {
@@ -3387,6 +3494,7 @@ mod tests {
             terminal_prompts: Arc::default(),
             bot_username: None,
             bot_user_id: None,
+            privacy_mode: None,
             shutdown_tx,
             persistence: persistence.clone(),
             workers: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -3468,6 +3576,7 @@ mod tests {
             terminal_prompts: Arc::default(),
             bot_username: None,
             bot_user_id: None,
+            privacy_mode: None,
             shutdown_tx,
             persistence: persistence.clone(),
             workers: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -3528,6 +3637,7 @@ mod tests {
                 worker_id: 1,
                 cancelled: Arc::clone(&cancelled),
                 abort_handle: handle.abort_handle(),
+                waiting: Arc::default(),
             },
         );
 
@@ -3578,6 +3688,7 @@ mod tests {
                 worker_id: 1,
                 cancelled: Arc::clone(&cancelled),
                 abort_handle: target_worker.abort_handle(),
+                waiting: Arc::default(),
             },
         );
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
@@ -3589,6 +3700,7 @@ mod tests {
             terminal_prompts: Arc::default(),
             bot_username: None,
             bot_user_id: None,
+            privacy_mode: None,
             shutdown_tx,
             persistence: persistence.clone(),
             workers,
@@ -3753,7 +3865,7 @@ mod tests {
             telegram: tellm_config::TelegramConfig {
                 allowed_chat_ids: vec![1, 42],
                 owner_user_ids: Vec::new(),
-                private_group_ids: Vec::new(),
+                private_group_ids: vec![-100],
             },
         };
 
@@ -3766,10 +3878,12 @@ mod tests {
             result,
             DenyChatConfigResult {
                 allowed_removed: true,
+                private_removed: true,
                 removed_model_pins: vec!["gpt".to_string()],
             }
         );
         assert!(!config.telegram.allowed_chat_ids.contains(&-100));
+        assert!(config.telegram.private_group_ids.is_empty());
         assert!(config.models["gpt"].telegram_chat_ids.is_empty());
         assert_eq!(
             format_deny_chat_reply(-100, &result),
@@ -4117,6 +4231,7 @@ mod tests {
             is_bot: false,
             first_name: "Ana".to_string(),
             username: None,
+            can_read_all_group_messages: None,
         });
         part
     }
@@ -4310,7 +4425,7 @@ mod tests {
             .await
             .get_or_default(GROUP)
             .settings
-            .show_cost = false;
+            .show_cost = Some(false);
         handles
     }
 
@@ -4391,6 +4506,13 @@ mod tests {
             ])
         );
         assert_eq!(sent_texts(&telegram), vec!["Option B.", "It is cheaper."]);
+        for request in sent_message_bodies(&telegram) {
+            assert_eq!(
+                request["reply_parameters"]["message_id"],
+                serde_json::json!(1),
+                "each answer quotes the question it answers"
+            );
+        }
 
         let rooms = handles.rooms.lock().await;
         let room = rooms.get(GROUP).unwrap();
@@ -4406,7 +4528,10 @@ mod tests {
     #[tokio::test]
     async fn a_private_group_answers_every_message_in_its_conversation() {
         let telegram = telegram_mock();
-        let provider = MockHttpServer::start(vec![completion("In May.", 10, 5)]);
+        let provider = MockHttpServer::start(vec![
+            completion("In May.", 10, 5),
+            completion("Sofia.", 10, 5),
+        ]);
         let handles = group_handles(&telegram, &provider, true).await;
         handles
             .rooms
@@ -4433,6 +4558,35 @@ mod tests {
             ])
         );
         assert_eq!(sent_texts(&telegram), vec!["In May."]);
+        assert!(
+            sent_message_bodies(&telegram)[0]
+                .get("reply_parameters")
+                .is_none(),
+            "nothing else waits, so the answer needs no quote"
+        );
+
+        // Another message waits behind this one: the answer quotes its
+        // question so it is clear which one it answers.
+        let worker = tokio::spawn(std::future::pending::<()>());
+        handles.workers.lock().unwrap().insert(
+            GROUP,
+            WorkerRegistration {
+                worker_id: 1,
+                cancelled: Arc::default(),
+                abort_handle: worker.abort_handle(),
+                waiting: Arc::new(AtomicUsize::new(1)),
+            },
+        );
+        let mut question = group_message(8, "and where?");
+        question.message_id = 5;
+        handle_allowed_message(GROUP, question, &handles, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        worker.abort();
+        assert_eq!(
+            sent_message_bodies(&telegram)[1]["reply_parameters"]["message_id"],
+            serde_json::json!(5)
+        );
     }
 
     #[tokio::test]
@@ -4495,6 +4649,7 @@ mod tests {
                     is_bot: *id == 99,
                     first_name: (*name).to_string(),
                     username: None,
+                    can_read_all_group_messages: None,
                 })
                 .collect();
             message
@@ -4514,6 +4669,118 @@ mod tests {
 
         assert_eq!(sent_texts(&telegram), vec![groups::join_notice(&["Ivo"])]);
         assert!(provider.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_shows_help_in_a_direct_chat_and_model_keeps_the_same_model() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = mock_handles(&telegram, &provider);
+        handles
+            .rooms
+            .lock()
+            .await
+            .get_or_default(42)
+            .append_turn(WireFormat::Compat, compat_turn("Hi.", "Hello."));
+        let cancelled = AtomicBool::new(false);
+
+        for text in ["/start", "/model local"] {
+            handle_allowed_message(42, text_message(text), &handles, &cancelled)
+                .await
+                .unwrap();
+        }
+
+        let sent = sent_texts(&telegram);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[0].contains("/new [summary]"), "{}", sent[0]);
+        assert_eq!(sent[1], "Already using local. Nothing changed.");
+        assert_eq!(
+            handles.rooms.lock().await.get_or_default(42).history.len(),
+            2,
+            "the conversation goes on"
+        );
+    }
+
+    fn membership(from: i64, old: &str, new: &str) -> tellm_telegram::ChatMemberUpdated {
+        serde_json::from_value(serde_json::json!({
+            "chat": { "id": GROUP, "title": "Family" },
+            "from": { "id": from, "is_bot": false, "first_name": "Ana" },
+            "old_chat_member": { "status": old },
+            "new_chat_member": { "status": new },
+        }))
+        .unwrap()
+    }
+
+    async fn wait_for_sent(telegram: &MockHttpServer) -> Vec<String> {
+        for _ in 0..200 {
+            let sent = sent_requests(telegram);
+            if !sent.is_empty() {
+                return sent;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Vec::new()
+    }
+
+    /// Every message-sending request, by method name.
+    fn sent_requests(telegram: &MockHttpServer) -> Vec<String> {
+        telegram
+            .requests()
+            .iter()
+            .filter(|request| request.path.contains("/send"))
+            .map(|request| {
+                request
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_bot_removed_from_a_group_forgets_it_and_a_promotion_changes_nothing() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(Vec::new());
+        let handles = group_handles(&telegram, &provider, true).await;
+        handles
+            .rooms
+            .lock()
+            .await
+            .get_or_default(GROUP)
+            .settings
+            .role = Some("Be brief.".to_string());
+
+        handle_membership_change(membership(7, "member", "administrator"), &handles).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            telegram.requests().is_empty(),
+            "becoming an admin sends no second welcome"
+        );
+        assert!(chat_is_allowed(GROUP, &handles).await);
+
+        handle_membership_change(membership(7, "administrator", "kicked"), &handles).await;
+        {
+            let config = handles.config.lock().await;
+            assert!(!config.telegram.allowed_chat_ids.contains(&GROUP));
+            assert!(config.telegram.private_group_ids.is_empty());
+        }
+        assert!(!chat_is_allowed(GROUP, &handles).await);
+        assert_eq!(
+            handles.rooms.lock().await.get_or_default(GROUP).settings,
+            rooms::RoomSettings::default(),
+            "the room starts over"
+        );
+
+        handle_membership_change(membership(7, "left", "member"), &handles).await;
+        assert_eq!(wait_for_sent(&telegram).await, ["sendMessage"]);
+        assert!(chat_is_allowed(GROUP, &handles).await);
+        let welcome = telegram.requests()[0].json_body()["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(welcome.contains(groups::NEW_GROUP_NOTE), "{welcome}");
     }
 
     #[tokio::test]
@@ -4657,7 +4924,7 @@ mod tests {
 
         assert!(hint.contains("chat_id=-100"));
         assert!(hint.contains("/setprivacy"));
-        assert!(hint.contains("re-add the bot"));
+        assert!(hint.contains("add it again"));
     }
 
     #[test]
@@ -4901,6 +5168,7 @@ mod tests {
             terminal_prompts: Arc::default(),
             bot_username: None,
             bot_user_id: None,
+            privacy_mode: None,
             shutdown_tx,
             persistence,
             workers: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -4937,6 +5205,16 @@ mod tests {
             serde_json::json!({ "role": "user", "content": question }),
             serde_json::json!({ "role": "assistant", "content": answer }),
         ]
+    }
+
+    /// The request body of every message tellm sent to the chat.
+    fn sent_message_bodies(telegram: &MockHttpServer) -> Vec<serde_json::Value> {
+        telegram
+            .requests()
+            .iter()
+            .filter(|request| request.path.ends_with("/sendRichMessage"))
+            .map(|request| request.json_body())
+            .collect()
     }
 
     /// The text of every message tellm sent to the chat.

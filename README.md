@@ -277,8 +277,10 @@ you add are approved automatically and show a model picker.
 **Shared groups:** every group starts shared, because tellm can't tell who
 else reads it. There it answers only messages that @mention it or reply to
 it, each on its own: no conversation history, no memory, and nothing is
-stored. A reply includes the message it answers, so follow-ups still make
-sense. Only owners can use commands there, except `/help` and `/id`. If a
+stored. Each answer quotes the question it answers, and a reply to the bot
+includes the message it replies to, so follow-ups still make sense. The cost
+line is off there unless you send `/cost on`. Only owners can use commands
+there, except `/help` and `/id`. If a
 group is just you, send `/group private` to make it a normal room; it then
 answers every message as one conversation. If someone who isn't an owner
 joins a private group, tellm says so in the group, and `/group shared` makes
@@ -297,8 +299,12 @@ second paid request.
 
 ## Troubleshooting
 
-- **The bot ignores plain text in a group:** turn off privacy mode in
-  BotFather (`/setprivacy`) and add the bot to the group again.
+- **The bot ignores plain text or @mentions in a group:** privacy mode is on
+  (tellm warns about it at startup and in the group's welcome). Turn it off
+  in BotFather (`/setprivacy`), then remove the bot from the group and add it
+  again.
+- **Removing the bot from a group** forgets that group: adding it back starts
+  over as a new, shared group.
 - **Keychain prompts at startup:** tellm reads each configured key once at
   startup, so the prompts come before your first message rather than in the
   middle of a chat. On macOS they return after each upgrade or rebuild,

@@ -229,6 +229,7 @@ mod tests {
             is_bot: id == 99,
             first_name: name.to_string(),
             username: None,
+            can_read_all_group_messages: None,
         }
     }
 

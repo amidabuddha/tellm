@@ -8,7 +8,7 @@ use tellm_config::{Config, ModelConfig, WireFormat, secrets};
 use tellm_core::{ChatRequest, ChatResponse, ContentPart, GeneratedImage, Provider, ProviderError};
 use tellm_gemini::Gemini;
 use tellm_openai::Responses;
-use tellm_telegram::{Document, IncomingMessage, PhotoSize, Telegram, TelegramError};
+use tellm_telegram::{Document, IncomingMessage, PhotoSize, Target, Telegram, TelegramError};
 use tokio::task::spawn_blocking;
 
 use crate::memory::ConversationMemory;
@@ -384,14 +384,16 @@ fn attachment_too_large_error(kind: &str, size: usize) -> String {
 /// Delivers a reply. `cost_line` closes the text when there is any; a reply
 /// that is only images gets it as its own message after them, so it still
 /// arrives last.
+/// Delivers a reply. Only its first message answers the target's message.
 pub(crate) async fn send_response(
     telegram: &Telegram,
-    chat_id: i64,
+    target: Target,
     response: ChatResponse,
     cost_line: Option<String>,
 ) -> Result<(), String> {
     let has_text = !response.text.trim().is_empty();
     let mut separate_cost_line = cost_line;
+    let mut target = target;
     if has_text || response.images.is_empty() {
         let text = match separate_cost_line.take() {
             Some(line) if has_text => with_cost_line(&response.text, &line),
@@ -399,22 +401,24 @@ pub(crate) async fn send_response(
             None => response.text.clone(),
         };
         telegram
-            .send_message(chat_id, &text)
+            .send_message(target, &text)
             .await
             .map_err(|error| error.to_string())?;
+        target = target.without_reply();
     }
 
     for image in response.images {
         let (media_type, bytes) = decode_image(image)?;
         telegram
-            .send_photo(chat_id, bytes, &media_type)
+            .send_photo(target, bytes, &media_type)
             .await
             .map_err(|error| error.to_string())?;
+        target = target.without_reply();
     }
 
     if let Some(line) = separate_cost_line {
         telegram
-            .send_message(chat_id, &line)
+            .send_message(target, &line)
             .await
             .map_err(|error| error.to_string())?;
     }

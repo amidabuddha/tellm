@@ -41,22 +41,15 @@ pub struct RoomSettings {
     pub web_search: bool,
     #[serde(default)]
     pub image_generation: bool,
-    /// Whether each reply ends with its cost line. On by default, so the
-    /// file only records rooms that turned it off.
-    #[serde(default = "default_show_cost", skip_serializing_if = "is_true")]
-    pub show_cost: bool,
+    /// Whether each reply ends with its cost line. `None` follows the
+    /// default (see [`RoomSettings::shows_cost`]), so the file only records
+    /// rooms that chose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_cost: Option<bool>,
     /// Whether new conversations get the owner's memory. `None` follows the
     /// default: on in an owner's direct chat, off elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<bool>,
-}
-
-fn default_show_cost() -> bool {
-    true
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
 }
 
 impl Default for RoomSettings {
@@ -68,9 +61,18 @@ impl Default for RoomSettings {
             thinking: None,
             web_search: false,
             image_generation: false,
-            show_cost: true,
+            show_cost: None,
             memory: None,
         }
+    }
+}
+
+impl RoomSettings {
+    /// Whether replies end with their cost line: the room's choice, or by
+    /// default on, except in a shared group, where everyone would read what
+    /// each answer costs the owner.
+    pub fn shows_cost(&self, shared_group: bool) -> bool {
+        self.show_cost.unwrap_or(!shared_group)
     }
 }
 
@@ -587,7 +589,7 @@ mod tests {
                     thinking: Some(ThinkingLevel::High),
                     web_search: true,
                     image_generation: true,
-                    show_cost: true,
+                    show_cost: None,
                     memory: Some(true),
                 },
             );
@@ -600,7 +602,7 @@ mod tests {
                     thinking: Some(ThinkingLevel::Off),
                     web_search: false,
                     image_generation: false,
-                    show_cost: false,
+                    show_cost: Some(false),
                     memory: None,
                 },
             );
@@ -1138,11 +1140,17 @@ mod tests {
     }
 
     #[test]
-    fn rooms_toml_without_show_cost_defaults_the_cost_line_on() {
+    fn rooms_toml_without_show_cost_follows_the_default_cost_line() {
         let file: RoomsToml = toml::from_str("[rooms.5]\nweb_search = true\n").unwrap();
-        assert!(file.rooms["5"].show_cost);
+        assert_eq!(file.rooms["5"].show_cost, None);
+        assert!(file.rooms["5"].shows_cost(false), "on in a private room");
+        assert!(!file.rooms["5"].shows_cost(true), "off in a shared group");
         assert!(file.rooms["5"].web_search);
         assert_eq!(file.rooms["5"].memory, None);
+        let file: RoomsToml = toml::from_str("[rooms.5]\nshow_cost = false\n").unwrap();
+        assert!(!file.rooms["5"].shows_cost(false));
+        let file: RoomsToml = toml::from_str("[rooms.5]\nshow_cost = true\n").unwrap();
+        assert!(file.rooms["5"].shows_cost(true));
     }
 
     #[test]

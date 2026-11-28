@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tellm_telegram::{TEXT_CHUNK_SIZE, Telegram, TelegramError};
+use tellm_telegram::{TEXT_CHUNK_SIZE, Target, Telegram, TelegramError};
 use tellm_test_support::{MockHttpServer, MockResponse, body_contains};
 use tokio::time::timeout;
 
@@ -262,6 +262,29 @@ async fn rich_fallback_chunks_legacy_send_message_parts() {
         TEXT_CHUNK_SIZE
     );
     assert_eq!(requests[2].json_body()["text"], json!("A"));
+}
+
+#[tokio::test]
+async fn a_reply_quotes_its_message_in_the_first_part_only() {
+    let long_text = "A".repeat(TEXT_CHUNK_SIZE + 1);
+    let mock = MockTelegram::start(vec![
+        MockResponse::json_error(404, "Not Found: method not found"),
+        MockResponse::json_ok(json!({ "message_id": 4 })),
+        MockResponse::json_ok(json!({ "message_id": 5 })),
+    ]);
+
+    client(&mock)
+        .send_message(Target::reply(42, 7), &long_text)
+        .await
+        .unwrap();
+
+    let reply = json!({ "message_id": 7, "allow_sending_without_reply": true });
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].json_body()["reply_parameters"], reply);
+    assert_eq!(requests[1].json_body()["reply_parameters"], reply);
+    assert_eq!(requests[1].json_body()["chat_id"], json!(42));
+    assert!(requests[2].json_body().get("reply_parameters").is_none());
 }
 
 #[tokio::test]
