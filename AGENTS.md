@@ -15,9 +15,9 @@ These rules apply to every contributor — human, Claude, Codex, or otherwise.
 
 ## Work packaging
 
-- Propose and pick up work through GitHub issues. One issue per commit series; keep
-  commits scoped to one behavioral change with an imperative subject line and
-  a body that explains why.
+- Don't open GitHub issues for planned work; the commit messages carry the
+  background. Keep commits scoped to one behavioral change with an imperative
+  subject line and a body that explains why.
 - Golden tests precede ports: `chunk_text` and `markdown_to_html` must be
   implemented against `crates/tellm-telegram/tests/golden/*.json` (remove the
   `#[ignore]` attributes; do not edit the vectors to make tests pass —
