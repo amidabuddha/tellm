@@ -95,6 +95,11 @@ pub struct IncomingMessage {
     /// gathered an album into its first message.
     #[serde(skip)]
     pub album: Vec<IncomingMessage>,
+    /// Not from Telegram: how many messages tellm joined into `text`
+    /// because a Telegram app split a long text into them, or 0 when the
+    /// text arrived as one message.
+    #[serde(skip)]
+    pub split_parts: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

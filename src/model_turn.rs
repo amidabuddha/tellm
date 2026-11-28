@@ -778,6 +778,7 @@ mod tests {
             document: None,
             media_group_id: None,
             album: Vec::new(),
+            split_parts: 0,
         };
 
         assert!(!message_has_input(&message));
@@ -1063,6 +1064,7 @@ mod tests {
             document: None,
             media_group_id: Some("album".to_string()),
             album: Vec::new(),
+            split_parts: 0,
         }
     }
 

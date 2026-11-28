@@ -598,6 +598,20 @@ calls a billing API and never fetches prices.
   gathers the items that follow the first in its queue, each within 1 s of
   the last and up to 10, into one turn: every caption, then every item in
   order. A message that arrives right after the album is answered after it.
+- A long text that a Telegram app split is one turn. The apps send a text
+  over the message length limit as several messages, and the Bot API marks
+  nothing about it (checked 2026-11-28 against the apps' source: Telegram
+  Desktop cuts at the best break in the second half of its limit, 4,096 or
+  8,192 with Premium; Android at most 300 characters before 4,096; iOS at
+  the last line break or full stop before 4,096). So a text message of at
+  least 2,000 UTF-16 code units, the unit Telegram counts, may be a part:
+  the worker waits up to 2 s for the next, and a text message from the same
+  sender dated within 2 s of the part before it joins, after a line break,
+  while every part so far is that long. Shorter messages never wait. A part
+  starting with `/` joins as text, and a long command such as `/role` is
+  joined the same way. A part that arrives later, or an iOS first part
+  shorter than 2,000, is still answered on its own. The log line shows the
+  joined text as, for example, `input=text(5100,2 parts)`.
 - Edited-message updates are deliberately ignored so correcting a Telegram
   message cannot silently trigger a second billed model call.
 - Delivery: `sendRichMessage` → HTML `sendMessage` → plain text, with

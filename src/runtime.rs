@@ -36,6 +36,24 @@ const CHAT_TASK_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ALBUM_SETTLE: Duration = Duration::from_secs(1);
 /// Telegram's album size limit (sendMediaGroup takes 2-10 items).
 const MAX_ALBUM_ITEMS: usize = 10;
+/// A text message at least this long, in UTF-16 code units as Telegram
+/// counts text, may be a part of a long text that a Telegram app split into
+/// several messages. The apps cut near the message length limit (checked
+/// 2026-11-28 against their source): Telegram Desktop at the best break in
+/// the second half of its limit, 4,096 or 8,192 with Premium (lib_ui
+/// `TextUtilities::CutPart`, tdesktop `data_premium_limits.cpp`); Android
+/// at most 300 characters before 4,096
+/// (`ChatActivityEnterView.processSendingText`); iOS at the last line break
+/// or full stop before 4,096 (`breakChatInputText`). So every part but the
+/// last is longer than 2,048, unless iOS found no line break or full stop in
+/// the second half. Nobody types this much and sends again within
+/// [`SPLIT_TEXT_GAP_S`], and shorter messages never wait.
+const SPLIT_TEXT_MIN_PART: usize = 2_000;
+/// How long the worker waits for the next part of a split text, and the
+/// largest gap between two parts' Telegram timestamps (whole seconds). The
+/// app sends the parts back to back; the timestamps keep messages that only
+/// queued up together while the room was busy from joining.
+const SPLIT_TEXT_GAP_S: u64 = 2;
 const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 const TERMINAL_SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 static NEXT_CHAT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
@@ -674,6 +692,81 @@ fn merge_album(mut items: Vec<IncomingMessage>) -> IncomingMessage {
     first
 }
 
+/// Gathers a long text that a Telegram app split into several messages back
+/// into its first part, so the model answers it once. The Bot API marks
+/// nothing about a split, so a part is recognized by length, sender and
+/// timestamp: a text message from the same sender, dated within
+/// [`SPLIT_TEXT_GAP_S`] of the part before it, joins while every part so far
+/// is at least [`SPLIT_TEXT_MIN_PART`] long. Returns the first queued
+/// message that doesn't join, if one was read, so the caller handles it
+/// next.
+async fn gather_split_text(
+    first: IncomingMessage,
+    receiver: &mut mpsc::Receiver<IncomingMessage>,
+    settle: Duration,
+) -> (IncomingMessage, Option<IncomingMessage>) {
+    let mut parts = vec![first];
+    let read_ahead = loop {
+        let Some(last) = parts.last().filter(|last| is_long_text(last)) else {
+            break None;
+        };
+        match timeout(settle, receiver.recv()).await {
+            Ok(Some(next)) if continues_split_text(last, &next) => parts.push(next),
+            Ok(Some(next)) => break Some(next),
+            Ok(None) | Err(_) => break None,
+        }
+    };
+    (merge_split_text(parts), read_ahead)
+}
+
+fn is_long_text(message: &IncomingMessage) -> bool {
+    message.media_group_id.is_none()
+        && message
+            .text
+            .as_deref()
+            .is_some_and(|text| text.encode_utf16().count() >= SPLIT_TEXT_MIN_PART)
+}
+
+/// Whether `next` is the part of a split text that follows `last`. A
+/// message without a sender is never joined, since its parts can't be told
+/// from another member's message.
+fn continues_split_text(last: &IncomingMessage, next: &IncomingMessage) -> bool {
+    let same_sender = matches!(
+        (&last.from, &next.from),
+        (Some(last), Some(next)) if last.id == next.id
+    );
+    let gap = next
+        .date
+        .checked_sub(last.date)
+        .and_then(|gap| u64::try_from(gap).ok());
+    same_sender
+        && next.text.is_some()
+        && next.media_group_id.is_none()
+        && gap.is_some_and(|gap| gap <= SPLIT_TEXT_GAP_S)
+}
+
+/// One message for a split text: the first part, carrying every part's text
+/// joined by line breaks. The apps cut at a line break, a space or after a
+/// full stop and trim it from both parts, so a line break restores the most
+/// common cut and keeps words apart at the others.
+fn merge_split_text(parts: Vec<IncomingMessage>) -> IncomingMessage {
+    let count = parts.len();
+    let mut parts = parts.into_iter();
+    let Some(mut first) = parts.next() else {
+        unreachable!("gather_split_text always passes the first part");
+    };
+    if count > 1 {
+        let mut text = first.text.take().unwrap_or_default();
+        for part in parts {
+            text.push('\n');
+            text.push_str(part.text.as_deref().unwrap_or_default());
+        }
+        first.text = Some(text);
+        first.split_parts = count;
+    }
+    first
+}
+
 fn send_to_chat_worker(
     chat_id: i64,
     message: IncomingMessage,
@@ -823,7 +916,12 @@ fn spawn_chat_worker(
                     {
                         break;
                     }
-                    let (message, next) = gather_album(message, &mut receiver, ALBUM_SETTLE).await;
+                    let (message, next) = if message.media_group_id.is_some() {
+                        gather_album(message, &mut receiver, ALBUM_SETTLE).await
+                    } else {
+                        let settle = Duration::from_secs(SPLIT_TEXT_GAP_S);
+                        gather_split_text(message, &mut receiver, settle).await
+                    };
                     read_ahead = next;
                     if let Err(error) =
                         handle_allowed_message(chat_id, message, &handles, &worker_cancelled).await
@@ -2731,7 +2829,8 @@ fn update_log_line(
 }
 
 /// What a message carries, never its content: `text(8)`, `photo+caption(12)`,
-/// `photos(7)` for an album, `document`, or `none`. Text starting with `/` is flagged, so a slash
+/// `photos(7)` for an album, `text(5100,2 parts)` for a text a Telegram app
+/// split, `document`, or `none`. Text starting with `/` is flagged, so a slash
 /// command tellm doesn't know shows up as `route=model` with `slash`.
 fn input_shape(message: &IncomingMessage) -> String {
     let items = || std::iter::once(message).chain(&message.album);
@@ -2763,12 +2862,14 @@ fn input_shape(message: &IncomingMessage) -> String {
         } else {
             "caption"
         };
-        let chars = text.chars().count();
-        parts.push(if text.starts_with('/') {
-            format!("{label}({chars},slash)")
-        } else {
-            format!("{label}({chars})")
-        });
+        let mut details = vec![text.chars().count().to_string()];
+        if message.split_parts > 1 {
+            details.push(format!("{} parts", message.split_parts));
+        }
+        if text.starts_with('/') {
+            details.push("slash".to_string());
+        }
+        parts.push(format!("{label}({})", details.join(",")));
     }
     if parts.is_empty() {
         "none".to_string()
@@ -3411,6 +3512,7 @@ mod tests {
             document: None,
             media_group_id: None,
             album: Vec::new(),
+            split_parts: 0,
         };
         let mut update = tellm_telegram::Update {
             update_id: 7,
@@ -3820,6 +3922,180 @@ mod tests {
         ]);
         assert_eq!(album.caption.as_deref(), Some("first\n\nthird"));
         assert!(album.album.iter().all(|item| item.caption.is_none()));
+    }
+
+    /// A text message from user 7, as one part of what they sent.
+    fn text_part(message_id: i64, date: i64, text: &str) -> IncomingMessage {
+        let mut part = text_message(text);
+        part.message_id = message_id;
+        part.date = date;
+        part.from = Some(tellm_telegram::User {
+            id: 7,
+            is_bot: false,
+            first_name: "Ana".to_string(),
+            username: None,
+        });
+        part
+    }
+
+    #[tokio::test]
+    async fn a_split_text_is_one_message_up_to_its_short_last_part() {
+        let first = "a".repeat(SPLIT_TEXT_MIN_PART + 1_000);
+        let second = "b".repeat(SPLIT_TEXT_MIN_PART);
+        // A cut can leave a part starting with `/`; it is still text.
+        let last = "/usr/bin ends it.";
+        let (sender, mut receiver) = mpsc::channel(CHAT_QUEUE_SIZE);
+        sender.send(text_part(2, 1000, &second)).await.unwrap();
+        sender.send(text_part(3, 1001, last)).await.unwrap();
+        sender.send(text_part(4, 1001, "thanks")).await.unwrap();
+
+        let (text, next) = timeout(
+            Duration::from_secs(1),
+            gather_split_text(
+                text_part(1, 1000, &first),
+                &mut receiver,
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("a short part ends the text without waiting");
+
+        assert_eq!(text.message_id, 1);
+        assert_eq!(
+            text.text.as_deref(),
+            Some(format!("{first}\n{second}\n{last}").as_str())
+        );
+        assert_eq!(text.split_parts, 3);
+        assert_eq!(
+            input_shape(&text),
+            format!(
+                "text({},3 parts)",
+                first.len() + second.len() + last.len() + 2
+            )
+        );
+        assert!(next.is_none());
+        assert_eq!(
+            receiver.try_recv().unwrap().message_id,
+            4,
+            "a message after the short last part stays queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_long_text_waits_for_another_part() {
+        let (sender, mut receiver) = mpsc::channel(CHAT_QUEUE_SIZE);
+        sender.send(text_part(2, 1000, "and more")).await.unwrap();
+        for short in ["hi".to_string(), "a".repeat(SPLIT_TEXT_MIN_PART - 1)] {
+            let (text, next) = timeout(
+                Duration::from_secs(1),
+                gather_split_text(
+                    text_part(1, 1000, &short),
+                    &mut receiver,
+                    Duration::from_secs(60),
+                ),
+            )
+            .await
+            .expect("a shorter message is not held back");
+            assert_eq!(text.text, Some(short));
+            assert_eq!(text.split_parts, 0);
+            assert!(next.is_none(), "the queue is left alone");
+        }
+
+        // Telegram counts UTF-16 code units, two for each of these emoji.
+        let emoji = "😀".repeat(SPLIT_TEXT_MIN_PART / 2);
+        let (text, next) = gather_split_text(
+            text_part(1, 1000, &emoji),
+            &mut receiver,
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(text.text, Some(format!("{emoji}\nand more")));
+        assert_eq!(text.split_parts, 2);
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_long_text_never_joins_another_sender_a_later_message_or_media() {
+        let long = "a".repeat(SPLIT_TEXT_MIN_PART);
+        let mut other_sender = text_part(2, 1000, "me too");
+        other_sender.from.as_mut().unwrap().id = 8;
+        // Queued while the room was busy: back to back in the queue, but sent
+        // later than any part of a split.
+        let later = text_part(2, 1003, "and another thing");
+        let mut photo = album_item(2, "g", None);
+        photo.media_group_id = None;
+        photo.from = text_part(2, 1000, "").from;
+        let mut anonymous = text_part(1, 1000, &long);
+        anonymous.from = None;
+        let mut anonymous_next = text_part(2, 1000, "who sent this?");
+        anonymous_next.from = None;
+
+        for (first, next) in [
+            (text_part(1, 1000, &long), other_sender),
+            (text_part(1, 1000, &long), later),
+            (text_part(1, 1000, &long), photo),
+            (anonymous, anonymous_next),
+        ] {
+            let (sender, mut receiver) = mpsc::channel(CHAT_QUEUE_SIZE);
+            sender.send(next).await.unwrap();
+            let (text, next) =
+                gather_split_text(first, &mut receiver, Duration::from_millis(50)).await;
+            assert_eq!(text.text.as_deref(), Some(long.as_str()));
+            assert_eq!(text.split_parts, 0);
+            assert_eq!(
+                next.map(|message| message.message_id),
+                Some(2),
+                "the message is handed back to be handled next"
+            );
+        }
+
+        let (_sender, mut receiver) = mpsc::channel(CHAT_QUEUE_SIZE);
+        let (text, next) = gather_split_text(
+            text_part(1, 1000, &long),
+            &mut receiver,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(text.split_parts, 0, "a quiet queue ends the wait");
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_worker_answers_a_split_text_once() {
+        let telegram = telegram_mock();
+        let provider = MockHttpServer::start(vec![completion("One answer.", 10, 5)]);
+        let handles = mock_handles(&telegram, &provider);
+        let first = "a".repeat(SPLIT_TEXT_MIN_PART);
+
+        let dispatcher = spawn_chat_worker(42, handles.clone(), None);
+        dispatcher
+            .sender
+            .try_send(text_part(1, 1000, &first))
+            .unwrap();
+        dispatcher
+            .sender
+            .try_send(text_part(2, 1000, "the rest"))
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while sent_texts(&telegram).is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no reply sent");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "one turn for both parts");
+        let messages = requests[0].json_body()["messages"].clone();
+        assert_eq!(
+            messages.as_array().unwrap().last().unwrap()["content"],
+            format!("{first}\nthe rest")
+        );
+        assert_eq!(sent_texts(&telegram).len(), 1);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            stop_chat_workers(BTreeMap::from([(42, dispatcher)]), &handles.workers),
+        )
+        .await
+        .expect("the worker is joined");
     }
 
     #[test]
@@ -4383,6 +4659,7 @@ mod tests {
             document: None,
             media_group_id: None,
             album: Vec::new(),
+            split_parts: 0,
         }
     }
 
