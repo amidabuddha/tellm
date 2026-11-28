@@ -476,7 +476,8 @@ calls a billing API and never fetches prices.
 - Where it applies: the room setting `memory` in `rooms.toml`. Unset, it is on
   only in an owner's direct chat with the bot, recognized by its chat id being
   an owner's user id (Bot API user dialog ids equal user ids; checked
-  2026-11-18 against core.telegram.org/api/bots/ids). It is off in groups and
+  2026-11-18 against core.telegram.org/api/bots/ids). A shared group never
+  uses it, whatever its setting (§ Shared groups). It is off in groups and
   in other people's chats unless the owner runs `/memory on` there, so the
   owner's facts reach no one else by default.
 - System prompt: the room's role, a blank line, then a header line and the
@@ -639,7 +640,8 @@ calls a billing API and never fetches prices.
 `/new` (incl. `summary`), `/id`, `/mode`, `/model` (incl. `pin`/`unpin`/`add`, owner-gated), `/role`,
 `/reasoning`, `/websearch`, `/imagegen`, `/cost`, `/memory`, `/remember`,
 `/forget` (the three memory commands owner-gated), `/allow`, `/deny`, `/pair`,
-`/ollama unload` (owner-gated), `/shutdown` (owner-gated), `/help`.
+`/ollama unload` (owner-gated), `/group` (setting it owner-gated; see
+§ Shared groups), `/shutdown` (owner-gated), `/help`.
 Dropped as waste:
 `/webfetch` (fold into websearch decision later), assistants, AI-managed mode,
 MCP tooling.
@@ -745,6 +747,49 @@ that key is configured again.
   changed failures are reported immediately, followed by an `INFO` recovery
   record. Interactive prompts and explicit subcommand output are not log
   records and remain unprefixed.
+
+## Shared groups
+
+A group is a private room only when an owner says so; every other group is
+shared, since tellm can't tell who else reads it. Privacy mode stays off (it
+is one setting for the whole bot, and private rooms need plain text), so
+tellm does the filtering itself.
+
+- Marking: `telegram.private_group_ids` in `config.toml` lists the private
+  groups. `/group` shows whether the chat is shared or private (anyone);
+  `/group private` and `/group shared` are owner-gated like `/allow` and
+  persist the config. Direct chats (positive chat ids) are always private.
+  A group's room setup message says it starts shared and how to mark it
+  private. The room's conversation is kept when the marking changes: a shared
+  group neither reads nor writes it.
+- Addressed messages only: a message goes to the model only when its text or
+  any caption mentions the bot (`@username` as a whole word, ignoring ASCII
+  case, as Telegram compares usernames; checked 2026-11-28 against
+  core.telegram.org/bots/api#user) or it replies to one of the bot's
+  messages (`reply_to_message.from` is the bot's getMe id). The text is
+  matched rather than Telegram's mention entities, so the check survives
+  joined album captions and split texts. Everything else is logged as
+  `route=ignored` and costs nothing.
+- Each turn stands alone: the room's model, role and settings, without
+  history, memory or a carried summary, and the exchange is not stored. The
+  mentions of the bot are removed from the text. A reply carries the text or
+  caption of the message it replies to, quoted under "Replying to your
+  earlier message:" or "Replying to NAME:" (never that message's photo or
+  file). Only the turn's cost joins the room's total; the cost line has no
+  chat size, and no summary runs.
+- Commands: only `owner_user_ids` use them, except `/help` and `/id`; anyone
+  else gets a refusal. An unknown command is ignored rather than refused,
+  since it is most likely another bot's. Owners' commands work as anywhere
+  else, except that `/mode` shows message mode and refuses changes, `/new
+  summary` is refused (a summary of the room's earlier conversation would be
+  posted for everyone), and `/memory`, `/remember` and `/forget` are refused
+  so facts are never listed or echoed where others read them.
+- Joins in a private group: Telegram sends bots service messages whatever
+  their privacy mode (checked 2026-11-28 against
+  core.telegram.org/bots/features#privacy-mode). When `new_chat_members`
+  names anyone but the bot and the owners, the group gets a notice that it
+  is marked private and that `/group shared` limits the bot to mentions and
+  replies. Nothing changes on its own.
 
 ## Configuration
 

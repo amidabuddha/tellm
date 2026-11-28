@@ -91,6 +91,16 @@ pub struct IncomingMessage {
     /// Checked 2026-11-27 against core.telegram.org/bots/api#message and
     /// #sendmediagroup.
     pub media_group_id: Option<String>,
+    /// The message this one replies to, in the same chat and thread; it
+    /// carries no `reply_to_message` of its own. Checked 2026-11-28 against
+    /// core.telegram.org/bots/api#message.
+    pub reply_to_message: Option<Box<IncomingMessage>>,
+    /// A service message: members added to the group (the bot may be one).
+    /// Bots get service messages whatever their privacy mode. Checked
+    /// 2026-11-28 against core.telegram.org/bots/api#message and
+    /// core.telegram.org/bots/features#privacy-mode.
+    #[serde(default)]
+    pub new_chat_members: Vec<User>,
     /// Not from Telegram: the album's other items, in order, once tellm has
     /// gathered an album into its first message.
     #[serde(skip)]

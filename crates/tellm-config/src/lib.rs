@@ -166,6 +166,11 @@ pub struct TelegramConfig {
     /// needed.
     #[serde(default)]
     pub owner_user_ids: Vec<i64>,
+    /// Groups an owner marked private with `/group private`: tellm answers
+    /// every message there as one conversation. Every other group is shared,
+    /// where tellm answers only messages addressed to it, each on its own.
+    #[serde(default)]
+    pub private_group_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

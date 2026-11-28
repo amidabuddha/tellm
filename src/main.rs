@@ -4,6 +4,7 @@ mod access;
 mod commands;
 mod console;
 mod cost;
+mod groups;
 mod memory;
 mod model_turn;
 mod ollama;

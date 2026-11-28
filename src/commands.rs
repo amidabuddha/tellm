@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use tellm_core::ThinkingLevel;
 
+use crate::groups::ChatKind;
 use crate::{access, rooms};
 
 #[derive(Debug, Clone)]
@@ -13,6 +14,7 @@ pub struct CommandContext<'a> {
     pub model_thinking: ThinkingLevel,
     pub privileged_access: access::PrivilegedAccess,
     pub capabilities: RoomCapabilities,
+    pub chat_kind: ChatKind,
 }
 
 impl CommandContext<'_> {
@@ -155,6 +157,14 @@ pub enum CommandAction {
     },
     UnloadOllama,
     Shutdown,
+    /// `/group`: say whether this chat is a shared or a private group.
+    ShowGroup {
+        kind: ChatKind,
+    },
+    /// `/group private|shared`: mark this group.
+    SetGroupPrivate {
+        private: bool,
+    },
     Help {
         pinned_model_key: Option<String>,
     },
@@ -182,11 +192,24 @@ pub enum KnownCommand {
     Pair,
     Ollama,
     Shutdown,
+    Group,
     Help,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandReject {
+    /// Anyone but an owner, in a shared group, for any command except
+    /// `/help` and `/id`.
+    SharedGroupOwnerOnly,
+    /// `/mode` changes and `/new summary` in a shared group, where every
+    /// message stands alone.
+    StandaloneInSharedGroup,
+    /// `/memory`, `/remember` and `/forget` in a shared group: memory is off
+    /// there, and listing or echoing facts would show them to everyone.
+    MemoryInSharedGroup,
+    UnknownGroupOption {
+        value: String,
+    },
     UnknownCommand {
         name: String,
     },
@@ -256,10 +279,24 @@ pub fn parse<'a>(text: &'a str, bot_username: Option<&str>) -> ParsedRoute<'a> {
 }
 
 pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) -> CommandAction {
+    let shared = context.chat_kind == ChatKind::SharedGroup;
+    // In a shared group the other members may read and ask, but only an
+    // owner changes what the bot does or what it costs.
+    if shared
+        && matches!(
+            context.privileged_access,
+            access::PrivilegedAccess::NotOwner
+        )
+        && !matches!(command, KnownCommand::Help | KnownCommand::Id)
+    {
+        return CommandAction::Reject {
+            reason: CommandReject::SharedGroupOwnerOnly,
+        };
+    }
     match command {
-        KnownCommand::New => route_new(args),
+        KnownCommand::New => route_new(args, shared),
         KnownCommand::Id => CommandAction::ShowChatId,
-        KnownCommand::Mode => route_mode(args, context.settings),
+        KnownCommand::Mode => route_mode(args, context.settings, shared),
         KnownCommand::Model => route_model(args, context),
         KnownCommand::Role => route_role(args, context.settings),
         KnownCommand::Reasoning => route_reasoning(args, context.settings, context.model_thinking),
@@ -268,6 +305,11 @@ pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) 
             route_image_generation(args, context.settings, &context.capabilities)
         }
         KnownCommand::Cost => route_cost(args),
+        KnownCommand::Memory | KnownCommand::Remember | KnownCommand::Forget if shared => {
+            CommandAction::Reject {
+                reason: CommandReject::MemoryInSharedGroup,
+            }
+        }
         KnownCommand::Memory => route_memory(args, context.privileged_access),
         KnownCommand::Remember => route_remember(args, context.privileged_access),
         KnownCommand::Forget => route_forget(args, context.privileged_access),
@@ -276,6 +318,7 @@ pub fn resolve(command: KnownCommand, args: &str, context: &CommandContext<'_>) 
         KnownCommand::Pair => route_pair(args),
         KnownCommand::Ollama => route_ollama(args, context.privileged_access),
         KnownCommand::Shutdown => route_shutdown(context.privileged_access),
+        KnownCommand::Group => route_group(args, context),
         KnownCommand::Help => CommandAction::Help {
             pinned_model_key: context.pinned_model_key.map(str::to_string),
         },
@@ -305,9 +348,15 @@ pub fn pair_code<'a>(text: &'a str, bot_username: Option<&str>) -> Option<&'a st
 /// `/new` starts over and `/new summary` carries a summary along. Anything
 /// else is refused rather than read as a plain `/new`, so a mistyped
 /// `summary` never throws the conversation away.
-fn route_new(args: &str) -> CommandAction {
+/// In a shared group `/new summary` is refused: there is no conversation
+/// there, and a summary of the room's earlier private one would be posted for
+/// everyone to read.
+fn route_new(args: &str, shared: bool) -> CommandAction {
     match first_arg(args) {
         None => CommandAction::ResetHistory,
+        Some(value) if value.eq_ignore_ascii_case("summary") && shared => CommandAction::Reject {
+            reason: CommandReject::StandaloneInSharedGroup,
+        },
         Some(value) if value.eq_ignore_ascii_case("summary") => CommandAction::SummarizeChat,
         Some(value) => CommandAction::Reject {
             reason: CommandReject::UnknownNewOption {
@@ -317,12 +366,23 @@ fn route_new(args: &str) -> CommandAction {
     }
 }
 
-fn route_mode(args: &str, settings: &rooms::RoomSettings) -> CommandAction {
+/// A shared group is always in message mode; the room's own setting waits
+/// for the group to be marked private.
+fn route_mode(args: &str, settings: &rooms::RoomSettings, shared: bool) -> CommandAction {
     let Some(value) = first_arg(args) else {
         return CommandAction::ShowMode {
-            current: settings.mode,
+            current: if shared {
+                rooms::ChatMode::Message
+            } else {
+                settings.mode
+            },
         };
     };
+    if shared {
+        return CommandAction::Reject {
+            reason: CommandReject::StandaloneInSharedGroup,
+        };
+    }
 
     match value.to_ascii_lowercase().as_str() {
         "chat" => CommandAction::SetMode {
@@ -543,6 +603,38 @@ fn route_memory(args: &str, access: access::PrivilegedAccess) -> CommandAction {
             },
         },
     }
+}
+
+/// `/group` shows whether this group is shared or private; `/group private`
+/// and `/group shared` are an owner's to set. A direct chat is always
+/// private.
+fn route_group(args: &str, context: &CommandContext<'_>) -> CommandAction {
+    let value = first_arg(args).map(str::to_ascii_lowercase);
+    let private = match value.as_deref() {
+        None | Some("status") => {
+            return CommandAction::ShowGroup {
+                kind: context.chat_kind,
+            };
+        }
+        Some("private") => true,
+        Some("shared") => false,
+        Some(value) => {
+            return CommandAction::Reject {
+                reason: CommandReject::UnknownGroupOption {
+                    value: value.to_string(),
+                },
+            };
+        }
+    };
+    if let Some(reject) = owner_gate(context.privileged_access) {
+        return reject;
+    }
+    if context.chat_kind == ChatKind::Direct {
+        return CommandAction::ShowGroup {
+            kind: ChatKind::Direct,
+        };
+    }
+    CommandAction::SetGroupPrivate { private }
 }
 
 fn route_remember(args: &str, access: access::PrivilegedAccess) -> CommandAction {
@@ -769,6 +861,7 @@ fn parse_known_command(name: &str) -> Option<KnownCommand> {
         "pair" => Some(KnownCommand::Pair),
         "ollama" => Some(KnownCommand::Ollama),
         "shutdown" => Some(KnownCommand::Shutdown),
+        "group" => Some(KnownCommand::Group),
         "help" => Some(KnownCommand::Help),
         _ => None,
     }
@@ -1602,8 +1695,146 @@ mod tests {
             model_thinking: ThinkingLevel::Medium,
             privileged_access,
             capabilities: RoomCapabilities::permissive(),
+            chat_kind: ChatKind::Direct,
         };
         route(text, bot_username, &context)
+    }
+
+    fn route_in(
+        chat_kind: ChatKind,
+        text: &str,
+        privileged_access: access::PrivilegedAccess,
+    ) -> Route {
+        let settings = rooms::RoomSettings::default();
+        let model_keys = BTreeSet::from(["claude".to_string()]);
+        let context = CommandContext {
+            settings: &settings,
+            default_model: "claude",
+            model_keys: &model_keys,
+            pinned_model_key: None,
+            model_thinking: ThinkingLevel::Medium,
+            privileged_access,
+            capabilities: RoomCapabilities::permissive(),
+            chat_kind,
+        };
+        route(text, None, &context)
+    }
+
+    fn rejected(reason: CommandReject) -> Route {
+        Route::Command(CommandAction::Reject { reason })
+    }
+
+    #[test]
+    fn in_a_shared_group_only_owners_use_commands_but_help_and_id() {
+        use access::PrivilegedAccess::{Allowed, NotOwner, Stale};
+        let shared = ChatKind::SharedGroup;
+        for text in [
+            "/new",
+            "/role be brief",
+            "/model claude",
+            "/cost",
+            "/group",
+            "/pair 1",
+        ] {
+            assert_eq!(
+                route_in(shared, text, NotOwner),
+                rejected(CommandReject::SharedGroupOwnerOnly),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            route_in(shared, "/id", NotOwner),
+            Route::Command(CommandAction::ShowChatId)
+        );
+        assert!(matches!(
+            route_in(shared, "/help", NotOwner),
+            Route::Command(CommandAction::Help { .. })
+        ));
+        // An owner's settings commands aren't checked for staleness, as in
+        // any other room.
+        for access in [Allowed, Stale] {
+            assert_eq!(
+                route_in(shared, "/new", access),
+                Route::Command(CommandAction::ResetHistory)
+            );
+        }
+        for kind in [ChatKind::Direct, ChatKind::PrivateGroup] {
+            assert_eq!(
+                route_in(kind, "/new", NotOwner),
+                Route::Command(CommandAction::ResetHistory),
+                "other members still use a private room's commands"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_group_has_no_conversation_mode_summary_or_memory() {
+        use access::PrivilegedAccess::Allowed;
+        let shared = ChatKind::SharedGroup;
+        assert_eq!(
+            route_in(shared, "/mode", Allowed),
+            Route::Command(CommandAction::ShowMode {
+                current: rooms::ChatMode::Message,
+            })
+        );
+        for text in ["/mode chat", "/mode message", "/new summary"] {
+            assert_eq!(
+                route_in(shared, text, Allowed),
+                rejected(CommandReject::StandaloneInSharedGroup),
+                "{text}"
+            );
+        }
+        for text in ["/memory", "/memory on", "/remember I am 41", "/forget 1"] {
+            assert_eq!(
+                route_in(shared, text, Allowed),
+                rejected(CommandReject::MemoryInSharedGroup),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            route_in(ChatKind::PrivateGroup, "/new summary", Allowed),
+            Route::Command(CommandAction::SummarizeChat)
+        );
+    }
+
+    #[test]
+    fn group_command_shows_to_anyone_and_sets_for_owners_in_groups_only() {
+        use access::PrivilegedAccess::{Allowed, NotOwner, Stale};
+        assert_eq!(
+            route_in(ChatKind::PrivateGroup, "/group", NotOwner),
+            Route::Command(CommandAction::ShowGroup {
+                kind: ChatKind::PrivateGroup,
+            })
+        );
+        assert_eq!(
+            route_in(ChatKind::SharedGroup, "/group Private", Allowed),
+            Route::Command(CommandAction::SetGroupPrivate { private: true })
+        );
+        assert_eq!(
+            route_in(ChatKind::PrivateGroup, "/group shared", Allowed),
+            Route::Command(CommandAction::SetGroupPrivate { private: false })
+        );
+        assert_eq!(
+            route_in(ChatKind::PrivateGroup, "/group shared", NotOwner),
+            rejected(CommandReject::OwnerNotAllowed)
+        );
+        assert_eq!(
+            route_in(ChatKind::PrivateGroup, "/group shared", Stale),
+            rejected(CommandReject::OwnerStale)
+        );
+        assert_eq!(
+            route_in(ChatKind::Direct, "/group shared", Allowed),
+            Route::Command(CommandAction::ShowGroup {
+                kind: ChatKind::Direct,
+            }),
+            "a direct chat stays private"
+        );
+        assert_eq!(
+            route_in(ChatKind::PrivateGroup, "/group public", Allowed),
+            rejected(CommandReject::UnknownGroupOption {
+                value: "public".to_string(),
+            })
+        );
     }
 
     fn route_with_capabilities(
@@ -1620,6 +1851,7 @@ mod tests {
             model_thinking: ThinkingLevel::Medium,
             privileged_access: access::PrivilegedAccess::NotOwner,
             capabilities,
+            chat_kind: ChatKind::Direct,
         };
         route(text, None, &context)
     }

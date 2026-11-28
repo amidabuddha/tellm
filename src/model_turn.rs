@@ -66,6 +66,27 @@ pub(crate) fn prepare_chat_request(
     }
 }
 
+/// A request that stands alone, as in a shared group: the room's model, role
+/// and settings, but no history, memory or carried summary, and the room's
+/// conversation isn't touched, so there is nothing to roll back.
+pub(crate) fn prepare_standalone_request(
+    room: &RoomState,
+    model_config: ModelConfig,
+    input: Vec<ContentPart>,
+) -> PreparedChatRequest {
+    let mut request = chat_request_from_room(room, &model_config, input);
+    request.history = Vec::new();
+    PreparedChatRequest {
+        model_config,
+        request,
+        rollback: None,
+        generation: room.generation(),
+        reset_notice: None,
+        memory: None,
+        memory_notice: None,
+    }
+}
+
 /// The role comes first, then the memory block, then the summary the
 /// conversation continues from, each after a blank line. Every part is fixed
 /// for the whole conversation, so the prompt stays byte-stable.
@@ -779,6 +800,8 @@ mod tests {
             media_group_id: None,
             album: Vec::new(),
             split_parts: 0,
+            reply_to_message: None,
+            new_chat_members: Vec::new(),
         };
 
         assert!(!message_has_input(&message));
@@ -1065,6 +1088,8 @@ mod tests {
             media_group_id: Some("album".to_string()),
             album: Vec::new(),
             split_parts: 0,
+            reply_to_message: None,
+            new_chat_members: Vec::new(),
         }
     }
 

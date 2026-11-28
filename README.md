@@ -130,6 +130,7 @@ All direct, with no middleware.
 | `/pair CODE` | Claim an unpaired chat with the code from the terminal |
 | `/allow CHAT_ID` · `/deny CHAT_ID` | Approve or revoke a chat (owner) |
 | `/ollama unload` | Unload local Ollama models this session used (owner) |
+| `/group` · `/group private\|shared` | Show, or set (owner), whether this group is your private room or shared |
 | `/shutdown` | Stop tellm (owner) |
 
 ## Configuration
@@ -149,6 +150,7 @@ default_model = "gpt"
 [telegram]
 allowed_chat_ids = []
 owner_user_ids = []
+private_group_ids = []
 
 [models.gpt]
 wire_format = "responses"
@@ -271,6 +273,16 @@ you add are approved automatically and show a model picker.
 - `/model pin KEY` locks it until `/model unpin`.
 - `/model add KEY` adds a built-in provider. If its key is missing, tellm asks
   for it in the terminal, never in Telegram.
+
+**Shared groups:** every group starts shared, because tellm can't tell who
+else reads it. There it answers only messages that @mention it or reply to
+it, each on its own: no conversation history, no memory, and nothing is
+stored. A reply includes the message it answers, so follow-ups still make
+sense. Only owners can use commands there, except `/help` and `/id`. If a
+group is just you, send `/group private` to make it a normal room; it then
+answers every message as one conversation. If someone who isn't an owner
+joins a private group, tellm says so in the group, and `/group shared` makes
+it shared again.
 
 **Ollama:** for `localhost:11434`, tellm starts `ollama serve` when needed.
 On shutdown it unloads the models this session used and stops the server again
